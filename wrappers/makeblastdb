@@ -1,0 +1,62 @@
+#!/bin/bash
+# Replacement for NCBI makeblastdb used with the Rust rmblastn port.
+#
+# The Rust rmblastn binary uses a UCSC 2bit file as its database, not a BLAST
+# database.  This wrapper:
+#   1. Converts the input FASTA to a .2bit file via faToTwoBit (the actual
+#      database used at search time).
+#   2. Creates dummy BLAST database index files (.ndb, .nhr, .nin, .nog, .nos,
+#      .not, .nsq, .ntf, .nto) containing only the word "dummy", so that any
+#      caller checking for the existence of a BLAST database will find non-zero
+#      files and proceed normally.
+#
+# The real NCBI makeblastdb is NOT called.
+
+FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
+
+# Nucleotide BLAST DB extensions created by the real makeblastdb.
+NUCL_EXTENSIONS=(ndb nhr nin nog nos not nsq ntf nto)
+
+in_file=""
+out_name=""
+dbtype="nucl"
+
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+        -in)     i=$((i+1)); in_file="${args[$i]}" ;;
+        -out)    i=$((i+1)); out_name="${args[$i]}" ;;
+        -dbtype) i=$((i+1)); dbtype="${args[$i]}" ;;
+    esac
+    i=$((i+1))
+done
+
+if [ -z "$in_file" ]; then
+    echo "[makeblastdb] Error: -in <file> is required" >&2
+    exit 1
+fi
+
+if [ ! -f "$in_file" ]; then
+    echo "[makeblastdb] Error: input file not found: $in_file" >&2
+    exit 1
+fi
+
+base="${out_name:-$in_file}"
+
+# Step 1: build the 2bit file used by the Rust rmblastn binary.
+if [ "$dbtype" = "nucl" ]; then
+    echo "[makeblastdb] Creating ${base}.2bit" >&2
+    "$FATOTWOBIT" "$in_file" "${base}.2bit"
+    if [ $? -ne 0 ]; then
+        echo "[makeblastdb] Error: faToTwoBit failed" >&2
+        exit 1
+    fi
+fi
+
+# Step 2: create dummy BLAST index files so callers see a complete-looking database.
+for ext in "${NUCL_EXTENSIONS[@]}"; do
+    echo "dummy" > "${base}.${ext}"
+done
+
+echo "[makeblastdb] Done: ${base}.2bit and dummy index files created" >&2

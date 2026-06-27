@@ -1,0 +1,12 @@
+#!/bin/bash
+# Cross-checking ("verify") replacement for NCBI blastdbcmd.
+#
+# The verify makeblastdb builds a real BLAST index, so the real NCBI blastdbcmd
+# works directly against it.  This wrapper simply defers to the real binary so
+# that callers querying database info (e.g. alignVerify.pl / NCBIBlastSearchEngine)
+# get exactly the NCBI output they expect.
+
+NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
+NCBI_BLASTDBCMD="$NCBI_DIR/blastdbcmd"
+
+exec "$NCBI_BLASTDBCMD" "$@"

@@ -1,0 +1,130 @@
+#!/bin/bash
+# Replacement for NCBI rmblastn used with the Rust rmblastn port.
+#
+# Legacy callers invoke rmblastn with NCBI BLAST-style arguments:
+#   - single-dash flags  (-flag)
+#   - underscores in flag names  (-mask_level, -xdrop_ungap, ...)
+#   - -dust no  (boolean expressed as no/yes)
+#   - -num_alignments  (not implemented in the Rust port)
+#
+# This wrapper translates all of the above before exec-ing the real binary:
+#   1. Single-dash flags are promoted to double-dash  (-foo → --foo).
+#   2. Underscores in flag names are replaced with hyphens  (foo_bar → foo-bar).
+#   3. -dust no/yes is converted to --dust false/true.
+#   4. -num_alignments (and its value) is silently dropped.
+
+REAL_RMBLASTN="/home/rhubley/projects/Claude/rmblast-port/rmblast/target/release/rmblastn"
+FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
+
+args=("$@")
+new_args=()
+i=0
+
+while [ $i -lt ${#args[@]} ]; do
+    arg="${args[$i]}"
+
+    if [[ "$arg" =~ ^(-{1,2})([^=]+)(=.*)?$ ]]; then
+        flag_name="${BASH_REMATCH[2]}"
+        inline_value="${BASH_REMATCH[3]}"   # non-empty only for --flag=value style
+
+        # normalize underscores → hyphens
+        flag_name="${flag_name//_/-}"
+
+        # drop -num-alignments (and its value)
+        if [[ "$flag_name" == "num-alignments" ]]; then
+            if [[ -n "$inline_value" ]]; then
+                i=$((i+1))
+            else
+                next_i=$((i+1))
+                if [ $next_i -lt ${#args[@]} ] && [[ ! "${args[$next_i]}" =~ ^- ]]; then
+                    i=$((i+1))
+                fi
+                i=$((i+1))
+            fi
+            continue
+        fi
+
+        new_flag="--${flag_name}"
+
+        if [[ -n "$inline_value" ]]; then
+            # --flag=value style: keep as-is (value already attached)
+            new_args+=("${new_flag}${inline_value}")
+            i=$((i+1))
+        else
+            # separate-value style: peek at next token
+            next_i=$((i+1))
+            if [ $next_i -lt ${#args[@]} ] && [[ ! "${args[$next_i]}" =~ ^- ]]; then
+                value="${args[$next_i]}"
+                # translate -dust no/yes to --dust false/true
+                if [[ "$flag_name" == "dust" ]]; then
+                    case "$value" in
+                        no|false|0)  value="false" ;;
+                        yes|true|1)  value="true"  ;;
+                    esac
+                fi
+                new_args+=("$new_flag" "$value")
+                i=$((i+2))
+            else
+                new_args+=("$new_flag")
+                i=$((i+1))
+            fi
+        fi
+    else
+        new_args+=("$arg")
+        i=$((i+1))
+    fi
+done
+
+# Find --db in new_args, ensure the value ends with .2bit, and build the
+# .2bit file on-the-fly if the caller skipped makeblastdb.
+db_idx=-1
+db_inline=false
+for (( j=0; j<${#new_args[@]}; j++ )); do
+    if [[ "${new_args[$j]}" == "--db" ]]; then
+        db_idx=$j
+        db_inline=false
+        break
+    elif [[ "${new_args[$j]}" == "--db="* ]]; then
+        db_idx=$j
+        db_inline=true
+        break
+    fi
+done
+
+if [ $db_idx -ge 0 ]; then
+    if $db_inline; then
+        db_val="${new_args[$db_idx]#--db=}"
+    else
+        val_idx=$((db_idx + 1))
+        db_val="${new_args[$val_idx]}"
+    fi
+
+    # Strip any existing .2bit suffix to get the canonical base (FASTA path).
+    if [[ "$db_val" == *.2bit ]]; then
+        db_base="${db_val%.2bit}"
+    else
+        db_base="$db_val"
+    fi
+    db_2bit="${db_base}.2bit"
+
+    if [ ! -f "$db_2bit" ]; then
+        if [ ! -f "$db_base" ]; then
+            echo "[rmblastn] Error: database file not found: $db_base" >&2
+            exit 1
+        fi
+        echo "[rmblastn] Building ${db_2bit} from ${db_base}" >&2
+        "$FATOTWOBIT" "$db_base" "$db_2bit"
+        if [ $? -ne 0 ]; then
+            echo "[rmblastn] Error: faToTwoBit failed for ${db_base}" >&2
+            exit 1
+        fi
+    fi
+
+    if $db_inline; then
+        new_args[$db_idx]="--db=${db_2bit}"
+    else
+        new_args[$val_idx]="$db_2bit"
+    fi
+fi
+
+exec "$REAL_RMBLASTN" "${new_args[@]}"

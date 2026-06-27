@@ -1,0 +1,14 @@
+[package]
+name = "rmblastn"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rmblastn"
+path = "src/main.rs"
+
+[dependencies]
+rmblast-lib = { package = "rmblast-lib", path = "../rmblast-lib" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+rayon = { workspace = true }

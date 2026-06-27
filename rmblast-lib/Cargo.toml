@@ -1,0 +1,10 @@
+[package]
+name = "rmblast-lib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+memmap2 = { workspace = true }

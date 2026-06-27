@@ -1,0 +1,16 @@
+#!/bin/bash
+# Cross-checking ("verify") replacement for NCBI makeblastdb.
+#
+# For the verify wrappers, BOTH engines run against the same database:
+#   - NCBI rmblastn needs a real BLAST index.
+#   - The Rust port reads the FASTA file directly (NOT a .2bit) -- only the
+#     FASTA reproduces NCBI's ambiguity-code handling.
+#
+# So this wrapper simply runs the REAL NCBI makeblastdb to build the index and
+# leaves the FASTA in place for the Rust engine.  (No faToTwoBit / .2bit is
+# produced, unlike the plain ../wrappers/makeblastdb.)
+
+NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
+NCBI_MAKEBLASTDB="$NCBI_DIR/makeblastdb"
+
+exec "$NCBI_MAKEBLASTDB" "$@"

@@ -1,0 +1,392 @@
+#!/bin/bash
+# Cross-checking ("verify") replacement for NCBI rmblastn.
+#
+# Unlike the plain drop-in wrapper (../wrappers/rmblastn) which only runs the
+# Rust port, this wrapper runs BOTH engines serially over the identical inputs
+# and parameters, compares their results, and -- on any disagreement -- saves a
+# self-contained debug bundle to a diffs directory for later investigation.
+#
+#   1. The real NCBI rmblastn is run with the caller's original arguments
+#      (it uses the real BLAST index files built by ../verify_wrappers/makeblastdb).
+#   2. The Rust rmblastn is run with the translated arguments, BUT pointed at
+#      the FASTA file as its database (NOT a .2bit file) -- only the FASTA is
+#      guaranteed to reproduce NCBI's ambiguity-code handling.
+#   3. The two result sets are compared as a sorted multiset of output lines
+#      (the same comparison alignVerify.pl performs).
+#   4. If they differ, a per-failure directory of inputs / parameters / outputs /
+#      diff / reproduce.sh is written under $RMBLAST_VERIFY_DIR
+#      (default: ./rmblast_verify_failures).
+#   5. The Rust output is emitted to the caller (this is a drop-in for the Rust
+#      deployment); the wrapper exits with the Rust engine's return code.
+#
+# The NCBI->Rust argument translation is identical to ../wrappers/rmblastn:
+#   - Single-dash flags are promoted to double-dash  (-foo -> --foo).
+#   - Underscores in flag names are replaced with hyphens  (foo_bar -> foo-bar).
+#   - -dust no/yes is converted to --dust false/true.
+#   - -num_alignments (and its value) is silently dropped.
+
+REAL_RMBLASTN="/home/rhubley/projects/Claude/rmblast-port/rmblast/target/release/rmblastn"
+NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
+NCBI_RMBLASTN="$NCBI_DIR/rmblastn"
+NCBI_MAKEBLASTDB="$NCBI_DIR/makeblastdb"
+
+# Where mismatch bundles are written (overridable via the environment).
+VERIFY_DIR="${RMBLAST_VERIFY_DIR:-./rmblast_verify_failures}"
+
+# Canonical tabular field list used *only* for the cross-check comparison.  The
+# verification always compares ALIGNMENT DATA in this format -- never the
+# caller's (possibly pairwise) output, whose headers/version/paths/dates differ
+# cosmetically between engines and are not what we are verifying.  This is the
+# same field set the project's 16-combo validation scripts use.
+CANON_OUTFMT="6 score perc_sub perc_query_gap perc_db_gap qseqid qstart qend qlen sstrand sseqid sstart send slen kdiv cpg_kdiv transi transv cpg_sites qseq sseq"
+
+# ---------------------------------------------------------------------------
+# 0. Informational invocations (-version / -help) do NOT trigger a cross-check.
+#    Just run the primary (Rust) engine and report its output, as requested.
+# ---------------------------------------------------------------------------
+for a in "$@"; do
+    case "$a" in
+        -version|--version|-v)
+            exec "$REAL_RMBLASTN" --version ;;
+        -h|-help|--help)
+            exec "$REAL_RMBLASTN" --help ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# 1. Translate the caller's NCBI-style args into Rust-style args.
+#    (verbatim from ../wrappers/rmblastn)
+# ---------------------------------------------------------------------------
+args=("$@")
+new_args=()
+i=0
+
+while [ $i -lt ${#args[@]} ]; do
+    arg="${args[$i]}"
+
+    if [[ "$arg" =~ ^(-{1,2})([^=]+)(=.*)?$ ]]; then
+        flag_name="${BASH_REMATCH[2]}"
+        inline_value="${BASH_REMATCH[3]}"   # non-empty only for --flag=value style
+
+        # normalize underscores -> hyphens
+        flag_name="${flag_name//_/-}"
+
+        # drop -num-alignments (and its value)
+        if [[ "$flag_name" == "num-alignments" ]]; then
+            if [[ -n "$inline_value" ]]; then
+                i=$((i+1))
+            else
+                next_i=$((i+1))
+                if [ $next_i -lt ${#args[@]} ] && [[ ! "${args[$next_i]}" =~ ^- ]]; then
+                    i=$((i+1))
+                fi
+                i=$((i+1))
+            fi
+            continue
+        fi
+
+        new_flag="--${flag_name}"
+
+        if [[ -n "$inline_value" ]]; then
+            # --flag=value style: keep as-is (value already attached)
+            new_args+=("${new_flag}${inline_value}")
+            i=$((i+1))
+        else
+            # separate-value style: peek at next token
+            next_i=$((i+1))
+            if [ $next_i -lt ${#args[@]} ] && [[ ! "${args[$next_i]}" =~ ^- ]]; then
+                value="${args[$next_i]}"
+                # translate -dust no/yes to --dust false/true
+                if [[ "$flag_name" == "dust" ]]; then
+                    case "$value" in
+                        no|false|0)  value="false" ;;
+                        yes|true|1)  value="true"  ;;
+                    esac
+                fi
+                new_args+=("$new_flag" "$value")
+                i=$((i+2))
+            else
+                new_args+=("$new_flag")
+                i=$((i+1))
+            fi
+        fi
+    else
+        new_args+=("$arg")
+        i=$((i+1))
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# 2. Resolve the database.  The caller passes the FASTA path as the db value
+#    (NCBI convention: -db <fasta>).  We feed:
+#      - NCBI rmblastn:  -db  <fasta-base>      (uses the BLAST index alongside)
+#      - Rust rmblastn:  --db <fasta-base>      (reads the FASTA directly)
+#    Any trailing ".2bit" on the supplied value is stripped to recover the FASTA.
+# ---------------------------------------------------------------------------
+db_base=""
+
+# Find --db in the translated (Rust) args and force its value to the FASTA path.
+db_idx=-1
+db_inline=false
+for (( j=0; j<${#new_args[@]}; j++ )); do
+    if [[ "${new_args[$j]}" == "--db" ]]; then
+        db_idx=$j; db_inline=false; break
+    elif [[ "${new_args[$j]}" == "--db="* ]]; then
+        db_idx=$j; db_inline=true; break
+    fi
+done
+
+if [ $db_idx -ge 0 ]; then
+    if $db_inline; then
+        db_val="${new_args[$db_idx]#--db=}"
+    else
+        db_val="${new_args[$((db_idx+1))]}"
+    fi
+    db_base="${db_val%.2bit}"        # strip any .2bit suffix -> FASTA path
+
+    if $db_inline; then
+        new_args[$db_idx]="--db=${db_base}"
+    else
+        new_args[$((db_idx+1))]="$db_base"
+    fi
+fi
+
+# Build the NCBI-side argument vector from the ORIGINAL args, only normalizing
+# the -db value to the FASTA base (so NCBI and the index agree).
+ncbi_args=()
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    a="${args[$i]}"
+    if [[ "$a" == "-db" || "$a" == "--db" ]]; then
+        ncbi_args+=("$a")
+        nv="${args[$((i+1))]}"
+        ncbi_args+=("${nv%.2bit}")
+        i=$((i+2))
+    elif [[ "$a" == "-db="* || "$a" == "--db="* ]]; then
+        pre="${a%%=*}"; nv="${a#*=}"
+        ncbi_args+=("${pre}=${nv%.2bit}")
+        i=$((i+1))
+    else
+        ncbi_args+=("$a")
+        i=$((i+1))
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# 3. Make sure both engines have what they need.
+#    - FASTA must exist (for the Rust engine).
+#    - A real BLAST index must exist (for NCBI); build it if the caller skipped
+#      makeblastdb.
+# ---------------------------------------------------------------------------
+if [ -n "$db_base" ]; then
+    if [ ! -f "$db_base" ]; then
+        echo "[verify rmblastn] Error: FASTA database not found: $db_base" >&2
+        exit 1
+    fi
+    if [ ! -s "${db_base}.nhr" ] && [ ! -s "${db_base}.nin" ]; then
+        echo "[verify rmblastn] Building BLAST index for ${db_base}" >&2
+        "$NCBI_MAKEBLASTDB" -parse_seqids -dbtype nucl \
+            -in "$db_base" -out "$db_base" > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo "[verify rmblastn] Error: makeblastdb failed for ${db_base}" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Run the engines.
+#
+#    The cross-check ALWAYS compares tabular ALIGNMENT DATA -- never the
+#    caller's possibly-pairwise output, whose headers (version, db path, dates,
+#    number formatting) differ cosmetically between engines and are not what we
+#    are verifying.
+#
+#      - If the caller already asked for tabular output ("-outfmt 6 ..."), we
+#        compare that directly and the Rust run doubles as the caller's output.
+#      - Otherwise (pairwise / any non-tabular format) we run a dedicated
+#        CANON_OUTFMT pass on each engine for the diff, plus a separate
+#        caller-format Rust run for the output handed back to the caller.
+# ---------------------------------------------------------------------------
+tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/verify_rmblastn.XXXXXX")"
+ncbi_tab="$tmpdir/ncbi.tab"; ncbi_err="$tmpdir/ncbi.err"
+rust_tab="$tmpdir/rust.tab"; rust_err="$tmpdir/rust.err"
+caller_out="$tmpdir/caller.out"; caller_err="$tmpdir/caller.err"
+
+# What -outfmt did the caller request (if any), and is it tabular ("6 ...")?
+caller_outfmt=""
+for (( j=0; j<${#args[@]}; j++ )); do
+    case "${args[$j]}" in
+        -outfmt|--outfmt)     caller_outfmt="${args[$((j+1))]}" ;;
+        -outfmt=*|--outfmt=*) caller_outfmt="${args[$j]#*=}" ;;
+    esac
+done
+first_tok="${caller_outfmt%%[[:space:]]*}"
+is_tabular6=0
+[ "$first_tok" = "6" ] && is_tabular6=1
+
+# Build comparison arg vectors with -outfmt forced to CANON_OUTFMT.
+strip_outfmt() {   # echo all args except -outfmt/--outfmt (+ its value), NUL-delimited
+    local arr=("$@") k=0
+    while [ $k -lt ${#arr[@]} ]; do
+        case "${arr[$k]}" in
+            -outfmt|--outfmt)     k=$((k+2)); continue ;;
+            -outfmt=*|--outfmt=*) k=$((k+1)); continue ;;
+        esac
+        printf '%s\0' "${arr[$k]}"; k=$((k+1))
+    done
+}
+
+if [ "$is_tabular6" -eq 1 ]; then
+    ncbi_run=( "${ncbi_args[@]}" )
+    rust_run=( "${new_args[@]}" )
+    "$NCBI_RMBLASTN" "${ncbi_run[@]}" > "$ncbi_tab"   2> "$ncbi_err"; ncbi_rc=$?
+    "$REAL_RMBLASTN" "${rust_run[@]}" > "$rust_tab"   2> "$rust_err"; rust_rc=$?
+    cp "$rust_tab" "$caller_out"; cp "$rust_err" "$caller_err"; caller_rc=$rust_rc
+else
+    mapfile -d '' ncbi_run < <(strip_outfmt "${ncbi_args[@]}"); ncbi_run+=("-outfmt=$CANON_OUTFMT")
+    mapfile -d '' rust_run < <(strip_outfmt "${new_args[@]}");  rust_run+=("--outfmt" "$CANON_OUTFMT")
+    "$NCBI_RMBLASTN" "${ncbi_run[@]}" > "$ncbi_tab"   2> "$ncbi_err"; ncbi_rc=$?
+    "$REAL_RMBLASTN" "${rust_run[@]}" > "$rust_tab"   2> "$rust_err"; rust_rc=$?
+    "$REAL_RMBLASTN" "${new_args[@]}" > "$caller_out" 2> "$caller_err"; caller_rc=$?
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Compare results as a sorted multiset of non-blank lines.
+# ---------------------------------------------------------------------------
+sort "$ncbi_tab" | grep -v '^[[:space:]]*$' > "$tmpdir/ncbi.sorted"
+sort "$rust_tab" | grep -v '^[[:space:]]*$' > "$tmpdir/rust.sorted"
+
+ncbi_n=$(wc -l < "$tmpdir/ncbi.sorted")
+rust_n=$(wc -l < "$tmpdir/rust.sorted")
+
+# Lines only in NCBI ('<') and only in Rust ('>').
+only_ncbi="$tmpdir/only_ncbi"
+only_rust="$tmpdir/only_rust"
+comm -23 "$tmpdir/ncbi.sorted" "$tmpdir/rust.sorted" > "$only_ncbi"
+comm -13 "$tmpdir/ncbi.sorted" "$tmpdir/rust.sorted" > "$only_rust"
+num_diffs=$(( $(wc -l < "$only_ncbi") + $(wc -l < "$only_rust") ))
+
+if [ "$ncbi_rc" -eq 0 ] && [ "$rust_rc" -eq 0 ] && [ "$num_diffs" -eq 0 ]; then
+    echo "# verify rmblastn: Rust MATCHES NCBI ($ncbi_n alignments, 0 diffs)" >&2
+else
+    # ---- Mismatch: report to STDERR and archive a debug bundle ----
+    echo "" >&2
+    echo "##############################################################" >&2
+    echo "# verify rmblastn: MISMATCH between NCBI and Rust rmblastn!" >&2
+    echo "#   NCBI exit : $ncbi_rc, hits: $ncbi_n" >&2
+    echo "#   Rust exit : $rust_rc, hits: $rust_n" >&2
+    echo "#   diff lines: $num_diffs (only-NCBI=$(wc -l < "$only_ncbi"), only-Rust=$(wc -l < "$only_rust"))" >&2
+    echo "##############################################################" >&2
+
+    # Preview up to 20 diff lines on STDERR.
+    { sed 's/^/< /' "$only_ncbi"; sed 's/^/> /' "$only_rust"; } | head -20 >&2
+
+    mkdir -p "$VERIFY_DIR"
+    stem="$(basename "${db_base:-db}")_$(date +%s)_$$"
+    dir="$VERIFY_DIR/$stem"; n=0
+    while [ -e "$dir" ]; do n=$((n+1)); dir="$VERIFY_DIR/$stem.$n"; done
+    mkdir -p "$dir"
+
+    # Inputs: query (the -query value), the FASTA db + its index files, matrix.
+    qf=""
+    mat_val=""
+    for (( j=0; j<${#ncbi_run[@]}; j++ )); do
+        [[ "${ncbi_run[$j]}" == "-query"  || "${ncbi_run[$j]}" == "--query"  ]] && qf="${ncbi_run[$((j+1))]}"
+        [[ "${ncbi_run[$j]}" == -query=*  || "${ncbi_run[$j]}" == --query=*  ]] && qf="${ncbi_run[$j]#*=}"
+        [[ "${ncbi_run[$j]}" == "-matrix" || "${ncbi_run[$j]}" == "--matrix" ]] && mat_val="${ncbi_run[$((j+1))]}"
+        [[ "${ncbi_run[$j]}" == -matrix=* || "${ncbi_run[$j]}" == --matrix=* ]] && mat_val="${ncbi_run[$j]#*=}"
+    done
+    [ -n "$qf" ] && [ -f "$qf" ] && cp "$qf" "$dir/" 2>/dev/null
+    if [ -n "$db_base" ]; then
+        for f in "$db_base" "$db_base".*; do [ -f "$f" ] && cp "$f" "$dir/" 2>/dev/null; done
+    fi
+    # Resolve the matrix the same way both engines do (direct path, then
+    # $BLASTMAT/<name>) and copy it in so reproduce.sh works with BLASTMAT=.
+    mat_file=""
+    if [ -n "$mat_val" ]; then
+        if [ -f "$mat_val" ]; then
+            mat_file="$mat_val"
+        elif [ -n "$BLASTMAT" ] && [ -f "$BLASTMAT/$mat_val" ]; then
+            mat_file="$BLASTMAT/$mat_val"
+        fi
+    fi
+    [ -n "$mat_file" ] && cp "$mat_file" "$dir/" 2>/dev/null
+
+    cp "$ncbi_tab" "$dir/ncbi.tab"
+    cp "$rust_tab" "$dir/rust.tab"
+    cp "$ncbi_err" "$dir/ncbi.stderr"
+    cp "$rust_err" "$dir/rust.stderr"
+
+    {
+        echo "# '<' lines were produced by NCBI rmblastn but not the Rust port"
+        echo "# '>' lines were produced by the Rust port but not NCBI rmblastn"
+        sed 's/^/< /' "$only_ncbi"
+        sed 's/^/> /' "$only_rust"
+    } > "$dir/diff.txt"
+
+    # commands.txt: exact invocations (BLASTMAT is inherited from the caller).
+    {
+        echo "BLASTMAT     : ${BLASTMAT:-<unset>}"
+        echo "ncbi binary  : $NCBI_RMBLASTN"
+        echo "rust binary  : $REAL_RMBLASTN"
+        echo "ncbi exit    : $ncbi_rc"
+        echo "rust exit    : $rust_rc"
+        echo ""
+        echo "# NCBI rmblastn command (as compared):"
+        printf '%q ' "$NCBI_RMBLASTN" "${ncbi_run[@]}"; echo ""
+        echo ""
+        echo "# Rust rmblastn command (as compared):"
+        printf '%q ' "$REAL_RMBLASTN" "${rust_run[@]}"; echo ""
+    } > "$dir/commands.txt"
+
+    # reproduce.sh: rerun both engines against the copied-in files and diff.
+    # Rewrite absolute input paths (query / db / matrix) to the local basename
+    # copies so the bundle is self-contained under BLASTMAT=.
+    qbn="$(basename "${qf:-query}")"
+    dbn="$(basename "${db_base:-db}")"
+    matbn="$(basename "${mat_file:-$mat_val}")"
+    relocal() {   # %q-escape one token, swapping known input paths for basenames
+        local t="$1"
+        case "$t" in
+            "$qf")        t="$qbn"   ;;
+            "$db_base")   t="$dbn"   ;;
+            "$mat_file")  t="$matbn" ;;
+            "$mat_val")   t="$matbn" ;;
+            -query=*|--query=*)   t="${t%%=*}=$qbn"   ;;
+            -db=*|--db=*)         t="${t%%=*}=$dbn"   ;;
+            -matrix=*|--matrix=*) t="${t%%=*}=$matbn" ;;
+        esac
+        printf '%q ' "$t"
+    }
+    {
+        echo "#!/bin/sh"
+        echo "# Reproduce the NCBI-vs-Rust rmblastn mismatch using the copies"
+        echo "# of the inputs saved alongside this script."
+        echo 'cd "$(dirname "$0")" || exit 1'
+        echo "export BLASTMAT=."
+        echo ""
+        echo "echo '== NCBI rmblastn =='"
+        printf '%q ' "$NCBI_RMBLASTN"; for t in "${ncbi_run[@]}"; do relocal "$t"; done
+        echo "2>ncbi.repro.stderr | sort > ncbi.repro.tab"
+        echo ""
+        echo "echo '== Rust rmblastn =='"
+        printf '%q ' "$REAL_RMBLASTN"; for t in "${rust_run[@]}"; do relocal "$t"; done
+        echo "2>rust.repro.stderr | sort > rust.repro.tab"
+        echo ""
+        echo "echo '== diff (NCBI vs Rust) =='"
+        echo "diff ncbi.repro.tab rust.repro.tab"
+    } > "$dir/reproduce.sh"
+    chmod 0755 "$dir/reproduce.sh"
+
+    echo "# verify rmblastn: debug bundle saved to: $dir" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Emit the Rust output (in the caller's requested format) to the caller and
+#    exit with the Rust return code.
+# ---------------------------------------------------------------------------
+cat "$caller_out"
+cat "$caller_err" >&2
+rm -rf "$tmpdir"
+exit $caller_rc

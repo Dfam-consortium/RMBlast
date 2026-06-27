@@ -1,0 +1,58 @@
+#!/bin/bash
+# Replacement for NCBI blastdbcmd used with the Rust rmblastn port.
+#
+# Supports: -db <prefix> -dbtype nucl -info
+#
+# The Rust rmblastn binary uses a UCSC 2bit file as its database.  This
+# wrapper calls twoBitInfo on <prefix>.2bit and prints a summary line in
+# the same format as the real blastdbcmd -info output.
+
+TWOBITINFO=/usr/local/ucscTools/twoBitInfo
+
+db=""
+dbtype="nucl"
+info=0
+
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+        -db)     i=$((i+1)); db="${args[$i]}" ;;
+        -dbtype) i=$((i+1)); dbtype="${args[$i]}" ;;
+        -info)   info=1 ;;
+    esac
+    i=$((i+1))
+done
+
+if [ -z "$db" ]; then
+    echo "[blastdbcmd] Error: -db <prefix> is required" >&2
+    exit 1
+fi
+
+twobit="${db}.2bit"
+
+if [ ! -f "$twobit" ]; then
+    echo "[blastdbcmd] Error: database file not found: $twobit" >&2
+    exit 1
+fi
+
+if [ "$info" -eq 1 ]; then
+    # twoBitInfo outputs two tab-separated columns: seqName  size
+    # Sum them to get total sequences and total bases.
+    "$TWOBITINFO" "$twobit" stdout | awk '
+        BEGIN { seqs=0; bases=0 }
+        { seqs++; bases += $2 }
+        END {
+            # Format bases with comma separators
+            n = bases
+            result = ""
+            while (n > 999) {
+                remainder = n % 1000
+                n = int(n / 1000)
+                result = sprintf(",%03d%s", remainder, result)
+            }
+            result = n result
+            printf "#   %d sequences; %s total bases\n", seqs, result
+        }
+    '
+fi
