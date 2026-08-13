@@ -20,6 +20,29 @@ single-engine wrappers precisely because the names collide.
 Key point: the Rust engine is pointed at the **FASTA file** as its database,
 never a `.2bit` — only the FASTA reproduces NCBI's ambiguity-code handling.
 
+## `--ncbi-compat` is forced on the Rust side
+
+This wrapper appends `--ncbi-compat` to every Rust invocation (both the
+comparison run and the caller-format run). It is *required* for a meaningful
+comparison:
+
+NCBI 2.17.1 silently drops HSPs with E-value > 10 (`Blast_HSPListReapByEvalue`,
+applied before masklevel) whenever it has valid Karlin-Altschul parameters —
+i.e. for every matrix in its hardcoded table, which is all the RepeatMasker
+`p##g` matrices. The Rust port applies **no** E-value cutoff by default, so
+without the flag it legitimately keeps a few marginal hits (E ≈ 10–30, typically
+scores just above `-min_raw_gapped_score`) that NCBI discards, and the wrapper
+would report them as mismatches. Measured example: human-1mb × shortlib with
+`20p41g.matrix` @25/5 — 691 hits without the flag vs NCBI's 686.
+
+`comparison.matrix` is absent from NCBI's table, so both engines run in sentinel
+mode there and cull nothing; those runs are unaffected either way.
+
+The flag is also stripped from the **NCBI** argument vector if a caller supplies
+it (NCBI has no such option and would abort with a usage error), and it is not
+added twice if the caller already passed it in either spelling
+(`-ncbi_compat` / `--ncbi-compat`).
+
 ## Usage
 
 Put this directory ahead of the real NCBI tools on `PATH` (or set it as the

@@ -24,6 +24,15 @@
 #   - Underscores in flag names are replaced with hyphens  (foo_bar -> foo-bar).
 #   - -dust no/yes is converted to --dust false/true.
 #   - -num_alignments (and its value) is silently dropped.
+#
+# ...with ONE addition specific to this verifying wrapper: --ncbi-compat is
+# forced on the Rust side.  Without it the Rust port applies NO E-value cutoff
+# by default, while NCBI 2.17.1 silently drops HSPs with E-value > 10 whenever
+# it has valid Karlin-Altschul parameters -- i.e. for every matrix in its
+# hardcoded table (the RepeatMasker p##g matrices).  Comparing the two engines
+# without the flag reports those extra Rust hits as mismatches even though both
+# engines are behaving correctly.  (comparison.matrix is absent from NCBI's
+# table, so it runs sentinel/no-cull in both engines and is unaffected.)
 
 REAL_RMBLASTN="/home/rhubley/projects/Claude/rmblast-port/rmblast/target/release/rmblastn"
 NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
@@ -116,6 +125,20 @@ while [ $i -lt ${#args[@]} ]; do
     fi
 done
 
+# Force NCBI 2.17.1 E-value semantics on the Rust engine (see header): the
+# port's default is no E-value cutoff, NCBI's is a silent cull at E > 10 for
+# every matrix in its hardcoded table.  Appending it here covers BOTH the
+# comparison run and the caller-format run, so what is verified is what the
+# caller receives.  Skipped if the caller already passed it (in any spelling --
+# -ncbi_compat has been normalized to --ncbi-compat by the loop above).
+has_ncbi_compat=false
+for a in "${new_args[@]}"; do
+    case "$a" in
+        --ncbi-compat|--ncbi-compat=*) has_ncbi_compat=true; break ;;
+    esac
+done
+$has_ncbi_compat || new_args+=("--ncbi-compat")
+
 # ---------------------------------------------------------------------------
 # 2. Resolve the database.  The caller passes the FASTA path as the db value
 #    (NCBI convention: -db <fasta>).  We feed:
@@ -165,6 +188,12 @@ while [ $i -lt ${#args[@]} ]; do
     elif [[ "$a" == "-db="* || "$a" == "--db="* ]]; then
         pre="${a%%=*}"; nv="${a#*=}"
         ncbi_args+=("${pre}=${nv%.2bit}")
+        i=$((i+1))
+    elif [[ "$a" == -ncbi[-_]compat || "$a" == --ncbi[-_]compat || \
+            "$a" == -ncbi[-_]compat=* || "$a" == --ncbi[-_]compat=* ]]; then
+        # Rust-only flag: NCBI 2.17.1 has no such option and aborts with a
+        # usage error if handed it.  Dropping it is exactly right -- NCBI's
+        # native behavior IS what the flag emulates.
         i=$((i+1))
     else
         ncbi_args+=("$a")
