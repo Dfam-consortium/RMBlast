@@ -3,8 +3,16 @@ name = "rmblast-lib"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Startup-time Gumbel parameter fitting via the vendored ALP C++ library, used
+# as the last resort of the E-value statistics hierarchy (see ka_stats).
+# Default-on; requires a C++ toolchain at build time.
+default = ["alp-fit"]
+alp-fit = ["rmstats/alp-fit"]
+
 [dependencies]
 rayon = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 memmap2 = { workspace = true }
+rmstats = { path = "../rmblast-stats/rmstats" }

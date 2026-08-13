@@ -1,0 +1,61 @@
+NCBI blast_stat.c table update to match the rmstats crate
+==========================================================
+
+The rmstats Rust crate ships two table entries that differ from the current
+RMBlast-patched blast_stat.c:
+
+  1. 30p53g.matrix @ 22/5 — the C source has an explicit placeholder
+     (lambda=K=H=0.1); rmstats carries the real ALP fit.
+  2. comparison.matrix @ 20/5 — absent from the C table (falls through to
+     Mode 3, evalue=1.0/bits=0.0); rmstats carries an ALP fit.
+
+Both fits were produced with rmblast-stats/alp-fit (ALP defaults
+eps_lambda=0.01 eps_K=0.05, seed 1, insertions_after_deletions=false,
+max_time 10), the identical settings that byte-for-byte reproduce the 40
+existing rmblast_*_values entries. Full fit outputs with error estimates:
+rmblast-stats/fits/30p53g.fit and rmblast-stats/fits/comparison.fit
+(bootstrap state in the matching .par files).
+
+Apply the following to c++/src/algo/blast/core/blast_stat.c to make NCBI
+rmblastn produce the same E-values/bit-scores as the Rust port for these two
+matrices. DO NOT apply while another session's comparison runs depend on the
+current binary; rebuild with:
+  cd ncbi-blast-2.17.0+-src/c++/ReleaseMT/build && make -j 20 all_p
+
+--- a/c++/src/algo/blast/core/blast_stat.c
++++ b/c++/src/algo/blast/core/blast_stat.c
+@@ -3323,7 +3323,9 @@
+ static array_of_8 rmblast_30p53g_values[1] = {
+-    {22, 5, (double) INT2_MAX, 0.1, 0.1, 0.1, 1.0, 0.0, 1.0, 1.0, 1.0}
++    {22, 5, (double) INT2_MAX,
++     0.1204393447, 0.1065198197, 0.1243912966,
++     0.9682296751, -21.9319682594,
++     1.0, 8.1529381219, 4.0254959683}
+ };
+ static Int4 rmblast_30p53g_prefs[1] = { BLAST_MATRIX_BEST };
+
+Then, immediately after the rmblast_30p53g block, add:
+
+ /* RepeatModeler comparison.matrix at gap costs 20/5 (ALP fit). -RMH- */
+ static array_of_8 rmblast_comparison_values[1] = {
+     {20, 5, (double) INT2_MAX,
+      0.0983622300, 0.0789918084, 0.1116129577,
+      0.8812796650, -26.8400935093,
+      1.0, 9.6806805374, 4.6681109347}
+ };
+ static Int4 rmblast_comparison_prefs[1] = { BLAST_MATRIX_BEST };
+
+And in BlastLoadMatrixValues() (after the "30p53g.matrix" registration at
+~line 3463):
+
+    matrix_info = MatrixInfoNew("comparison.matrix", rmblast_comparison_values,
+                                rmblast_comparison_prefs, 1);
+    ListNodeAddPointer(&retval, 0, matrix_info);
+
+Notes:
+  * Column 8 (C) is written as 1.0 above for consistency with the existing
+    baked entries, which also hardcode C=1.0; nothing consumes it. The
+    fitted C values are 0.7246924929 (30p53g) and 0.7198345171 (comparison)
+    and are preserved in the rmstats table and fits/SUMMARY.tsv.
+  * H is stored as lambda/alpha (alpha = ALP a_J + a_I) so that downstream
+    alpha = Lambda/H recovers ALP's a, matching all existing entries.

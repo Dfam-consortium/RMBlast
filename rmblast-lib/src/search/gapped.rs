@@ -23,6 +23,12 @@ use crate::matrix::ScoreMatrix;
 
 pub static TOTAL_DP_CELLS: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: number of times the REVERSE band pointer had to be clamped
+/// because `first_b_index` reached `n` (see `align_ex_score_only_inner`).  The clamp
+/// is behaviour-neutral — the inner loop runs zero times in that state — this counter
+/// only records how often the degenerate band state occurs.
+pub static REVERSE_FBI_CLAMPED: AtomicU64 = AtomicU64::new(0);
+
 const SCRIPT_GAP_IN_A: u8 = 0;
 const SCRIPT_SUB: u8 = 3;
 const SCRIPT_GAP_IN_B: u8 = 6;
@@ -181,7 +187,18 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
         // produces a register pointer naturally due to the decrement direction.
         // SAFETY: first_b_index <= b_idx < inner_end <= n <= b.len(); BLASTNA values 0-14.
         let mut b_cur: *const u8 = if REVERSE {
-            unsafe { b.as_ptr().add(n - 1 - first_b_index) }
+            // `first_b_index` can reach `n` (whole band x-dropped except the b_idx==n
+            // sentinel, which keeps b_size at n+1 so the `first_b_index >= b_size`
+            // break below does not fire).  The inner loop then runs zero times
+            // (b_idx == first_b_index == inner_end), so the pointer is never read —
+            // but forming it would underflow `n - 1 - first_b_index` (debug panic,
+            // out-of-bounds `add` = UB in release).  Substitute a valid placeholder.
+            if first_b_index < n {
+                unsafe { b.as_ptr().add(n - 1 - first_b_index) }
+            } else {
+                REVERSE_FBI_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                b.as_ptr()
+            }
         } else {
             // black_box makes this pointer opaque to LLVM, preventing the base+index
             // rewrite that would otherwise spill b.as_ptr() to 0x80(%rsp) each cell.
@@ -819,6 +836,43 @@ T -4  -4  -4   5
         let s: Vec<u8> = vec![0, 1, 2, 3];
         let r = align_ex(&a, &s, 0, 4, 4, 4, 50, &m, false, &mut w);
         assert_eq!(r.score, 0);
+    }
+
+    /// Regression: `align_ex_score_only` with `reverse = true` (the LEFT extension of
+    /// `gapped_extend_score_only`) used to compute its band pointer as
+    /// `b.as_ptr().add(n - 1 - first_b_index)`.  `first_b_index` can reach `n` when the
+    /// whole band x-drops except the b_idx == n sentinel cell (which keeps `b_size` at
+    /// n+1, so the `first_b_index >= b_size` loop break does not fire).  That underflowed
+    /// the usize subtraction: a panic in debug builds, an out-of-bounds `add` in release.
+    /// Random low-identity pairs under a tight x-dropoff drive the band into that state.
+    #[test]
+    fn test_reverse_band_no_underflow() {
+        let m = mat();
+        let mut dp: Vec<DpCell> = Vec::new();
+        // xorshift64* — deterministic, no rand dependency.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state
+        };
+        for trial in 0..4000 {
+            let alen = 1 + (next() % 60) as usize;
+            let blen = 1 + (next() % 60) as usize;
+            let a: Vec<u8> = (0..alen).map(|_| (next() % 4) as u8).collect();
+            let b: Vec<u8> = (0..blen).map(|_| (next() % 4) as u8).collect();
+            // Tight x-dropoff is what forces aggressive band pruning.
+            let xdrop = 1 + (next() % 20) as i32;
+            for &reverse in &[true, false] {
+                let (score, ..) = align_ex_score_only(
+                    &a, &b, alen, blen, 8, 2, xdrop, &m, reverse, &mut dp, false,
+                );
+                assert!(score >= 0, "trial {} reverse {} score {}", trial, reverse, score);
+            }
+        }
+        // Guard the guard: confirm these inputs really do drive the band into the
+        // degenerate state, so the test cannot silently stop covering the bug.
+        assert!(REVERSE_FBI_CLAMPED.load(Ordering::Relaxed) > 0,
+                "no reverse-band clamp observed — test inputs no longer reach the bug");
     }
 
     #[test]

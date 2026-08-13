@@ -24,6 +24,27 @@ pub enum MatrixError {
     MissingSymbol(char),
 }
 
+/// Gapped Karlin-Altschul parameters declared in a `# KARLIN` comment line of
+/// a matrix file (an rmblastn-rs extension; NCBI ignores `#` comments):
+///
+/// ```text
+/// # KARLIN lambda 0.1276 k 0.0179 h 0.0362 alpha 3.52 beta -26.8
+/// ```
+///
+/// Keys are case-insensitive key/value pairs in any order (same style as the
+/// `# FREQS` line).  `lambda` and `k` are required for the entry to be usable;
+/// exactly one of `h` or `alpha` suffices (alpha = lambda/H); `beta` defaults
+/// to 0.  Unset fields are stored as 0.0.  These values feed E-value/bit-score
+/// *reporting only* — never the seeding cutoff (see `ka_stats`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KarlinComment {
+    pub lambda: f64,
+    pub k: f64,
+    pub h: f64,
+    pub alpha: f64,
+    pub beta: f64,
+}
+
 /// A 16×16 scoring matrix in BLASTNA encoding, plus optional base frequencies
 /// and lambda (used by complexity adjustment).
 #[derive(Debug, Clone)]
@@ -35,12 +56,15 @@ pub struct ScoreMatrix {
     /// Lambda parameter estimated from the matrix + frequencies.
     pub lambda: f64,
     pub name: String,
+    /// Karlin-Altschul parameters from a `# KARLIN` comment line, if present.
+    pub karlin: Option<KarlinComment>,
 }
 
 impl ScoreMatrix {
     /// Parse a matrix from any `BufRead` source.
     pub fn from_reader<R: BufRead>(name: &str, reader: R) -> Result<Self, MatrixError> {
         let mut freqs = [0f64; BLASTNA_SIZE];
+        let mut karlin: Option<KarlinComment> = None;
         let mut col_order: Vec<u8> = Vec::new(); // BLASTNA indices of columns
         let mut raw_rows: Vec<(u8, Vec<i32>)> = Vec::new(); // (blastna_row, scores)
 
@@ -49,11 +73,15 @@ impl ScoreMatrix {
             let trimmed = line.trim();
 
             if trimmed.is_empty() || trimmed.starts_with('#') {
-                // Look for FREQS annotation
+                // Look for FREQS / KARLIN annotations
                 if let Some(rest) = trimmed.strip_prefix("# FREQS") {
                     parse_freqs(rest, &mut freqs)?;
                 } else if let Some(rest) = trimmed.strip_prefix("#FREQS") {
                     parse_freqs(rest, &mut freqs)?;
+                } else if let Some(rest) = trimmed.strip_prefix("# KARLIN") {
+                    karlin = Some(parse_karlin(rest)?);
+                } else if let Some(rest) = trimmed.strip_prefix("#KARLIN") {
+                    karlin = Some(parse_karlin(rest)?);
                 }
                 continue;
             }
@@ -144,6 +172,7 @@ impl ScoreMatrix {
             freqs,
             lambda,
             name: name.to_owned(),
+            karlin,
         })
     }
 
@@ -177,6 +206,27 @@ fn matrix_symbol_to_blastna(ch: u8) -> u8 {
         b'-' | b'X' | b'x' => 15,
         _ => IUPAC_TO_BLASTNA[ch as usize],
     }
+}
+
+fn parse_karlin(rest: &str) -> Result<KarlinComment, MatrixError> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut kc = KarlinComment::default();
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        let val: f64 = tokens[i + 1].parse().map_err(|_| {
+            MatrixError::Parse(format!("bad KARLIN value '{}' for key '{}'", tokens[i + 1], tokens[i]))
+        })?;
+        match tokens[i].to_ascii_lowercase().as_str() {
+            "lambda" => kc.lambda = val,
+            "k"      => kc.k = val,
+            "h"      => kc.h = val,
+            "alpha"  => kc.alpha = val,
+            "beta"   => kc.beta = val,
+            other    => return Err(MatrixError::Parse(format!("unknown KARLIN key '{}'", other))),
+        }
+        i += 2;
+    }
+    Ok(kc)
 }
 
 fn parse_freqs(rest: &str, freqs: &mut [f64; BLASTNA_SIZE]) -> Result<(), MatrixError> {
@@ -304,6 +354,28 @@ X -30 -30 -30 -30 -30 -30
         // Core ACGT scores unaffected by the trailing X column.
         assert_eq!(mat.score(0, 0), 9);
         assert_eq!(mat.score(3, 0), -13);
+    }
+
+    #[test]
+    fn test_karlin_comment_parsed() {
+        let with_karlin = format!(
+            "# KARLIN lambda 0.1276 K 0.0179 H 0.3562 beta -26.84\n{}",
+            SAMPLE_MATRIX
+        );
+        let mat = ScoreMatrix::from_reader("test", Cursor::new(with_karlin)).unwrap();
+        let kc = mat.karlin.expect("KARLIN line should be parsed");
+        assert!((kc.lambda - 0.1276).abs() < 1e-12);
+        assert!((kc.k - 0.0179).abs() < 1e-12);
+        assert!((kc.h - 0.3562).abs() < 1e-12);
+        assert_eq!(kc.alpha, 0.0);
+        assert!((kc.beta - -26.84).abs() < 1e-12);
+        // Matrix body still parsed normally alongside the comment.
+        assert_eq!(mat.score(0, 0), 9);
+
+        // No KARLIN line -> None; unknown key -> parse error.
+        assert!(ScoreMatrix::from_reader("test", Cursor::new(SAMPLE_MATRIX)).unwrap().karlin.is_none());
+        let bad = format!("# KARLIN lambdo 0.1\n{}", SAMPLE_MATRIX);
+        assert!(ScoreMatrix::from_reader("test", Cursor::new(bad)).is_err());
     }
 
     #[test]

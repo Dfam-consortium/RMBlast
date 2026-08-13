@@ -154,7 +154,11 @@ fn s_fill_contig_mb_table(
 
             // Complete, unambiguous lw-mer.
             // q_off_1based = read_pos - lw + 2 == 0-based_q_off + 1.
-            let q_off_1 = (read_pos - lw + 2) as i32;
+            // NOTE: written as `+ 2 - lw` (not `- lw + 2`): read_pos can equal lw-1
+            // (the first complete word of a region starting at 0), and the
+            // left-to-right usize evaluation of `read_pos - lw` would underflow —
+            // harmless in release (it wraps back on the `+ 2`) but a panic in debug.
+            let q_off_1 = (read_pos + 2 - lw) as i32;
 
             if lookup.hashtable[ecode as usize] == 0 {
                 mb_pv_set(&mut lookup.pv_array, ecode, lookup.pv_array_bts);

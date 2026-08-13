@@ -12,10 +12,11 @@ use rayon::prelude::*;
 
 use rmblast_lib::matrix::ScoreMatrix;
 use rmblast_lib::hits::Strand;
+use rmblast_lib::ka_stats::{self, KaContext, MatrixCliOverrides, RmStats};
 use rmblast_lib::options::{MtMode, SearchParams, SeedMode};
 use rmblast_lib::output::{
-    parse_outfmt, write_tabular, write_pairwise_program_header, write_pairwise_results,
-    write_pairwise_footer, AlignResult, OutField,
+    outfmt_needs_stats, parse_outfmt, write_tabular, write_pairwise_program_header,
+    write_pairwise_results, write_pairwise_footer, AlignResult, OutField,
 };
 use rmblast_lib::search::{apply_mask_level, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 // use rmblast_lib::search::engine::{COUNT_SEEDS, COUNT_UNGAPPED_HITS, COUNT_PRELIM_GAPPED, COUNT_FINAL_GAPPED, COUNT_FINAL_HITS};
@@ -128,7 +129,10 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     xdrop_gap_final: i32,
 
-    /// Minimum raw gapped score to report
+    /// Cutoff for the preliminary gapped stage. NOT a floor on the reported
+    /// score: traceback re-aligns under --xdrop-gap-final and may score lower,
+    /// and that lower score is reported (matches NCBI rmblastn). Post-filter if
+    /// you need a hard floor.
     #[arg(long, default_value_t = 0)]
     min_raw_gapped_score: i32,
 
@@ -178,6 +182,41 @@ struct Args {
     /// Format: sseqid TAB strand TAB qstart TAB qend TAB sstart TAB send TAB score
     #[arg(long)]
     dump_prelims: Option<String>,
+
+    /// Karlin-Altschul lambda override for E-value statistics of a matrix
+    /// absent from the baked table (NCBI -matrix_lambda; needs _k and _alpha too)
+    #[arg(long, alias = "matrix_lambda", default_value_t = 0.0)]
+    matrix_lambda: f64,
+
+    /// Karlin-Altschul K override (NCBI -matrix_k)
+    #[arg(long, alias = "matrix_k", default_value_t = 0.0)]
+    matrix_k: f64,
+
+    /// Karlin-Altschul alpha override (NCBI -matrix_alpha; H = lambda/alpha)
+    #[arg(long, alias = "matrix_alpha", default_value_t = 0.0)]
+    matrix_alpha: f64,
+
+    /// Karlin-Altschul beta override for the length adjustment (NCBI -matrix_beta)
+    #[arg(long, alias = "matrix_beta", default_value_t = 0.0, allow_hyphen_values = true)]
+    matrix_beta: f64,
+
+    /// Expect-value threshold: drop HSPs with E-value above this.  By
+    /// default NO E-value culling happens unless this flag is given (the
+    /// statistics then come from the full source hierarchy: baked table,
+    /// -matrix_* overrides, # KARLIN comment, or ALP fit).  Under
+    /// --ncbi-compat this defaults to 10, matching NCBI.
+    #[arg(long)]
+    evalue: Option<f64>,
+
+    /// Emulate NCBI rmblastn 2.17.1 E-value behavior exactly: statistics
+    /// only from the hardcoded matrix table (warts included: 30p53g's
+    /// placeholder values) or -matrix_* overrides, sentinel 1.0/0.0
+    /// rendering otherwise, and HSPs with E-value above --evalue (default
+    /// 10) silently dropped before masklevel — 2.17.1 has done this for
+    /// table matrices since the table was introduced.  Use for parity
+    /// benchmarks and legacy pipelines.
+    #[arg(long, alias = "ncbi_compat", action = clap::ArgAction::SetTrue)]
+    ncbi_compat: bool,
 }
 
 /// Resolve a `--db` argument to an existing file path.
@@ -320,6 +359,71 @@ fn main() -> Result<()> {
         0
     };
 
+    // Karlin-Altschul statistics context.
+    //
+    // Default mode: nothing is culled unless --evalue is given; the printed
+    // evalue/bitscore columns (when requested) come from the full source
+    // hierarchy.  Statistics are only resolved at all when they will be
+    // consumed (columns requested or --evalue given) — the lazy-stats rule
+    // that keeps the ALP fit free otherwise.
+    //
+    // --ncbi-compat: emulate 2.17.1 — native sources only, and the reap is
+    // always on with NCBI's default threshold of 10.
+    //
+    // Resolution must happen here — single-threaded, before any searches —
+    // because the ALP fitter uses process-global RNG state.
+    let stats_requested = match &output_format {
+        OutputFormat::Tabular(fields) => outfmt_needs_stats(fields),
+        OutputFormat::Pairwise => false,
+    };
+    let stats_mode = if args.ncbi_compat { ka_stats::StatsMode::NcbiCompat } else { ka_stats::StatsMode::Default };
+    let reap_threshold: Option<f64> = if args.ncbi_compat {
+        Some(args.evalue.unwrap_or(10.0))
+    } else {
+        args.evalue
+    };
+    let user_cli = MatrixCliOverrides {
+        matrix_lambda: args.matrix_lambda,
+        matrix_k: args.matrix_k,
+        matrix_alpha: args.matrix_alpha,
+        matrix_beta: args.matrix_beta,
+    };
+    let ka_ctx: KaContext = ka_stats::resolve(
+        &matrix, &args.matrix, args.gapopen, args.gapextend, &user_cli,
+        stats_requested || reap_threshold.is_some(),
+        stats_mode,
+    );
+    let reap_on = reap_threshold.is_some() && ka_ctx.reap_available();
+    if stats_requested || reap_threshold.is_some() {
+        eprintln!(
+            "# rmblastn: E-value statistics{}: {}",
+            if args.ncbi_compat { " (--ncbi-compat 2.17.1 emulation)" } else { "" },
+            ka_ctx.source.describe()
+        );
+        if ka_ctx.kbp_gap.is_valid() {
+            eprintln!(
+                "#   lambda={:.10} K={:.10} H={:.10}",
+                ka_ctx.kbp_gap.lambda, ka_ctx.kbp_gap.k, ka_ctx.kbp_gap.h
+            );
+        }
+        match (reap_on, reap_threshold) {
+            (true, Some(t)) => eprintln!("#   -evalue cutoff ACTIVE: threshold {}", t),
+            (false, Some(t)) => eprintln!(
+                "#   -evalue cutoff requested (threshold {}) but no statistics available — nothing culled",
+                t
+            ),
+            (_, None) => eprintln!("#   -evalue cutoff: off (no --evalue given)"),
+        }
+    }
+    // Reporting stats are built per query below; this closure builds the
+    // reap context (None = nothing culled).
+    let reap_for_query = |query_len: i32| -> Option<(RmStats, f64)> {
+        let t = reap_threshold?;
+        ka_ctx
+            .reap_stats_for_query(query_len, total_db_letters as i64, n_db_seqs as i32)
+            .map(|s| (s, t))
+    };
+
     // Get the 2bit file modification time for the "Posted date" footer line.
     let db_mtime_unix: Option<u64> = std::fs::metadata(&db_path)
         .ok()
@@ -354,6 +458,7 @@ fn main() -> Result<()> {
                 let mut results = search_db_parallel(
                     &qrec.seq, &qrec.id, &subject_names, &db, &params, &matrix,
                     avg_subj_length, args.dump_prelims.as_deref(),
+                    reap_for_query(full_q_len as i32),
                 );
                 results.sort_by(|a, b| {
                     let qa = a.hsp.q_len;
@@ -374,7 +479,10 @@ fn main() -> Result<()> {
                             .context("writing pairwise results")?;
                     }
                     OutputFormat::Tabular(fields) => {
-                        write_all(&mut out, &results, fields)?;
+                        let qstats = stats_requested.then(|| {
+                            ka_ctx.for_query(full_q_len as i32, total_db_letters as i64, n_db_seqs as i32)
+                        });
+                        write_all(&mut out, &results, fields, qstats.as_ref())?;
                     }
                 }
             }
@@ -389,6 +497,7 @@ fn main() -> Result<()> {
                     let mut qr = search_db_parallel(
                         &q.seq, &q.id, &subject_names, &db, &params, &matrix,
                         avg_subj_length, None,
+                        reap_for_query(q.len() as i32),
                     );
                     qr.sort_by(|a, b| b.hsp.score.cmp(&a.hsp.score));
                     qr
@@ -402,7 +511,10 @@ fn main() -> Result<()> {
                             .context("writing pairwise results")?;
                     }
                     OutputFormat::Tabular(fields) => {
-                        write_all(&mut out, &results, fields)?;
+                        let qstats = stats_requested.then(|| {
+                            ka_ctx.for_query(q.len() as i32, total_db_letters as i64, n_db_seqs as i32)
+                        });
+                        write_all(&mut out, &results, fields, qstats.as_ref())?;
                     }
                 }
             }
@@ -423,6 +535,16 @@ fn main() -> Result<()> {
     }
 
     out.flush()?;
+
+    if std::env::var_os("RMBLAST_DEBUG_COUNTERS").is_some() {
+        eprintln!(
+            "REVERSE_FBI_CLAMPED={} IMPROVE_SEED_NEGATIVE_OFFSET={}",
+            rmblast_lib::search::gapped::REVERSE_FBI_CLAMPED
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rmblast_lib::search::engine::IMPROVE_SEED_NEGATIVE_OFFSET
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
 
     // use std::sync::atomic::Ordering;
     // let dp_cells = TOTAL_DP_CELLS.load(Ordering::Relaxed);
@@ -560,6 +682,11 @@ fn search_db_parallel(
     matrix: &ScoreMatrix,
     avg_subj_length: u64,
     dump_prelims: Option<&str>,
+    // -evalue reap (NCBI Blast_HSPListReapByEvalue): drop HSPs whose E-value
+    // exceeds the threshold, BEFORE masklevel — reaping changes which HSPs
+    // compete there.  None when statistics are unavailable (NCBI sentinel
+    // mode) or come from a reporting-only source.
+    reap: Option<(rmblast_lib::ka_stats::RmStats, f64)>,
 ) -> Vec<AlignResult> {
     const INITIAL_CHUNK_SIZE: usize = 1_000_000;
     const OVERLAP: usize = 100;
@@ -625,6 +752,9 @@ fn search_db_parallel(
                 r
             })
             .collect();
+        if let Some((stats, expect)) = &reap {
+            results.retain(|r| stats.evalue(r.hsp.score) <= *expect);
+        }
         // Cross-subject masklevel: mirrors Blast_HSPResultsApplyMasklevel — all subjects
         // combined, sorted by (score DESC, oid DESC), then filtered globally.
         apply_mask_level(&mut results, params.mask_level, subject_names);
@@ -732,6 +862,9 @@ fn search_db_parallel(
         })
         .collect();
 
+    if let Some((stats, expect)) = &reap {
+        all_results.retain(|r| stats.evalue(r.hsp.score) <= *expect);
+    }
     // Cross-subject masklevel: mirrors Blast_HSPResultsApplyMasklevel — all subjects
     // combined, sorted by (score DESC, oid DESC), then filtered globally.
     apply_mask_level(&mut all_results, params.mask_level, subject_names);
@@ -743,9 +876,14 @@ fn search_db_parallel(
     all_results
 }
 
-fn write_all<W: Write>(w: &mut W, results: &[AlignResult], fields: &[OutField]) -> Result<()> {
+fn write_all<W: Write>(
+    w: &mut W,
+    results: &[AlignResult],
+    fields: &[OutField],
+    ka: Option<&RmStats>,
+) -> Result<()> {
     for r in results {
-        write_tabular(w, r, '\t', fields).context("writing output")?;
+        write_tabular(w, r, '\t', fields, ka).context("writing output")?;
     }
     Ok(())
 }

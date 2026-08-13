@@ -1,0 +1,17 @@
+[package]
+name = "rmstats"
+version = "0.1.0"
+edition = "2021"
+description = "Faithful Rust port of NCBI BLAST (RMBlast-patched) Karlin-Altschul E-value/bit-score statistics for rmblastn"
+
+[features]
+default = []
+# Startup-time Gumbel parameter fitting via the ALP C++ library (LAST-style).
+alp-fit = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[lib]
+name = "rmstats"
+path = "src/lib.rs"

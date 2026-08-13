@@ -59,6 +59,11 @@ pub enum OutField {
     CpgSites,
     QSeq,
     SSeq,
+    /// Expect value (requires Karlin-Altschul statistics; prints "1.0" when
+    /// unavailable, matching the NCBI Mode-3 sentinel).
+    Evalue,
+    /// Bit score (prints " 0.0" when statistics are unavailable).
+    Bitscore,
 }
 
 impl OutField {
@@ -84,9 +89,18 @@ impl OutField {
             "cpg_sites"      => Some(Self::CpgSites),
             "qseq"           => Some(Self::QSeq),
             "sseq"           => Some(Self::SSeq),
+            "evalue"         => Some(Self::Evalue),
+            "bitscore"       => Some(Self::Bitscore),
             _                => None,
         }
     }
+}
+
+/// True if any requested field needs Karlin-Altschul statistics — the gate
+/// that keeps `ka_stats::resolve` (including a potential ALP fit) and all
+/// per-HSP E-value math from running when the output doesn't ask for them.
+pub fn outfmt_needs_stats(fields: &[OutField]) -> bool {
+    fields.iter().any(|f| matches!(f, OutField::Evalue | OutField::Bitscore))
 }
 
 /// Parse an outfmt string like "6 score perc_sub ... qseq sseq" into a field list.
@@ -98,12 +112,64 @@ pub fn parse_outfmt(s: &str) -> Vec<OutField> {
         .collect()
 }
 
+/// C `%e`-style scientific formatting: signed exponent, minimum two exponent
+/// digits ("1.23e-05"), unlike Rust's `{:e}` ("1.23e-5").
+fn c_sci(value: f64, precision: usize) -> String {
+    let s = format!("{:.*e}", precision, value);
+    match s.split_once('e') {
+        Some((mant, exp)) => {
+            let exp: i32 = exp.parse().unwrap_or(0);
+            let sign = if exp < 0 { '-' } else { '+' };
+            format!("{}e{}{:02}", mant, sign, exp.abs())
+        }
+        None => s,
+    }
+}
+
+/// Format an E-value exactly as NCBI's tabular output does
+/// (CBlastTabularInfo::SetScores: CAlignFormatUtil::GetScoreString, with the
+/// whole [1e-180, 0.0009) band overridden by NStr::DoubleToString(evalue, 2,
+/// fDoubleScientific) = C "%.2e").  The Mode-3 sentinel 1.0 prints as "1.0".
+pub fn format_evalue(evalue: f64) -> String {
+    if evalue < 1.0e-180 {
+        "0.0".to_string()
+    } else if evalue < 0.0009 {
+        c_sci(evalue, 2)                  // tabular override of %2.0le/%3.0le
+    } else if evalue < 0.1 {
+        format!("{:.3}", evalue)          // %4.3lf (width always exceeded)
+    } else if evalue < 1.0 {
+        format!("{:.2}", evalue)          // %3.2lf
+    } else if evalue < 10.0 {
+        format!("{:.1}", evalue)          // %2.1lf
+    } else {
+        format!("{:.0}", evalue)          // %2.0lf
+    }
+}
+
+/// Format a bit score exactly as CAlignFormatUtil::GetScoreString does.  Note
+/// the truncating (long) cast for the >99.9 arm and the width-4 space padding
+/// of %4.1lf (the sentinel 0.0 prints as " 0.0").
+pub fn format_bit_score(bits: f64) -> String {
+    if bits > 99999.0 {
+        c_sci(bits, 3)                    // %5.3le (width always exceeded)
+    } else if bits > 99.9 {
+        format!("{:>3}", bits as i64)     // %3.0ld — truncation toward zero
+    } else {
+        format!("{:>4.1}", bits)          // %4.1lf
+    }
+}
+
 /// Write a single HSP in NCBI rmblastn outfmt-6 style (tab-separated).
+///
+/// `ka` supplies Karlin-Altschul statistics for the `evalue`/`bitscore`
+/// fields; pass `None` when those fields are absent (or to force the NCBI
+/// Mode-3 sentinel rendering: evalue "1.0", bitscore " 0.0").
 pub fn write_tabular<W: Write>(
     w: &mut W,
     r: &AlignResult,
     delimiter: char,
     fields: &[OutField],
+    ka: Option<&rmstats::RmStats>,
 ) -> std::io::Result<()> {
     let h  = &r.hsp;
     let st = &r.stats;
@@ -152,6 +218,16 @@ pub fn write_tabular<W: Write>(
             OutField::SSeq => {
                 let iupac = blastna_to_iupac_aligned(&h.s_seq);
                 w.write_all(&iupac)?;
+            }
+            // The final (complexity-adjusted) score is what NCBI computes
+            // E-values from at traceback time — h.score is exactly that.
+            OutField::Evalue => {
+                let e = ka.map_or(1.0, |s| s.evalue(h.score));
+                write!(w, "{}", format_evalue(e))?;
+            }
+            OutField::Bitscore => {
+                let b = ka.map_or(0.0, |s| s.bit_score(h.score));
+                write!(w, "{}", format_bit_score(b))?;
             }
         }
     }
@@ -468,4 +544,39 @@ pub fn write_pairwise_results<W: Write>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Expected strings mirror C snprintf with the NCBI tabular format rules
+    // (SetScores: GetScoreString + the %.2e override for [1e-180, 0.0009)).
+    #[test]
+    fn evalue_formatting_matches_ncbi_tabular() {
+        assert_eq!(format_evalue(1.0e-200), "0.0");
+        assert_eq!(format_evalue(2.5e-105), "2.50e-105");
+        assert_eq!(format_evalue(1.234e-30), "1.23e-30");
+        assert_eq!(format_evalue(5.0e-5), "5.00e-05");
+        assert_eq!(format_evalue(8.9e-4), "8.90e-04");
+        assert_eq!(format_evalue(0.0009), "0.001");
+        assert_eq!(format_evalue(0.05), "0.050");
+        assert_eq!(format_evalue(0.55), "0.55");
+        assert_eq!(format_evalue(1.0), "1.0");    // Mode-3 sentinel rendering
+        assert_eq!(format_evalue(3.7), "3.7");
+        assert_eq!(format_evalue(15.0), "15");
+        assert_eq!(format_evalue(2000.0), "2000");
+    }
+
+    #[test]
+    fn bit_score_formatting_matches_ncbi() {
+        assert_eq!(format_bit_score(0.0), " 0.0");    // sentinel: %4.1lf pads
+        assert_eq!(format_bit_score(7.25), " 7.2");
+        assert_eq!(format_bit_score(45.67), "45.7");
+        assert_eq!(format_bit_score(99.9), "99.9");
+        assert_eq!(format_bit_score(99.95), " 99");   // (long) truncation arm
+        assert_eq!(format_bit_score(234.7), "234");
+        assert_eq!(format_bit_score(12345.9), "12345");
+        assert_eq!(format_bit_score(123456.0), "1.235e+05");
+    }
 }

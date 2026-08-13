@@ -7,5 +7,6 @@ pub mod lookup;
 pub mod search;
 pub mod hits;
 pub mod stats;
+pub mod ka_stats;
 pub mod output;
 pub mod blast;

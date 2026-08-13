@@ -1,0 +1,14 @@
+# Rust build output (workspace root and any member crate)
+/target/
+**/target/
+
+# C/C++ build output: the vendored ALP library and the alp-fit tool are built
+# from source by rmstats' build.rs (feature "alp-fit") and alp-fit/Makefile.
+*.o
+*.a
+/rmblast-stats/alp-fit/alp_fit
+
+# Editor/backup files
+*~
+*.swp
+rmblast-stats/fits/*.err

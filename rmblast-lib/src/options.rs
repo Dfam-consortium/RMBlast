@@ -58,6 +58,18 @@ pub struct SearchParams {
     pub xdrop_gap_final: i32,
 
     // Filtering
+    /// Score cutoff for the **preliminary** gapped stage — NOT a floor on the
+    /// reported score.  A prelim HSP scoring at or above this is promoted to
+    /// traceback, but traceback re-aligns under `xdrop_gap_final` and may return a
+    /// lower score, which is then reported as-is.  This matches NCBI rmblastn:
+    /// `Blast_TracebackFromHSPList` does not re-test the cutoff (see
+    /// PORTING_NOTES.md §9.4).  Measured against rmblastn 2.17.1: ~0.2% of hits fall
+    /// below a cutoff of 200, ~2% below a cutoff of 95 (minimum observed score: 1).
+    ///
+    /// Two later stages *do* re-apply it: `complexity_adjust` (drops adjusted scores
+    /// below the cutoff) and the cut-HSP `reevaluate_gapped` path.  Neither closes the
+    /// gap for the main path.  Callers needing a hard floor must filter
+    /// `AlignResult::hsp.score` themselves.
     pub min_raw_gapped_score: i32,
     /// Ungapped pre-filter keep threshold.  `None` = use the historical fixed
     /// fallback `min_raw_gapped_score / 2`.  `Some(c)` = a Karlin-Altschul–derived

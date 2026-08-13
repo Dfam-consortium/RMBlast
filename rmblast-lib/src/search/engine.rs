@@ -28,6 +28,11 @@ pub static COUNT_PRELIM_GAPPED: AtomicU64 = AtomicU64::new(0);
 pub static COUNT_FINAL_GAPPED: AtomicU64 = AtomicU64::new(0);
 pub static COUNT_FINAL_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: times `improve_seed`'s minus branch produced a negative
+/// `max_offset` and fell back to the unimproved seed.  Expected to stay at 0 — it is
+/// only reachable at `score == 1` with the scan pinned to the array start.
+pub static IMPROVE_SEED_NEGATIVE_OFFSET: AtomicU64 = AtomicU64::new(0);
+
 use crate::blast::mblookup::{blast_mb_lookup_table_new, blast_mb_scan_subject, BlastMBLookupTable};
 use crate::blast::nalookup::{blast_na_lookup_table_new, choose_lut_width, BlastNaLookupTable};
 use crate::blast::nascan::blast_na_scan_subject;
@@ -290,7 +295,10 @@ fn improve_seed(
             .min(search_s_top.saturating_sub(prelim_s_start) + 1);
 
         let mut max_score = 0i32;
-        let mut max_offset = q_seed;
+        // Signed, because the post-loop index below can legitimately land one position
+        // BELOW the array start in this mirrored coordinate frame — see the comment at
+        // the `is_match && score > max_score` block after the loop.
+        let mut max_offset = q_seed as i64;
         let mut score = 0i32;
         let mut is_match = false;
         let mut prev_match = false;
@@ -307,7 +315,7 @@ fn improve_seed(
                 } else if score > max_score {
                     // qi is the first non-match going downward; run was above qi.
                     max_score = score;
-                    max_offset = qi + (score / 2) as usize;
+                    max_offset = qi as i64 + (score / 2) as i64;
                 }
             } else if is_match {
                 score += 1;
@@ -321,12 +329,29 @@ fn improve_seed(
         }
         if is_match && score > max_score {
             max_score = score;
-            let qi = search_q_top - q_len;
-            max_offset = qi + (score / 2) as usize;
+            // NCBI (blast_gapalign.c:3477) computes this in signed Int4: after its loop
+            // `index == q_start + q_len`, the EXCLUSIVE end of the scan, and
+            // `max_offset = index - score/2` steps back into range.  This branch mirrors
+            // that scan in reversed (FWD-genomic) coordinates, so the exclusive end lands
+            // one position BELOW `prelim_q_start` — i.e. -1 when the prelim HSP starts at
+            // query offset 0, which is common when a TE library is the query.  The
+            // `+ score/2` then brings it back, exactly as NCBI's `- score/2` does.
+            // Computing the intermediate in usize underflowed: a debug panic, and in
+            // release a double wrap that happened to land on the correct value.
+            let qi = search_q_top as i64 - q_len as i64;
+            max_offset = qi + (score / 2) as i64;
         }
         if max_score > 0 {
-            let delta = search_q_top - max_offset;
-            let new_s_seed = search_s_top.saturating_sub(delta);
+            if max_offset < 0 {
+                // Only reachable at score == 1 with the scan pinned to the array start.
+                // NCBI's frame keeps this non-negative, so there is no faithful value to
+                // mirror; fall back to NCBI's no-improvement outcome rather than emit a
+                // wrapped seed (which is what the usize arithmetic used to return).
+                IMPROVE_SEED_NEGATIVE_OFFSET.fetch_add(1, Ordering::Relaxed);
+                return (q_seed as u32, s_seed as u32);
+            }
+            let delta = search_q_top as i64 - max_offset;
+            let new_s_seed = (search_s_top as i64 - delta).max(0);
             (max_offset as u32, new_s_seed as u32)
         } else {
             (q_seed as u32, s_seed as u32)
@@ -3538,7 +3563,7 @@ mod tests {
                 scores[i][j] = if i == j { 1 } else { -3 };
             }
         }
-        ScoreMatrix { scores, freqs: [0.0f64; 16], lambda: 0.0, name: "blastn_1m3".to_string() }
+        ScoreMatrix { scores, freqs: [0.0f64; 16], lambda: 0.0, name: "blastn_1m3".to_string(), karlin: None }
     }
 
     fn make_prelim(score: i32, q_start: u32, q_end: u32, s_start: u32, s_end: u32) -> PrelimHsp {
