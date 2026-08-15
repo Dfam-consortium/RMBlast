@@ -557,6 +557,20 @@ fn main() -> Result<()> {
     //     dp_cells,
     // );
 
+    if std::env::var_os("RMBLAST_DP_STATS").is_some() {
+        use std::sync::atomic::Ordering;
+        use rmblast_lib::search::gapped::{
+            SCORE_ONLY_ROWS, SCORE_ONLY_SIMD_ROWS, SCORE_ONLY_WIDE_CELLS, TOTAL_DP_CELLS,
+        };
+        eprintln!(
+            "DP_STATS score_only: rows={} simd_rows={} cells={} wide_cells={}",
+            SCORE_ONLY_ROWS.load(Ordering::Relaxed),
+            SCORE_ONLY_SIMD_ROWS.load(Ordering::Relaxed),
+            TOTAL_DP_CELLS.load(Ordering::Relaxed),
+            SCORE_ONLY_WIDE_CELLS.load(Ordering::Relaxed),
+        );
+    }
+
     Ok(())
 }
 
