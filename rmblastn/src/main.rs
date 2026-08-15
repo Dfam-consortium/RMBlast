@@ -745,8 +745,12 @@ fn search_db_parallel(
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
                 let n_mask = db.get_n_mask(name);
+                // Shared per-subject RC/packed strands: computed once in the db
+                // cache and reused across every query searched against `name`.
+                let prep = db.get_prepared(name).ok();
                 let mut r = search_with_query_lookup(
                     &chunk_lookup, query, query_id, &seq, name, params, matrix, 0, &n_mask,
+                    prep.as_deref(),
                 );
                 for h in &mut r { h.hsp.q_len = full_q_len_u32; }
                 r
@@ -808,7 +812,8 @@ fn search_db_parallel(
                     Ok(s) => s,
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
-                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, name, params, matrix, chunk_start as u32)
+                let prep = db.get_prepared(name).ok();
+                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, name, params, matrix, chunk_start as u32, prep.as_deref())
             })
             .collect();
 

@@ -340,9 +340,15 @@ revisiting for large-DB use:
   `build_query_lookup` concatenates to feed the lookup constructor; NCBI indexes its
   already-both-strands query in place.  Only matters for very large single queries.
 - **Swap-orientation performance.**  In the standard orientation the port is ~10–20%
-  faster than NCBI single-threaded (~30–40% at 4 threads).  In the swap orientation
-  (TE query × genome DB) it is ~1.7× *slower* and uses more memory.  The dominant time
-  cost there is the subject **scan over 1-byte BLASTNA** (4× the memory traffic of NCBI's
-  2-bit packed scan); the dominant remaining memory cost is the per-query subject
-  reverse-complement.  Both are the same "decode/derive per query instead of share/pack"
-  pattern as the decode cache addressed; neither affects the standard orientation.
+  faster than NCBI single-threaded (~30–40% at 4 threads).  The swap orientation
+  (TE query × genome DB) was historically ~1.7× *slower*; callgrind showed the true
+  cost was not the scan itself (the scan already reads 2-bit packed data) but
+  **re-deriving the subject's RC + packed strands for every query** (~28% of
+  instructions: `revcomp_blastna` + `blast_compress_blastna_sequence` per
+  query×subject task).  Fixed by the `PreparedSubject` cache on `SubjectDb`
+  (`get_prepared`): RC + both packed strands are computed once per subject and
+  shared (deterministic, bit-identical).  Measured longlib × chr20 single-thread:
+  3:17.6 → 1:59.0 wall (−40%); the port now beats NCBI in all 16 swap combos.
+  Cost: ~1.5× subject size cached per touched subject (chr20: +96 MB RSS).  The
+  same cache feeds `search_phase2a`, which previously re-derived each subject per
+  query chunk (~50× on chr22) in the standard orientation.

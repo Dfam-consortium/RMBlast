@@ -119,7 +119,7 @@ fn ungapped_regression_chr22() {
             search_with_query_lookup_ungapped(
                 &ql, &chunk, &qrec.id, &seq, name,
                 &params, &matrix, chunk_start as u32,
-                &mut hits, &[],
+                &mut hits, &[], None,
             );
             for h in &hits {
                 all_hits.push(hit_text(h));

@@ -37,7 +37,9 @@ use crate::blast::mblookup::{blast_mb_lookup_table_new, blast_mb_scan_subject, B
 use crate::blast::nalookup::{blast_na_lookup_table_new, choose_lut_width, BlastNaLookupTable};
 use crate::blast::nascan::blast_na_scan_subject;
 use crate::blast::types::BlastOffsetPair;
+#[cfg(test)]
 use crate::blast::util::{blast_compress_blastna_sequence, seqblk_from_blastna};
+use crate::seq::{prepare_subject_strands, PreparedSubject};
 use crate::encoding::{revcomp_blastna, BLASTNA_COMPLEMENT};
 use crate::filter::dust::{dust_mask, dust_mask_ncbi_compat, DUST_LEVEL, DUST_LINKER, DUST_WINDOW};
 use crate::hits::{EditOp, EditScript, Hsp, Strand};
@@ -535,6 +537,7 @@ pub fn search_with_query_lookup(
     matrix: &ScoreMatrix,
     chunk_offset: u32,
     n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -543,21 +546,18 @@ pub fn search_with_query_lookup(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    // Pack both subject strands into NCBI2NA (4 bases/byte) for the scan.
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     // Generate masked query for DUST: used for exact extension, ungapped scoring, Phase 2a, Phase 2b.
     // When dust=false, masked_query == query (no allocation).
@@ -575,7 +575,7 @@ pub fn search_with_query_lookup(
     if ql.c1_start > 0 {
         // Combined LUT: single scan of FWD subject, interleaved plus/minus hits.
         collect_ungapped_combined(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     } else {
@@ -584,12 +584,12 @@ pub fn search_with_query_lookup(
             Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     }
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, &subj_rc, subject_id,
+        query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
         ql.lut_word_length(), n_mask,
     );
@@ -617,6 +617,7 @@ pub fn search_with_query_lookup_seeds(
     chunk_offset: u32,
     seed_out: &mut Vec<SeedRecord>,
     n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -625,20 +626,18 @@ pub fn search_with_query_lookup_seeds(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     let masked_query_buf_s;
     let masked_query_s: &[u8] = if params.dust {
@@ -653,7 +652,7 @@ pub fn search_with_query_lookup_seeds(
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
         collect_ungapped_combined(
-            query, masked_query_s, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query_s, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
         );
     } else {
@@ -662,12 +661,12 @@ pub fn search_with_query_lookup_seeds(
             Strand::Plus, &ql.lookup, params, matrix, seed_out, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query_s, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query_s, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, seed_out, &mut ungapped,
         );
     }
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, &subj_rc, subject_id,
+        query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
         ql.lut_word_length(), n_mask,
     );
@@ -695,6 +694,7 @@ pub fn search_with_query_lookup_ungapped(
     chunk_offset: u32,
     ungap_out: &mut Vec<UngappedHit>,
     n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -703,20 +703,18 @@ pub fn search_with_query_lookup_ungapped(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     let masked_query_buf_u;
     let masked_query_u: &[u8] = if params.dust {
@@ -731,7 +729,7 @@ pub fn search_with_query_lookup_ungapped(
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
         collect_ungapped_combined(
-            query, masked_query_u, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query_u, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     } else {
@@ -740,12 +738,12 @@ pub fn search_with_query_lookup_ungapped(
             Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query_u, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query_u, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     }
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, &subj_rc, subject_id,
+        query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, ungap_out,
         ql.lut_word_length(), n_mask,
     );
@@ -774,7 +772,7 @@ pub fn search_query_vs_subject(
     matrix: &ScoreMatrix,
 ) -> Vec<AlignResult> {
     let (ql, _) = build_query_lookup(query, params);
-    search_with_query_lookup(&ql, query, query_id, subject_plus, subject_id, params, matrix, 0, &[])
+    search_with_query_lookup(&ql, query, query_id, subject_plus, subject_id, params, matrix, 0, &[], None)
 }
 
 /// Filter HSPs by masklevel: an HSP is dropped if any single higher-scoring HSP
@@ -1861,6 +1859,7 @@ pub fn search_phase2a(
     params: &SearchParams,
     matrix: &ScoreMatrix,
     chunk_offset: u32,
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<PrelimHsp> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -1869,25 +1868,23 @@ pub fn search_phase2a(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
         collect_ungapped_combined(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     } else {
@@ -1896,7 +1893,7 @@ pub fn search_phase2a(
             Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     }
