@@ -12,15 +12,15 @@ use std::sync::{Arc, OnceLock};
 use anyhow::Result;
 
 use crate::blast::util::{blast_compress_blastna_sequence, seqblk_from_blastna};
-use crate::encoding::revcomp_blastna;
+use crate::encoding::{revcomp_blastna, BLASTNA_COMPLEMENT};
 
 /// Per-subject derived strands, shared across searches.
 ///
-/// The reverse complement and both NCBI2NA-packed strands depend only on the
-/// subject bytes (the ambiguity RNG is seeded by sequence length), so they are
-/// identical for every query searched against the same subject and can be
-/// computed once and shared.  `packed_*` keep the 3 pre-sequence padding bytes
-/// (callers index `[3..]`, matching `SeqBlk::packed`).
+/// Everything here depends only on the subject bytes + its n_mask (the
+/// ambiguity RNG is seeded by sequence length), so it is identical for every
+/// query searched against the same subject and can be computed once and
+/// shared.  `packed_*` keep the 3 pre-sequence padding bytes (callers index
+/// `[3..]`, matching `SeqBlk::packed`).
 pub struct PreparedSubject {
     /// Reverse complement, sentinels included (as `revcomp_blastna` returns).
     pub rc: Arc<[u8]>,
@@ -28,13 +28,32 @@ pub struct PreparedSubject {
     pub packed_plus: Arc<[u8]>,
     /// Minus strand packed to NCBI2NA (3 padding bytes + 4 bases/byte).
     pub packed_minus: Arc<[u8]>,
+    /// Subject with original ambiguity codes restored from n_mask (the
+    /// Phase 2b alignment view).  Aliases the plus sequence when n_mask is
+    /// empty.
+    pub align: Arc<[u8]>,
+    /// Reverse complement of `align`.  Aliases `rc` when n_mask is empty.
+    pub align_rc: Arc<[u8]>,
+    /// n_mask reversed + complemented (minus-strand Phase 2b view); empty
+    /// when n_mask is empty.
+    pub n_mask_rc: Arc<[u8]>,
 }
 
 /// Compute the derived strands for a sentinel-wrapped BLASTNA subject exactly
 /// as the search entry points historically did per call.
-pub fn prepare_subject_strands(subject_plus: &[u8]) -> PreparedSubject {
+pub fn prepare_subject_strands(subject_plus: &[u8], n_mask: &[u8]) -> PreparedSubject {
+    prepare_subject_strands_shared(subject_plus, None, n_mask)
+}
+
+/// Like [`prepare_subject_strands`] but, when `plus_arc` is supplied, the
+/// ambiguity-free `align` view aliases it instead of copying the sequence.
+fn prepare_subject_strands_shared(
+    subject_plus: &[u8],
+    plus_arc: Option<&Arc<[u8]>>,
+    n_mask: &[u8],
+) -> PreparedSubject {
     let n = subject_plus.len().saturating_sub(2);
-    let rc = revcomp_blastna(subject_plus);
+    let rc: Arc<[u8]> = Arc::from(revcomp_blastna(subject_plus));
     let packed_plus = {
         let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
         blast_compress_blastna_sequence(&mut blk);
@@ -45,10 +64,32 @@ pub fn prepare_subject_strands(subject_plus: &[u8]) -> PreparedSubject {
         blast_compress_blastna_sequence(&mut blk);
         blk.packed
     };
+    let (align, align_rc, n_mask_rc) = if n_mask.is_empty() {
+        let align = match plus_arc {
+            Some(a) => a.clone(),
+            None => Arc::from(subject_plus.to_vec()),
+        };
+        (align, rc.clone(), Arc::from(Vec::new()))
+    } else {
+        let mut s = subject_plus.to_vec();
+        for (i, &code) in n_mask.iter().enumerate() {
+            if code != 0 { s[i + 1] = code; }
+        }
+        let align_rc: Arc<[u8]> = Arc::from(revcomp_blastna(&s));
+        let n_mask_rc: Vec<u8> = n_mask
+            .iter()
+            .rev()
+            .map(|&c| if c == 0 { 0 } else { BLASTNA_COMPLEMENT[c as usize] })
+            .collect();
+        (Arc::from(s), align_rc, Arc::from(n_mask_rc))
+    };
     PreparedSubject {
-        rc: Arc::from(rc),
+        rc,
         packed_plus: Arc::from(packed_plus),
         packed_minus: Arc::from(packed_minus),
+        align,
+        align_rc,
+        n_mask_rc,
     }
 }
 
@@ -211,7 +252,13 @@ impl SubjectDb {
     pub fn get_prepared(&self, name: &str) -> Result<Arc<PreparedSubject>> {
         match self.name_to_index.get(name) {
             Some(&i) => Ok(self.prepared[i]
-                .get_or_init(|| Arc::new(prepare_subject_strands(&self.decoded[i])))
+                .get_or_init(|| {
+                    Arc::new(prepare_subject_strands_shared(
+                        &self.decoded[i],
+                        Some(&self.decoded[i]),
+                        &self.n_masks[i],
+                    ))
+                })
                 .clone()),
             None => Err(anyhow::anyhow!("sequence '{}' not found in database", name)),
         }

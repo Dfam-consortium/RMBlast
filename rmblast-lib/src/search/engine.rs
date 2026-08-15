@@ -552,7 +552,7 @@ pub fn search_with_query_lookup(
     let prep: &PreparedSubject = match prepared {
         Some(p) => p,
         None => {
-            local_prep = prepare_subject_strands(subject_plus);
+            local_prep = prepare_subject_strands(subject_plus, n_mask);
             &local_prep
         }
     };
@@ -591,7 +591,7 @@ pub fn search_with_query_lookup(
     let mut results = run_gapped_phase(
         query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
-        ql.lut_word_length(), n_mask,
+        ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
         for r in &mut results {
@@ -632,7 +632,7 @@ pub fn search_with_query_lookup_seeds(
     let prep: &PreparedSubject = match prepared {
         Some(p) => p,
         None => {
-            local_prep = prepare_subject_strands(subject_plus);
+            local_prep = prepare_subject_strands(subject_plus, n_mask);
             &local_prep
         }
     };
@@ -668,7 +668,7 @@ pub fn search_with_query_lookup_seeds(
     let mut results = run_gapped_phase(
         query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
-        ql.lut_word_length(), n_mask,
+        ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
         for r in &mut results {
@@ -709,7 +709,7 @@ pub fn search_with_query_lookup_ungapped(
     let prep: &PreparedSubject = match prepared {
         Some(p) => p,
         None => {
-            local_prep = prepare_subject_strands(subject_plus);
+            local_prep = prepare_subject_strands(subject_plus, n_mask);
             &local_prep
         }
     };
@@ -745,7 +745,7 @@ pub fn search_with_query_lookup_ungapped(
     let mut results = run_gapped_phase(
         query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, ungap_out,
-        ql.lut_word_length(), n_mask,
+        ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
         for r in &mut results {
@@ -1874,7 +1874,8 @@ pub fn search_phase2a(
     let prep: &PreparedSubject = match prepared {
         Some(p) => p,
         None => {
-            local_prep = prepare_subject_strands(subject_plus);
+            // Phase 2a never touches the align views, so no n_mask is needed here.
+            local_prep = prepare_subject_strands(subject_plus, &[]);
             &local_prep
         }
     };
@@ -1965,21 +1966,15 @@ fn run_gapped_phase<U: UngapOut>(
     ungap_out: &mut U,
     lut_word_length: u32,
     n_mask: &[u8],
+    prep: &PreparedSubject,
 ) -> Vec<AlignResult> {
     // N/IUPAC handling: NCBI uses CRandom (2-bit scan) for Phase 2a (score-only filter)
     // and the original ambiguity code for Phase 2b (full traceback + improve_seed + reevaluate).
     // Phase 2a uses the original subject_plus/subj_rc parameters (CRandom at ambig positions).
-    // Phase 2b uses subject_align/subj_rc_align below (original BLASTNA code at ambig positions).
-    let subject_align: Vec<u8> = if n_mask.is_empty() {
-        subject_plus.to_vec()
-    } else {
-        let mut s = subject_plus.to_vec();
-        for (i, &code) in n_mask.iter().enumerate() {
-            if code != 0 { s[i + 1] = code; }
-        }
-        s
-    };
-    let subj_rc_align = revcomp_blastna(&subject_align);
+    // Phase 2b uses the align views below (original BLASTNA code at ambig positions),
+    // borrowed from the per-subject cache (built with this same n_mask).
+    let subject_align: &[u8] = &prep.align;
+    let subj_rc_align: &[u8] = &prep.align_rc;
 
     // Mirrors Blast_InitHitListSortByScore / score_compare_match in blast_extend.c.
     // NCBI sorts by combined-query q_start, which for plus strand = FWD q_start (< q_len)
@@ -2415,9 +2410,7 @@ fn run_gapped_phase<U: UngapOut>(
         let q_core   = &query[1..query.len() - 1];
         let src_core = &subject_align[1..subject_align.len() - 1];
         let rc_core  = &subj_rc_align[1..subj_rc_align.len() - 1];
-        let n_mask_rc_2b: Vec<u8> = if n_mask.is_empty() { Vec::new() } else {
-            n_mask.iter().rev().map(|&c| if c == 0 { 0 } else { BLASTNA_COMPLEMENT[c as usize] }).collect()
-        };
+        let n_mask_rc_2b: &[u8] = &prep.n_mask_rc;
 
         for slot in arr[extra_start..].iter_mut() {
             let mut r = match slot.take() { Some(r) => r, None => continue };
