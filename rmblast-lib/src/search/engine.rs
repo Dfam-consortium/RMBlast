@@ -168,6 +168,152 @@ pub struct PrelimHsp {
 /// Mirrors CBlastNucleotideOptionsHandle::SetHitSavingOptionsDefaults in NCBI.
 const MIN_DIAG_SEP: i64 = 50;
 
+/// Parameters for the opt-in prelim-cull fast mode (`--prelim-cull`).
+///
+/// NOT part of the faithful NCBI pipeline.  When enabled, preliminary HSPs
+/// that are mask_level-style dominated by higher-scoring prelims are skipped
+/// in Phase 2b (round 1), then re-tested against the survivors' FINAL
+/// coordinates and scores and resurrected — with a second small Phase 2b
+/// wave — where the dominance no longer holds (round 2).  The exact
+/// output-level mask_level still runs afterwards.  Output differs from
+/// faithful mode only in a small fraction of heavily-overlapped, mostly
+/// low-scoring hits (measured on chr22 x longlib: balanced preset ~0.2% of
+/// annotated bp, ~0.5% of hits, for ~68% of traceback DP avoided).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrelimCullParams {
+    /// Round-1 dominator score margin in percent (110 → the dominating prelim
+    /// must score >= 1.10x the candidate).
+    pub cull_margin_pct: u32,
+    /// Round-1 coverage requirement in percent of the candidate's query span.
+    pub cull_coverage: u32,
+    /// Round-2 resurrection margin in percent (dominator FINAL score vs
+    /// candidate PRELIM score; < 100 is conservative).
+    pub resurrect_margin_pct: u32,
+    /// Round-2 slack in bp added to each end of the candidate span before the
+    /// dominance re-test (absorbs prelim-vs-final coordinate drift).
+    pub resurrect_slack: u32,
+}
+
+/// Round 1 of the prelim cull: mark prelims whose query span is
+/// `cull_coverage`%-covered by a single not-yet-culled prelim scoring at
+/// least `cull_margin_pct`% of the candidate.  Mirrors the
+/// [`apply_mask_level`] sweep (score-descending order, survivors-only
+/// dominators, minus-strand +1 shift).  Returns per-subject keep masks.
+pub fn cull_prelims(
+    prelims_by_subject: &[Vec<PrelimHsp>],
+    cull_coverage: u32,
+    cull_margin_pct: u32,
+) -> Vec<Vec<bool>> {
+    struct Cand {
+        subj: usize,
+        idx: usize,
+        qs: u32,
+        qe: u32,
+        score: i64,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for (subj, v) in prelims_by_subject.iter().enumerate() {
+        for (idx, p) in v.iter().enumerate() {
+            let (qs, qe) = if p.strand == Strand::Minus {
+                (p.q_start + 1, p.q_end + 1)
+            } else {
+                (p.q_start, p.q_end)
+            };
+            cands.push(Cand { subj, idx, qs, qe, score: p.score as i64 });
+        }
+    }
+    // Deterministic order: score DESC, then query start ASC, then identity.
+    cands.sort_unstable_by(|a, b| {
+        b.score.cmp(&a.score)
+            .then_with(|| a.qs.cmp(&b.qs))
+            .then_with(|| a.subj.cmp(&b.subj))
+            .then_with(|| a.idx.cmp(&b.idx))
+    });
+
+    let mut keep: Vec<Vec<bool>> =
+        prelims_by_subject.iter().map(|v| vec![true; v.len()]).collect();
+    let mut accepted: Vec<(u32, u32, i64)> = Vec::new(); // qs ASC
+    let mut max_span: u32 = 0;
+    for c in &cands {
+        let span = c.qe.saturating_sub(c.qs) as i64;
+        if span == 0 {
+            continue; // keep — the final mask_level handles degenerate spans
+        }
+        let upper = accepted.partition_point(|a| a.0 < c.qe);
+        let min_start = c.qs.saturating_sub(max_span);
+        let mut masked = false;
+        let mut i = upper;
+        while i > 0 {
+            i -= 1;
+            let (qs_j, qe_j, sc_j) = accepted[i];
+            if qs_j < min_start { break; }
+            if qe_j <= c.qs { continue; }
+            if sc_j * 100 < c.score * cull_margin_pct as i64 { continue; }
+            let ovlp = (qe_j.min(c.qe) as i64) - (qs_j.max(c.qs) as i64);
+            if ovlp * 100 / span >= cull_coverage as i64 {
+                masked = true;
+                break;
+            }
+        }
+        if masked {
+            keep[c.subj][c.idx] = false;
+        } else {
+            let pos = accepted.partition_point(|a| a.0 < c.qs);
+            accepted.insert(pos, (c.qs, c.qe, c.score));
+            max_span = max_span.max(c.qe - c.qs);
+        }
+    }
+    keep
+}
+
+/// Round 2 of the prelim cull: re-test culled prelims against the surviving
+/// FINAL hits and return the indices (into `culled`) that must be
+/// resurrected because no single survivor still dominates them.
+///
+/// `survivors` holds FWD-query `(qs, qe, score)` of the wave-1 results
+/// (minus-strand +1-shifted), sorted by `qs` ascending.
+pub fn resurrect_prelims(
+    culled: &[(usize, PrelimHsp)],
+    survivors: &[(u32, u32, i64)],
+    surv_max_span: u32,
+    mask_level: u32,
+    resurrect_margin_pct: u32,
+    resurrect_slack: u32,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (ci, (_, p)) in culled.iter().enumerate() {
+        let (qs0, qe0) = if p.strand == Strand::Minus {
+            (p.q_start + 1, p.q_end + 1)
+        } else {
+            (p.q_start, p.q_end)
+        };
+        let qs = qs0.saturating_sub(resurrect_slack);
+        let qe = qe0 + resurrect_slack;
+        let span = (qe - qs) as i64;
+        let score = p.score as i64;
+        let upper = survivors.partition_point(|a| a.0 < qe);
+        let min_start = qs.saturating_sub(surv_max_span);
+        let mut dominated = false;
+        let mut i = upper;
+        while i > 0 {
+            i -= 1;
+            let (qs_j, qe_j, sc_j) = survivors[i];
+            if qs_j < min_start { break; }
+            if qe_j <= qs { continue; }
+            if sc_j * 100 < score * resurrect_margin_pct as i64 { continue; }
+            let ovlp = (qe_j.min(qe) as i64) - (qs_j.max(qs) as i64);
+            if ovlp * 100 / span >= mask_level as i64 {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            out.push(ci);
+        }
+    }
+    out
+}
+
 /// Find an improved gapped alignment seed within the preliminary alignment region.
 /// Mirrors NCBI's BlastGetStartForGappedAlignmentNucl (blast_gapalign.c).
 ///
