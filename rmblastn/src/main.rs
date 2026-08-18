@@ -929,10 +929,30 @@ fn search_db_parallel(
 
     // Fast-mode prelim cull, round 1: split the merged prelims into a Phase 2b
     // wave-1 set and a culled store (see PrelimCullParams).
+    // Interior chunk-edge coordinates for the cull's boundary exemption:
+    // prelims truncated at a chunk edge under-represent their final extent.
+    let chunk_boundaries: Vec<u32> = if prelim_cull.is_some() {
+        let mut b: Vec<u32> = Vec::new();
+        for k in 0..effective_num_chunks {
+            let cs = k * step;
+            if cs >= full_q_len { break; }
+            let ce = (cs + chunk_size).min(full_q_len);
+            if cs > 0 { b.push(cs as u32); }
+            if ce < full_q_len { b.push(ce as u32); }
+        }
+        b.sort_unstable();
+        b
+    } else {
+        Vec::new()
+    };
+
     let (wave1, culled_store): (Vec<Vec<PrelimHsp>>, Vec<(usize, PrelimHsp)>) =
         match prelim_cull {
             Some(cp) => {
-                let keep = cull_prelims(&accumulated_prelims, cp.cull_coverage, cp.cull_margin_pct);
+                let keep = cull_prelims(
+                    &accumulated_prelims, cp.cull_coverage, cp.cull_margin_pct,
+                    &chunk_boundaries,
+                );
                 let mut w1 = Vec::with_capacity(accumulated_prelims.len());
                 let mut culled = Vec::new();
                 for (si, (v, k)) in accumulated_prelims.into_iter().zip(keep).enumerate() {
@@ -1032,11 +1052,53 @@ fn load_gilist(path: Option<&str>) -> Result<Option<HashSet<String>>> {
         Some(p) => p,
     };
     let f = std::fs::File::open(p).with_context(|| format!("opening gilist '{}'", p))?;
-    let set: HashSet<String> = std::io::BufReader::new(f)
-        .lines()
-        .filter_map(|l| l.ok())
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut set: HashSet<String> = HashSet::new();
+    for line in std::io::BufReader::new(f).lines() {
+        let entry = match line {
+            Ok(l) => l.trim().to_string(),
+            Err(_) => continue,
+        };
+        if entry.is_empty() {
+            continue;
+        }
+        // A bare GI number also matches the sequence named "gi|<n>".  This is
+        // the form RepeatModeler writes (RepeatModeler:1851 emits
+        // `($startGID+1) .. $sampleDBSize`, i.e. plain integers) while its
+        // databases name sequences "gi|N"; without this the all-vs-other
+        // batches would filter every subject out and silently return no hits.
+        if entry.chars().all(|c| c.is_ascii_digit()) {
+            set.insert(format!("gi|{}", entry));
+        }
+        set.insert(entry);
+    }
     Ok(Some(set))
+}
+
+#[cfg(test)]
+mod gilist_tests {
+    use super::load_gilist;
+    use std::io::Write;
+
+    /// RepeatModeler writes bare integers; the databases name sequences "gi|N".
+    /// Both spellings must select the subject (see wrappers/blastdb_aliastool).
+    #[test]
+    fn bare_numbers_and_gi_pipe_both_match() {
+        let dir = std::env::temp_dir().join("rmblastn_gilist_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bare = dir.join("bare.txt");
+        writeln!(std::fs::File::create(&bare).unwrap(), "2\n3\n").unwrap();
+        let set = load_gilist(Some(bare.to_str().unwrap())).unwrap().unwrap();
+        assert!(set.contains("gi|2") && set.contains("gi|3"));
+        assert!(set.contains("2"), "the raw spelling must still match");
+        assert!(!set.contains("gi|1"));
+
+        let piped = dir.join("piped.txt");
+        writeln!(std::fs::File::create(&piped).unwrap(), "gi|2\ngi|3\n").unwrap();
+        let set = load_gilist(Some(piped.to_str().unwrap())).unwrap().unwrap();
+        assert!(set.contains("gi|2") && set.contains("gi|3"));
+
+        assert!(load_gilist(None).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

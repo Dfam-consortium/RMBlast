@@ -194,15 +194,32 @@ pub struct PrelimCullParams {
     pub resurrect_slack: u32,
 }
 
+/// Slop (bp) for deciding that a prelim endpoint abuts a query-chunk edge.
+const CULL_BOUNDARY_EPS: u32 = 5;
+
+/// True if `x` lies within [`CULL_BOUNDARY_EPS`] of any coordinate in the
+/// sorted `boundaries` list.
+fn abuts_boundary(x: u32, boundaries: &[u32]) -> bool {
+    let lo = x.saturating_sub(CULL_BOUNDARY_EPS);
+    let i = boundaries.partition_point(|&b| b < lo);
+    i < boundaries.len() && boundaries[i] <= x.saturating_add(CULL_BOUNDARY_EPS)
+}
+
 /// Round 1 of the prelim cull: mark prelims whose query span is
 /// `cull_coverage`%-covered by a single not-yet-culled prelim scoring at
 /// least `cull_margin_pct`% of the candidate.  Mirrors the
 /// [`apply_mask_level`] sweep (score-descending order, survivors-only
 /// dominators, minus-strand +1 shift).  Returns per-subject keep masks.
+///
+/// `chunk_boundaries` holds the sorted interior query-chunk edge coordinates:
+/// a prelim whose span abuts one was truncated by Phase 2a's chunking, so its
+/// extent under-represents its final traceback — such prelims are never
+/// culled (they still act as dominators).
 pub fn cull_prelims(
     prelims_by_subject: &[Vec<PrelimHsp>],
     cull_coverage: u32,
     cull_margin_pct: u32,
+    chunk_boundaries: &[u32],
 ) -> Vec<Vec<bool>> {
     struct Cand {
         subj: usize,
@@ -238,6 +255,13 @@ pub fn cull_prelims(
         let span = c.qe.saturating_sub(c.qs) as i64;
         if span == 0 {
             continue; // keep — the final mask_level handles degenerate spans
+        }
+        if abuts_boundary(c.qs, chunk_boundaries) || abuts_boundary(c.qe, chunk_boundaries) {
+            // Chunk-truncated span: exempt from culling, but let it dominate.
+            let pos = accepted.partition_point(|a| a.0 < c.qs);
+            accepted.insert(pos, (c.qs, c.qe, c.score));
+            max_span = max_span.max(c.qe - c.qs);
+            continue;
         }
         let upper = accepted.partition_point(|a| a.0 < c.qe);
         let min_start = c.qs.saturating_sub(max_span);
