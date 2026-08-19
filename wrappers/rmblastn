@@ -12,9 +12,13 @@
 #   2. Underscores in flag names are replaced with hyphens  (foo_bar → foo-bar).
 #   3. -dust no/yes is converted to --dust false/true.
 #   4. -num_alignments (and its value) is silently dropped.
+#   5. The -db value is passed as the FASTA path (any trailing ".2bit" is
+#      stripped).  The Rust binary reads FASTA directly; the 2bit format
+#      degrades IUB ambiguity codes to N, and all result-equivalence
+#      validation was performed against FASTA databases (matches the
+#      verify_wrappers behaviour).
 
 REAL_RMBLASTN="/home/rhubley/projects/Claude/rmblast-port/rmblast/target/release/rmblastn"
-FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
 
 args=("$@")
 new_args=()
@@ -75,8 +79,9 @@ while [ $i -lt ${#args[@]} ]; do
     fi
 done
 
-# Find --db in new_args, ensure the value ends with .2bit, and build the
-# .2bit file on-the-fly if the caller skipped makeblastdb.
+# Find --db in new_args and force its value to the FASTA path (strip any
+# trailing ".2bit").  The Rust binary reads FASTA directly, preserving IUB
+# ambiguity codes that the 2bit format would degrade to N.
 db_idx=-1
 db_inline=false
 for (( j=0; j<${#new_args[@]}; j++ )); do
@@ -99,31 +104,17 @@ if [ $db_idx -ge 0 ]; then
         db_val="${new_args[$val_idx]}"
     fi
 
-    # Strip any existing .2bit suffix to get the canonical base (FASTA path).
-    if [[ "$db_val" == *.2bit ]]; then
-        db_base="${db_val%.2bit}"
-    else
-        db_base="$db_val"
-    fi
-    db_2bit="${db_base}.2bit"
+    db_base="${db_val%.2bit}"
 
-    if [ ! -f "$db_2bit" ]; then
-        if [ ! -f "$db_base" ]; then
-            echo "[rmblastn] Error: database file not found: $db_base" >&2
-            exit 1
-        fi
-        echo "[rmblastn] Building ${db_2bit} from ${db_base}" >&2
-        "$FATOTWOBIT" "$db_base" "$db_2bit"
-        if [ $? -ne 0 ]; then
-            echo "[rmblastn] Error: faToTwoBit failed for ${db_base}" >&2
-            exit 1
-        fi
+    if [ ! -f "$db_base" ]; then
+        echo "[rmblastn] Error: database file not found: $db_base" >&2
+        exit 1
     fi
 
     if $db_inline; then
-        new_args[$db_idx]="--db=${db_2bit}"
+        new_args[$db_idx]="--db=${db_base}"
     else
-        new_args[$val_idx]="$db_2bit"
+        new_args[$val_idx]="$db_base"
     fi
 fi
 
