@@ -18,6 +18,13 @@
 #      (default: ./rmblast_verify_failures).
 #   5. The Rust output is emitted to the caller (this is a drop-in for the Rust
 #      deployment); the wrapper exits with the Rust engine's return code.
+#   6. EVERY invocation appends one stats line to $RMBLAST_VERIFY_DIR/
+#      verify_log.tsv (datetime, query, db, per-engine runtime and peak RSS,
+#      hit counts, diff count, PASS/MISMATCH/ERROR status, bundle name).  The
+#      directory is created unconditionally for the log; mismatch bundles are
+#      still written only on failure.  Runtime/RSS figures cover the
+#      comparison runs; the extra caller-format Rust pass that non-tabular
+#      invocations need is not counted.
 #
 # The NCBI->Rust argument translation is identical to ../wrappers/rmblastn:
 #   - Single-dash flags are promoted to double-dash  (-foo -> --foo).
@@ -242,6 +249,19 @@ ncbi_tab="$tmpdir/ncbi.tab"; ncbi_err="$tmpdir/ncbi.err"
 rust_tab="$tmpdir/rust.tab"; rust_err="$tmpdir/rust.err"
 caller_out="$tmpdir/caller.out"; caller_err="$tmpdir/caller.err"
 
+# GNU time for the stats log: '%e %M' = elapsed seconds, peak RSS in KB.
+# Output goes to a side file so the engines' own stderr stays clean.
+TIME_BIN=/usr/bin/time
+
+# Query file path (for the stats log; the failure bundle re-derives its own).
+qf=""
+for (( j=0; j<${#args[@]}; j++ )); do
+    case "${args[$j]}" in
+        -query|--query)     qf="${args[$((j+1))]}" ;;
+        -query=*|--query=*) qf="${args[$j]#*=}" ;;
+    esac
+done
+
 # What -outfmt did the caller request (if any), and is it tabular ("6 ...")?
 caller_outfmt=""
 for (( j=0; j<${#args[@]}; j++ )); do
@@ -269,14 +289,18 @@ strip_outfmt() {   # echo all args except -outfmt/--outfmt (+ its value), NUL-de
 if [ "$is_tabular6" -eq 1 ]; then
     ncbi_run=( "${ncbi_args[@]}" )
     rust_run=( "${new_args[@]}" )
-    "$NCBI_RMBLASTN" "${ncbi_run[@]}" > "$ncbi_tab"   2> "$ncbi_err"; ncbi_rc=$?
-    "$REAL_RMBLASTN" "${rust_run[@]}" > "$rust_tab"   2> "$rust_err"; rust_rc=$?
+    "$TIME_BIN" -f '%e %M' -o "$tmpdir/ncbi.time" \
+        "$NCBI_RMBLASTN" "${ncbi_run[@]}" > "$ncbi_tab"   2> "$ncbi_err"; ncbi_rc=$?
+    "$TIME_BIN" -f '%e %M' -o "$tmpdir/rust.time" \
+        "$REAL_RMBLASTN" "${rust_run[@]}" > "$rust_tab"   2> "$rust_err"; rust_rc=$?
     cp "$rust_tab" "$caller_out"; cp "$rust_err" "$caller_err"; caller_rc=$rust_rc
 else
     mapfile -d '' ncbi_run < <(strip_outfmt "${ncbi_args[@]}"); ncbi_run+=("-outfmt=$CANON_OUTFMT")
     mapfile -d '' rust_run < <(strip_outfmt "${new_args[@]}");  rust_run+=("--outfmt" "$CANON_OUTFMT")
-    "$NCBI_RMBLASTN" "${ncbi_run[@]}" > "$ncbi_tab"   2> "$ncbi_err"; ncbi_rc=$?
-    "$REAL_RMBLASTN" "${rust_run[@]}" > "$rust_tab"   2> "$rust_err"; rust_rc=$?
+    "$TIME_BIN" -f '%e %M' -o "$tmpdir/ncbi.time" \
+        "$NCBI_RMBLASTN" "${ncbi_run[@]}" > "$ncbi_tab"   2> "$ncbi_err"; ncbi_rc=$?
+    "$TIME_BIN" -f '%e %M' -o "$tmpdir/rust.time" \
+        "$REAL_RMBLASTN" "${rust_run[@]}" > "$rust_tab"   2> "$rust_err"; rust_rc=$?
     "$REAL_RMBLASTN" "${new_args[@]}" > "$caller_out" 2> "$caller_err"; caller_rc=$?
 fi
 
@@ -296,6 +320,7 @@ comm -23 "$tmpdir/ncbi.sorted" "$tmpdir/rust.sorted" > "$only_ncbi"
 comm -13 "$tmpdir/ncbi.sorted" "$tmpdir/rust.sorted" > "$only_rust"
 num_diffs=$(( $(wc -l < "$only_ncbi") + $(wc -l < "$only_rust") ))
 
+dir=""   # failure-bundle directory (set only on mismatch; logged below)
 if [ "$ncbi_rc" -eq 0 ] && [ "$rust_rc" -eq 0 ] && [ "$num_diffs" -eq 0 ]; then
     echo "# verify rmblastn: Rust MATCHES NCBI ($ncbi_n alignments, 0 diffs)" >&2
 else
@@ -410,6 +435,36 @@ else
 
     echo "# verify rmblastn: debug bundle saved to: $dir" >&2
 fi
+
+# ---------------------------------------------------------------------------
+# 5b. Append one stats line for THIS invocation to $VERIFY_DIR/verify_log.tsv.
+#     The directory is created unconditionally; the single-printf O_APPEND
+#     write stays atomic under concurrent (-pa N) invocations.
+# ---------------------------------------------------------------------------
+# GNU time prepends "Command exited with non-zero status N" on failure, so
+# the '%e %M' figures are on the LAST line of the -o file.
+ncbi_sec="-"; ncbi_rss="-"; rust_sec="-"; rust_rss="-"
+[ -s "$tmpdir/ncbi.time" ] && read -r ncbi_sec ncbi_rss <<< "$(tail -n 1 "$tmpdir/ncbi.time")"
+[ -s "$tmpdir/rust.time" ] && read -r rust_sec rust_rss <<< "$(tail -n 1 "$tmpdir/rust.time")"
+if [ "$ncbi_rc" -ne 0 ] || [ "$rust_rc" -ne 0 ]; then
+    status="ERROR(ncbi=$ncbi_rc,rust=$rust_rc)"
+elif [ "$num_diffs" -eq 0 ]; then
+    status="PASS"
+else
+    status="MISMATCH"
+fi
+bundle="-"
+[ -n "$dir" ] && bundle="$(basename "$dir")"
+mkdir -p "$VERIFY_DIR"
+log="$VERIFY_DIR/verify_log.tsv"
+if [ ! -s "$log" ]; then
+    printf '#datetime\tquery\tdb\tncbi_sec\trust_sec\tncbi_maxrss_kb\trust_maxrss_kb\tncbi_hits\trust_hits\tdiff_lines\tstatus\tbundle\n' >> "$log"
+fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "$(basename "${qf:-?}")" "$(basename "${db_base:-?}")" \
+    "$ncbi_sec" "$rust_sec" "$ncbi_rss" "$rust_rss" \
+    "$ncbi_n" "$rust_n" "$num_diffs" "$status" "$bundle" >> "$log"
 
 # ---------------------------------------------------------------------------
 # 6. Emit the Rust output (in the caller's requested format) to the caller and
