@@ -35,7 +35,7 @@ pub static SCORE_ONLY_SIMD_ROWS: AtomicU64 = AtomicU64::new(0);
 /// Diagnostic counter: total score-only DP rows.
 pub static SCORE_ONLY_ROWS: AtomicU64 = AtomicU64::new(0);
 
-/// Diagnostic counter: total score-only DP cells in rows of width >= 16.
+/// Diagnostic counter: total score-only DP cells in rows of width >= 32.
 pub static SCORE_ONLY_WIDE_CELLS: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: total score-only DP cells (subset of TOTAL_DP_CELLS).
@@ -613,7 +613,7 @@ mod so_simd {
 }
 
 /// AVX2 variant of [`align_ex_score_only_inner_scalar`] — identical results.
-/// Rows with a band of >= 16 cells run the fused SIMD kernel
+/// Rows with a band of >= 32 cells run the fused SIMD kernel
 /// ([`so_simd::row_fused`]); narrower rows run the reference per-cell loop.
 ///
 /// # Equivalence of the SIMD kernel to the reference loop
@@ -708,7 +708,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
         let w = inner_end.saturating_sub(first_b_index);
         SCORE_ONLY_ROWS.fetch_add(1, Ordering::Relaxed);
 
-        if w >= 16 {
+        if w >= 32 {
             SCORE_ONLY_SIMD_ROWS.fetch_add(1, Ordering::Relaxed);
             SCORE_ONLY_WIDE_CELLS.fetch_add(w as u64, Ordering::Relaxed);
             // SAFETY: AVX2 checked by the dispatch (simd_enabled());
