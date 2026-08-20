@@ -1,58 +1,247 @@
 #!/bin/bash
+#
 # Replacement for NCBI blastdbcmd used with the Rust rmblastn port.
 #
-# Supports: -db <prefix> -dbtype nucl -info
+# The port's "database" is a UCSC 2bit file (what the makeblastdb wrapper
+# produces) or a plain FASTA file — not a BLAST index.  This wrapper implements
+# the handful of blastdbcmd invocations that BuildDatabase / RepeatModeler /
+# util/align.pl actually make, on top of twoBitInfo / twoBitToFa (2bit) or awk
+# (FASTA).
 #
-# The Rust rmblastn binary uses a UCSC 2bit file as its database.  This
-# wrapper calls twoBitInfo on <prefix>.2bit and prints a summary line in
-# the same format as the real blastdbcmd -info output.
+# Supported:
+#   -db <name> -info
+#   -db <name> -entry all [-outfmt "%f"]           -> whole database as FASTA
+#   -db <name> -entry all -outfmt "%i %l"          -> "seqID<TAB>length" per sequence
+#   -db <name> -entry all -outfmt "gi|%g %l"       -> same (see GI NOTE below)
+#   -db <name> -entry <seqID> [-outfmt "%f"]       -> one sequence as FASTA
+#   -db <name> -entry_batch <file>                 -> "seqID start-end" per line
+#   -dbtype/-line_length/-target_only/-long_seqids are accepted and ignored
+#   -out <file>
+#
+# Anything else exits non-zero with a "not supported" message rather than
+# quietly producing something different from what the caller expects.
+#
+# GI NOTE: RepeatModeler asks the *sample* databases for `-outfmt "gi|%g %l"`
+# and then fetches records with `-entry "gi|N"`.  That works because those
+# databases are built from FASTA whose deflines sampleFromDB() wrote as
+# ">gi|N seqID:start-end", so the sequence NAME is literally "gi|N".  We simply
+# print the stored name, which is already "gi|N" — no GI table involved.  The
+# '|' never reaches a shell: it is passed straight to twoBitToFa as -seq=<name>.
+#
+# KNOWN DIFFERENCES from real blastdbcmd (all in text nobody parses):
+#   * -info "Date:" is the file mtime, explicitly labelled SYNTHETIC — there is
+#     no BLAST database whose creation date we could report.
+#   * -entry_batch deflines use twoBitToFa's ">name:zeroBasedStart-end" instead
+#     of NCBI's ">name:1basedStart-end description".  The extracted BASES are
+#     identical (verified against NCBI); only the header text differs.
+#     sampleFromDB() discards these deflines and re-headers by position.
+#   * ids carry no "lcl|" prefix, and 2bit-backed sequences have no description
+#     (a 2bit file stores only the name).
+#   * a 2bit-backed database cannot round-trip non-N IUB codes (R/Y/K/M/W/S/...
+#     come back as N) — that is the 2bit format, not this wrapper.  Point -db at
+#     the FASTA if those codes matter.
+#
+# THIS IS A COMPATIBILITY HACK.  It reproduces what the callers parse, not the
+# whole of blastdbcmd.
 
-TWOBITINFO=/usr/local/ucscTools/twoBitInfo
+UCSCTOOLS_DIR="${UCSCTOOLS_DIR:-/usr/local/ucscTools}"
+TWOBITINFO="$UCSCTOOLS_DIR/twoBitInfo"
+TWOBITTOFA="$UCSCTOOLS_DIR/twoBitToFa"
+
+die() { echo "[blastdbcmd] Error: $*" >&2; exit 1; }
 
 db=""
-dbtype="nucl"
+entry=""
+entry_batch=""
+outfmt=""
+out=""
 info=0
 
 args=("$@")
 i=0
 while [ $i -lt ${#args[@]} ]; do
     case "${args[$i]}" in
-        -db)     i=$((i+1)); db="${args[$i]}" ;;
-        -dbtype) i=$((i+1)); dbtype="${args[$i]}" ;;
-        -info)   info=1 ;;
+        -db)          i=$((i+1)); db="${args[$i]}" ;;
+        -entry)       i=$((i+1)); entry="${args[$i]}" ;;
+        -entry_batch) i=$((i+1)); entry_batch="${args[$i]}" ;;
+        -outfmt)      i=$((i+1)); outfmt="${args[$i]}" ;;
+        -out)         i=$((i+1)); out="${args[$i]}" ;;
+        -info)        info=1 ;;
+        # Accepted and ignored: irrelevant to a 2bit/FASTA "database".
+        -dbtype|-line_length|-ctrl_a|-target_only|-long_seqids) i=$((i+1)) ;;
+        -help|-h)     sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)            die "option not supported by this wrapper: ${args[$i]}" ;;
     esac
     i=$((i+1))
 done
 
-if [ -z "$db" ]; then
-    echo "[blastdbcmd] Error: -db <prefix> is required" >&2
-    exit 1
+[ -n "$db" ] || die "-db <name> is required"
+
+# ── Resolve <name> to a real file ────────────────────────────────────────────
+# RepeatModeler hands us a BLAST-database *prefix* (it strips .nsq/.nin/...),
+# so try the name itself first, then the suffixes our makeblastdb wrapper and
+# ordinary FASTA files use.
+dbfile=""
+for cand in "$db" "$db.2bit" "$db.fa" "$db.fasta" "$db.fna"; do
+    if [ -f "$cand" ]; then dbfile="$cand"; break; fi
+done
+[ -n "$dbfile" ] || die "database not found: $db (tried $db, $db.2bit, $db.fa, $db.fasta, $db.fna)"
+
+if [ "$(head -c 1 "$dbfile")" = ">" ]; then
+    dbtype_detected="fasta"
+else
+    dbtype_detected="2bit"
+    [ -x "$TWOBITINFO" ] || die "twoBitInfo not found at $TWOBITINFO (set UCSCTOOLS_DIR)"
+    [ -x "$TWOBITTOFA" ] || die "twoBitToFa not found at $TWOBITTOFA (set UCSCTOOLS_DIR)"
 fi
 
-twobit="${db}.2bit"
+[ -n "$out" ] && exec > "$out"
 
-if [ ! -f "$twobit" ]; then
-    echo "[blastdbcmd] Error: database file not found: $twobit" >&2
-    exit 1
-fi
+# "seqID<TAB>length", one line per sequence, in database order.
+list_ids_lengths() {
+    if [ "$dbtype_detected" = "2bit" ]; then
+        "$TWOBITINFO" "$dbfile" stdout
+    else
+        awk '/^>/ { if (n != "") print n "\t" len; n = substr($1,2); len = 0; next }
+                  { gsub(/[ \t\r]/, ""); len += length($0) }
+             END  { if (n != "") print n "\t" len }' "$dbfile"
+    fi
+}
 
+# ── -info ────────────────────────────────────────────────────────────────────
+#
+# Consumers and what they parse:
+#   BuildDatabase        /\s+([\d,]+)\s+sequences;\s+([\d,]+)\s+total bases.*$/
+#   RepeatUtil.pm        the same, plus /Longest sequence:\s*([\d,]+)/
+#   util/align.pl        /^\s+([\d,]+)\s+sequences;\s+([\d,]+)\s+total bases\s*$/
+# The last one is anchored at both ends, so the counts line must start with
+# whitespace and end immediately after "total bases".
 if [ "$info" -eq 1 ]; then
-    # twoBitInfo outputs two tab-separated columns: seqName  size
-    # Sum them to get total sequences and total bases.
-    "$TWOBITINFO" "$twobit" stdout | awk '
-        BEGIN { seqs=0; bases=0 }
-        { seqs++; bases += $2 }
-        END {
-            # Format bases with comma separators
-            n = bases
-            result = ""
-            while (n > 999) {
-                remainder = n % 1000
-                n = int(n / 1000)
-                result = sprintf(",%03d%s", remainder, result)
-            }
-            result = n result
-            printf "#   %d sequences; %s total bases\n", seqs, result
+    # The date is NOT a database creation date — there is no database to have
+    # created.  It is the file's mtime, and it is labelled as synthetic so that
+    # nobody mistakes this output for the real thing.
+    filedate=$(date -r "$dbfile" '+%b %-d, %Y  %-I:%M %p' 2>/dev/null || echo "unknown date")
+    list_ids_lengths | awk -v db="$(cd "$(dirname "$dbfile")" && pwd)/$(basename "$dbfile")" \
+                           -v filedate="$filedate" -v kind="$dbtype_detected" '
+        function commify(n,   out, rem) {
+            out = ""
+            while (n > 999) { rem = n % 1000; n = int(n / 1000); out = sprintf(",%03d%s", rem, out) }
+            return n out
         }
-    '
+        { seqs++; bases += $2; if ($2 > longest) longest = $2 }
+        END {
+            printf "Database: %s\n", db
+            printf "\t%s sequences; %s total bases\n\n", commify(seqs), commify(bases)
+            printf "Date: %s (SYNTHETIC: %s file mtime, not a BLASTDB creation date)", filedate, kind
+            printf "\tLongest sequence: %s bases\n\n", commify(longest)
+            printf "BLASTDB Version: n/a (%s file, via rmblast wrapper)\n", kind
+            printf "\nVolumes:\n\t%s\n", db
+        }'
+    exit 0
 fi
+
+# ── -entry / -entry_batch ────────────────────────────────────────────────────
+if [ -n "$entry_batch" ]; then
+    [ -f "$entry_batch" ] || die "entry batch file not found: $entry_batch"
+
+    # Batch lines are "seqID start-end" (1-based, fully closed) as written by
+    # RepeatModeler's sampleFromDB(); "seqID start end" and a bare "seqID" are
+    # also accepted.  Output order must follow the file: the caller re-headers
+    # the records by position and ignores our deflines.
+    #
+    # Emitted as twoBitToFa's -seqList spec: name[:zeroBasedStart-end].
+    # Unknown names are dropped with a warning, the way real blastdbcmd skips
+    # them.  Without this twoBitToFa aborts the whole batch on the first miss,
+    # silently truncating the sample.
+    speclist=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_seqlist_XXXXXX")
+    names=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_names_XXXXXX")
+    trap 'rm -f "$speclist" "$names"' EXIT
+    list_ids_lengths | cut -f1 > "$names"
+    awk -v namesfile="$names" '
+         BEGIN { while ((getline nm < namesfile) > 0) have[nm] = 1 }
+         {
+            if (NF == 0) next
+            id = $1
+            if (!(id in have)) { print "[blastdbcmd] Skipped " id > "/dev/stderr"; next }
+            rest = $2
+            if (NF >= 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) rest = $2 "-" $3
+            if (rest ~ /^[0-9]+-[0-9]+$/) {
+                split(rest, r, "-")
+                printf "%s:%d-%d\n", id, r[1] - 1, r[2]
+            } else {
+                print id
+            }
+         }' "$entry_batch" > "$speclist"
+
+    if [ "$dbtype_detected" = "2bit" ]; then
+        "$TWOBITTOFA" -seqList="$speclist" "$dbfile" stdout
+    else
+        # FASTA backend: hold only the requested sequences in memory, then emit
+        # them in batch order.  Fine for sample databases; a whole-genome FASTA
+        # with a big batch will be memory hungry (use a .2bit there).
+        awk -v speclist="$speclist" '
+            BEGIN {
+                while ((getline line < speclist) > 0) {
+                    nspec++; spec[nspec] = line
+                    id = line; sub(/:[0-9]+-[0-9]+$/, "", id)
+                    want[id] = 1
+                }
+            }
+            /^>/ { keep = want[substr($1,2)]; if (keep) cur = substr($1,2); else cur = ""; next }
+            cur != "" { gsub(/[ \t\r]/, ""); seq[cur] = seq[cur] $0 }
+            END {
+                for (k = 1; k <= nspec; k++) {
+                    s = spec[k]; id = s; st = 0; en = -1
+                    if (match(s, /:[0-9]+-[0-9]+$/)) {
+                        id = substr(s, 1, RSTART - 1)
+                        split(substr(s, RSTART + 1), r, "-"); st = r[1]; en = r[2]
+                    }
+                    if (!(id in seq)) { print "[blastdbcmd] Skipped " id > "/dev/stderr"; continue }
+                    if (en < 0) en = length(seq[id])
+                    print ">" s
+                    sq = substr(seq[id], st + 1, en - st)
+                    for (p = 1; p <= length(sq); p += 50) print substr(sq, p, 50)
+                }
+            }' "$dbfile"
+    fi
+    exit $?     # propagate a real extraction failure instead of masking it
+fi
+
+[ -n "$entry" ] || die "one of -info, -entry or -entry_batch is required"
+
+case "$outfmt" in
+    ""|"%f")
+        if [ "$entry" = "all" ]; then
+            if [ "$dbtype_detected" = "2bit" ]; then
+                "$TWOBITTOFA" "$dbfile" stdout
+            else
+                cat "$dbfile"
+            fi
+        else
+            if [ "$dbtype_detected" = "2bit" ]; then
+                # NOTE: -seqList, not -seq.  twoBitToFa's -seq= parsing chokes on
+                # names containing '/' ("... is not a twoBit file"), which is most
+                # of a RepeatMasker library ("AluJb_short_#SINE/Alu").  -seqList
+                # handles those, and 'gi|N', fine.
+                one=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_seq_XXXXXX")
+                trap 'rm -f "$one"' EXIT
+                printf '%s\n' "$entry" > "$one"
+                "$TWOBITTOFA" -seqList="$one" "$dbfile" stdout
+            else
+                awk -v want="$entry" '/^>/ { p = (substr($1,2) == want) } p' "$dbfile"
+            fi
+        fi
+        ;;
+    *%l*)
+        # Covers "%i %l" and "gi|%g %l" — both just want id + length.  See the
+        # GI NOTE at the top: the stored name is already "gi|N" where it matters.
+        if [ "$entry" = "all" ]; then
+            list_ids_lengths
+        else
+            list_ids_lengths | awk -F'\t' -v want="$entry" '$1 == want'
+        fi
+        ;;
+    *)
+        die "-outfmt '$outfmt' is not supported by this wrapper (supported: %f, and any format containing %l)"
+        ;;
+esac

@@ -352,3 +352,120 @@ revisiting for large-DB use:
   Cost: ~1.5× subject size cached per touched subject (chr20: +96 MB RSS).  The
   same cache feeds `search_phase2a`, which previously re-derived each subject per
   query chunk (~50× on chr22) in the standard orientation.
+
+## `dustmasker` front-end (2026-08-17)
+
+The DUST implementation (`rmblast-lib/src/filter/dust.rs`, a faithful port of NCBI's
+`CSymDustMasker`) is exposed as a standalone `dustmasker` binary (`dustmasker/`) so
+legacy callers — e.g. RepeatScout's `filter-stage-1.prl`, which shells out to
+`dustmasker -in $file -outfmt fasta |` — can run without an NCBI BLAST+ install.
+
+### Scope (deliberately partial)
+
+Supported: `-in -out -window -level -linker -infmt fasta -outfmt {interval,fasta,acclist}
+-hard_masking`, plus the NCBI single-dash argument style (same `normalize_args()` shim
+as `rmblastn`).  Everything else exits **non-zero with an explicit "not ported"
+message** rather than emitting near-miss output:
+
+- `-infmt blastdb`
+- `-outfmt seqloc_*` / `maskinfo_*` (ASN.1 / XML serialisation)
+- `-parse_seqids`
+
+Sequence identifiers are echoed verbatim from the input defline.  NCBI instead
+round-trips them through its object manager: without `-parse_seqids` that yields the
+same string **except** that its title cleanup strips spaces just inside parentheses
+(`>fam ( Size = 3 )` → `>fam (Size = 3)`); with `-parse_seqids` it emits a normalised
+Seq-id (`lcl|foo `), which is why that flag is refused.  The paren quirk is the only
+known output difference on any tested input.
+
+### Two DUST entry points — do not confuse them
+
+| | BLAST filter path | dustmasker application path |
+|---|---|---|
+| API | `dust_mask` (and `dust_mask_ncbi_compat`) | `dustmasker_intervals` |
+| NCBI source | `dust_filter.cpp` → `GetMaskedInts` | `dust_mask_app.cpp` → `GetDustMasks_SkipNs` |
+| N-runs | dusted like any other base | runs > `window` are *reported as masked*, and split the sequence into independently dusted segments |
+
+The application path also reports **any** N-run that begins at position 0 or that runs
+to the end of the record, regardless of length (that asymmetry is NCBI's).  Both paths
+share `dust_intervals`, which takes the CRandom generator (`NcbiLfg`) by `&mut` so the
+N-split segments of one record consume a single RNG stream — NCBI constructs one
+`CSymDustMasker` per record and the converter, hence the RNG, is a member of it.  A
+fresh generator per segment would desync the random 2-bit values assigned at N
+positions and silently change the intervals.
+
+`dust_intervals` also applies NCBI's constructor clamping (window ∈ [8,64],
+level ∈ [2,64], linker ∈ [1,32]; out-of-range values fall back to the defaults rather
+than erroring).  Note the N-run threshold and the `s_InsertMerge` linker use the **raw**
+command-line values — only the masker clamps — matching `GetDustMasks_SkipNs`.
+
+### Validation
+
+Byte-identical to NCBI dustmasker 2.17.0 on `alu.fa`, `shortlib`, `lib-cons.fa`
+(modulo the paren quirk above), `human-1mb.fa`, and `chr22.fa` (56,287 intervals,
+exercising the long-N-run splitting) across all three output formats, with and without
+`-hard_masking`, and for parameter sets `-window 32`, `-level 25`, `-linker 5`,
+`-window 20 -level 30 -linker 3`, and the out-of-range `-level 100` / `-window 3` /
+`-linker 99` clamping cases.  `filter::dust::tests::test_dustmasker_skip_ns_vs_ncbi`
+bakes in a synthetic N-run case as a regression test.  `run_1mb_shortlib_16combo.sh`
+re-passes 16/16 after the `dust_mask` refactor, confirming the engine path is unchanged.
+
+## `blastdbcmd` wrapper (2026-08-17)
+
+`wrappers/blastdbcmd` covers the blastdbcmd invocations BuildDatabase,
+RepeatModeler and `util/align.pl` actually make, against a 2bit **or** FASTA
+"database" (2bit via `twoBitInfo`/`twoBitToFa`, FASTA via awk; the backend is
+detected from the file's first byte).  `-db <name>` is resolved as `<name>`,
+then `<name>.2bit`, `.fa`, `.fasta`, `.fna` — RepeatModeler hands over a BLAST
+prefix, having stripped `.nsq`/`.nin`/….  Unsupported options exit non-zero.
+
+Things worth knowing before touching it:
+
+- **The `-info` counts line is parsed by three different regexes**, and
+  `util/align.pl:518` anchors both ends: `/^\s+([\d,]+)\s+sequences;\s+([\d,]+)\s+total bases\s*$/`.
+  It must start with whitespace (a tab) and end immediately after `total bases`.
+  `RepeatUtil.pm` additionally needs `Longest sequence:\s*([\d,]+)`.  The old
+  wrapper's `#   N sequences; ...` line failed the align.pl regex.
+- **`-outfmt "gi|%g %l"` needs no GI machinery.**  RepeatModeler asks that of the
+  *sample* databases, whose sequences sampleFromDB() named `gi|N` in the defline;
+  BuildDatabase likewise renames genome sequences to `gi|N`.  Printing the stored
+  name gives `gi|N` already, and `-entry "gi|N"` is a plain name lookup — the `|`
+  never reaches a shell.
+- **Use `twoBitToFa -seqList`, never `-seq=`.**  `-seq=` fails with "… is not a
+  twoBit file" when the name contains `/` — i.e. most of a RepeatMasker library
+  (`AluJb_short_#SINE/Alu`).  `-seqList` handles those and `gi|N` fine, preserves
+  request order, and allows repeats.
+- **Batch names are filtered against the catalog first.**  `twoBitToFa` aborts the
+  whole batch on the first unknown name; real blastdbcmd skips and continues.
+  Without the pre-filter one bad name silently truncates a sample.
+- `-entry_batch` lines are `seqID start-end`, **1-based fully closed** (verified
+  byte-for-byte against NCBI); the spec file converts to twoBitToFa's half-open
+  zero-based form.  Output deflines are therefore twoBitToFa-style
+  `>name:zeroBasedStart-end` rather than NCBI's `>name:1basedStart-end desc` —
+  harmless because `sampleFromDB()` discards them and re-headers by position.
+- `-info`'s `Date:` is the file mtime, labelled `SYNTHETIC`; there is no database
+  creation date to report.
+
+Validated end to end: `RMBLAST_DIR=<wrappers> BuildDatabase -name testdb small.fa`
+reports the right counts, `-outfmt "%f" | faToTwoBit` round-trips to a
+byte-identical 2bit, and `%i %l` matches `twoBitInfo` exactly on both backends.
+
+## `blastdb_aliastool` wrapper + gilist spelling (2026-08-17)
+
+`wrappers/blastdb_aliastool` implements the one form RepeatModeler uses —
+`-gi_file_in <text> -gi_file_out <binary>` — as a file copy: the real tool packs
+the text list into NCBI's binary gilist format, and the Rust rmblastn reads the
+text directly.  Anything else exits non-zero.
+
+**The trap:** RepeatModeler writes **bare integers** to that file
+(`RepeatModeler:1851`, `my @giList = (($startGID+1) .. $sampleDBSize)`), but its
+databases name sequences `gi|N` (BuildDatabase and `sampleFromDB()` both rename
+to `gi|N`).  `load_gilist` matched raw strings, so a copied gilist filtered
+*every* subject out and the all-vs-other batches returned **zero hits, silently**
+— no error, just no families.  `load_gilist` now also inserts `gi|<n>` for any
+all-digit line, so both spellings select the subject; regression test
+`gilist_tests::bare_numbers_and_gi_pipe_both_match`.
+
+Keep the two spellings handled in that one place.  Do not make the wrapper
+rewrite the file — direct rmblastn users hitting the same NCBI convention would
+not be covered by it.

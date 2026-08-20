@@ -2,6 +2,7 @@
 members = [
     "rmblast-lib",
     "rmblastn",
+    "dustmasker",
     "rmblast-stats/rmstats",
 ]
 resolver = "2"
