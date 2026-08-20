@@ -29,6 +29,9 @@ pub static TOTAL_DP_CELLS: AtomicU64 = AtomicU64::new(0);
 /// only records how often the degenerate band state occurs.
 pub static REVERSE_FBI_CLAMPED: AtomicU64 = AtomicU64::new(0);
 
+/// Diagnostic counter: total score-only DP cells (subset of TOTAL_DP_CELLS).
+pub static SCORE_ONLY_CELLS: AtomicU64 = AtomicU64::new(0);
+
 const SCRIPT_GAP_IN_A: u8 = 0;
 const SCRIPT_SUB: u8 = 3;
 const SCRIPT_GAP_IN_B: u8 = 6;
@@ -308,6 +311,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
     }
 
     TOTAL_DP_CELLS.fetch_add(total_cells_so, Ordering::Relaxed);
+    SCORE_ONLY_CELLS.fetch_add(total_cells_so, Ordering::Relaxed);
     let reset_end = b_size.min(dp.len());
     for cell in dp[..reset_end].iter_mut() {
         *cell = DpCell { best: MININT, best_gap: MININT };

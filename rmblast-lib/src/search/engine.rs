@@ -37,7 +37,9 @@ use crate::blast::mblookup::{blast_mb_lookup_table_new, blast_mb_scan_subject, B
 use crate::blast::nalookup::{blast_na_lookup_table_new, choose_lut_width, BlastNaLookupTable};
 use crate::blast::nascan::blast_na_scan_subject;
 use crate::blast::types::BlastOffsetPair;
+#[cfg(test)]
 use crate::blast::util::{blast_compress_blastna_sequence, seqblk_from_blastna};
+use crate::seq::{prepare_subject_strands, PreparedSubject};
 use crate::encoding::{revcomp_blastna, BLASTNA_COMPLEMENT};
 use crate::filter::dust::{dust_mask, dust_mask_ncbi_compat, DUST_LEVEL, DUST_LINKER, DUST_WINDOW};
 use crate::hits::{EditOp, EditScript, Hsp, Strand};
@@ -165,6 +167,176 @@ pub struct PrelimHsp {
 /// min_diag_separation value for rmblastn megablast (MB_HSP_CLOSE threshold).
 /// Mirrors CBlastNucleotideOptionsHandle::SetHitSavingOptionsDefaults in NCBI.
 const MIN_DIAG_SEP: i64 = 50;
+
+/// Parameters for the opt-in prelim-cull fast mode (`--prelim-cull`).
+///
+/// NOT part of the faithful NCBI pipeline.  When enabled, preliminary HSPs
+/// that are mask_level-style dominated by higher-scoring prelims are skipped
+/// in Phase 2b (round 1), then re-tested against the survivors' FINAL
+/// coordinates and scores and resurrected — with a second small Phase 2b
+/// wave — where the dominance no longer holds (round 2).  The exact
+/// output-level mask_level still runs afterwards.  Output differs from
+/// faithful mode only in a small fraction of heavily-overlapped, mostly
+/// low-scoring hits (measured on chr22 x longlib: balanced preset ~0.2% of
+/// annotated bp, ~0.5% of hits, for ~68% of traceback DP avoided).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrelimCullParams {
+    /// Round-1 dominator score margin in percent (110 → the dominating prelim
+    /// must score >= 1.10x the candidate).
+    pub cull_margin_pct: u32,
+    /// Round-1 coverage requirement in percent of the candidate's query span.
+    pub cull_coverage: u32,
+    /// Round-2 resurrection margin in percent (dominator FINAL score vs
+    /// candidate PRELIM score; < 100 is conservative).
+    pub resurrect_margin_pct: u32,
+    /// Round-2 slack in bp added to each end of the candidate span before the
+    /// dominance re-test (absorbs prelim-vs-final coordinate drift).
+    pub resurrect_slack: u32,
+}
+
+/// Slop (bp) for deciding that a prelim endpoint abuts a query-chunk edge.
+const CULL_BOUNDARY_EPS: u32 = 5;
+
+/// True if `x` lies within [`CULL_BOUNDARY_EPS`] of any coordinate in the
+/// sorted `boundaries` list.
+fn abuts_boundary(x: u32, boundaries: &[u32]) -> bool {
+    let lo = x.saturating_sub(CULL_BOUNDARY_EPS);
+    let i = boundaries.partition_point(|&b| b < lo);
+    i < boundaries.len() && boundaries[i] <= x.saturating_add(CULL_BOUNDARY_EPS)
+}
+
+/// Round 1 of the prelim cull: mark prelims whose query span is
+/// `cull_coverage`%-covered by a single not-yet-culled prelim scoring at
+/// least `cull_margin_pct`% of the candidate.  Mirrors the
+/// [`apply_mask_level`] sweep (score-descending order, survivors-only
+/// dominators, minus-strand +1 shift).  Returns per-subject keep masks.
+///
+/// `chunk_boundaries` holds the sorted interior query-chunk edge coordinates:
+/// a prelim whose span abuts one was truncated by Phase 2a's chunking, so its
+/// extent under-represents its final traceback — such prelims are never
+/// culled (they still act as dominators).
+pub fn cull_prelims(
+    prelims_by_subject: &[Vec<PrelimHsp>],
+    cull_coverage: u32,
+    cull_margin_pct: u32,
+    chunk_boundaries: &[u32],
+) -> Vec<Vec<bool>> {
+    struct Cand {
+        subj: usize,
+        idx: usize,
+        qs: u32,
+        qe: u32,
+        score: i64,
+    }
+    let mut cands: Vec<Cand> = Vec::new();
+    for (subj, v) in prelims_by_subject.iter().enumerate() {
+        for (idx, p) in v.iter().enumerate() {
+            let (qs, qe) = if p.strand == Strand::Minus {
+                (p.q_start + 1, p.q_end + 1)
+            } else {
+                (p.q_start, p.q_end)
+            };
+            cands.push(Cand { subj, idx, qs, qe, score: p.score as i64 });
+        }
+    }
+    // Deterministic order: score DESC, then query start ASC, then identity.
+    cands.sort_unstable_by(|a, b| {
+        b.score.cmp(&a.score)
+            .then_with(|| a.qs.cmp(&b.qs))
+            .then_with(|| a.subj.cmp(&b.subj))
+            .then_with(|| a.idx.cmp(&b.idx))
+    });
+
+    let mut keep: Vec<Vec<bool>> =
+        prelims_by_subject.iter().map(|v| vec![true; v.len()]).collect();
+    let mut accepted: Vec<(u32, u32, i64)> = Vec::new(); // qs ASC
+    let mut max_span: u32 = 0;
+    for c in &cands {
+        let span = c.qe.saturating_sub(c.qs) as i64;
+        if span == 0 {
+            continue; // keep — the final mask_level handles degenerate spans
+        }
+        if abuts_boundary(c.qs, chunk_boundaries) || abuts_boundary(c.qe, chunk_boundaries) {
+            // Chunk-truncated span: exempt from culling, but let it dominate.
+            let pos = accepted.partition_point(|a| a.0 < c.qs);
+            accepted.insert(pos, (c.qs, c.qe, c.score));
+            max_span = max_span.max(c.qe - c.qs);
+            continue;
+        }
+        let upper = accepted.partition_point(|a| a.0 < c.qe);
+        let min_start = c.qs.saturating_sub(max_span);
+        let mut masked = false;
+        let mut i = upper;
+        while i > 0 {
+            i -= 1;
+            let (qs_j, qe_j, sc_j) = accepted[i];
+            if qs_j < min_start { break; }
+            if qe_j <= c.qs { continue; }
+            if sc_j * 100 < c.score * cull_margin_pct as i64 { continue; }
+            let ovlp = (qe_j.min(c.qe) as i64) - (qs_j.max(c.qs) as i64);
+            if ovlp * 100 / span >= cull_coverage as i64 {
+                masked = true;
+                break;
+            }
+        }
+        if masked {
+            keep[c.subj][c.idx] = false;
+        } else {
+            let pos = accepted.partition_point(|a| a.0 < c.qs);
+            accepted.insert(pos, (c.qs, c.qe, c.score));
+            max_span = max_span.max(c.qe - c.qs);
+        }
+    }
+    keep
+}
+
+/// Round 2 of the prelim cull: re-test culled prelims against the surviving
+/// FINAL hits and return the indices (into `culled`) that must be
+/// resurrected because no single survivor still dominates them.
+///
+/// `survivors` holds FWD-query `(qs, qe, score)` of the wave-1 results
+/// (minus-strand +1-shifted), sorted by `qs` ascending.
+pub fn resurrect_prelims(
+    culled: &[(usize, PrelimHsp)],
+    survivors: &[(u32, u32, i64)],
+    surv_max_span: u32,
+    mask_level: u32,
+    resurrect_margin_pct: u32,
+    resurrect_slack: u32,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (ci, (_, p)) in culled.iter().enumerate() {
+        let (qs0, qe0) = if p.strand == Strand::Minus {
+            (p.q_start + 1, p.q_end + 1)
+        } else {
+            (p.q_start, p.q_end)
+        };
+        let qs = qs0.saturating_sub(resurrect_slack);
+        let qe = qe0 + resurrect_slack;
+        let span = (qe - qs) as i64;
+        let score = p.score as i64;
+        let upper = survivors.partition_point(|a| a.0 < qe);
+        let min_start = qs.saturating_sub(surv_max_span);
+        let mut dominated = false;
+        let mut i = upper;
+        while i > 0 {
+            i -= 1;
+            let (qs_j, qe_j, sc_j) = survivors[i];
+            if qs_j < min_start { break; }
+            if qe_j <= qs { continue; }
+            if sc_j * 100 < score * resurrect_margin_pct as i64 { continue; }
+            let ovlp = (qe_j.min(qe) as i64) - (qs_j.max(qs) as i64);
+            if ovlp * 100 / span >= mask_level as i64 {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            out.push(ci);
+        }
+    }
+    out
+}
 
 /// Find an improved gapped alignment seed within the preliminary alignment region.
 /// Mirrors NCBI's BlastGetStartForGappedAlignmentNucl (blast_gapalign.c).
@@ -535,6 +707,7 @@ pub fn search_with_query_lookup(
     matrix: &ScoreMatrix,
     chunk_offset: u32,
     n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -543,21 +716,18 @@ pub fn search_with_query_lookup(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    // Pack both subject strands into NCBI2NA (4 bases/byte) for the scan.
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus, n_mask);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     // Generate masked query for DUST: used for exact extension, ungapped scoring, Phase 2a, Phase 2b.
     // When dust=false, masked_query == query (no allocation).
@@ -575,7 +745,7 @@ pub fn search_with_query_lookup(
     if ql.c1_start > 0 {
         // Combined LUT: single scan of FWD subject, interleaved plus/minus hits.
         collect_ungapped_combined(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     } else {
@@ -584,14 +754,14 @@ pub fn search_with_query_lookup(
             Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     }
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, &subj_rc, subject_id,
+        query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
-        ql.lut_word_length(), n_mask,
+        ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
         for r in &mut results {
@@ -617,6 +787,7 @@ pub fn search_with_query_lookup_seeds(
     chunk_offset: u32,
     seed_out: &mut Vec<SeedRecord>,
     n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -625,20 +796,18 @@ pub fn search_with_query_lookup_seeds(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus, n_mask);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     let masked_query_buf_s;
     let masked_query_s: &[u8] = if params.dust {
@@ -653,7 +822,7 @@ pub fn search_with_query_lookup_seeds(
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
         collect_ungapped_combined(
-            query, masked_query_s, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query_s, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
         );
     } else {
@@ -662,14 +831,14 @@ pub fn search_with_query_lookup_seeds(
             Strand::Plus, &ql.lookup, params, matrix, seed_out, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query_s, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query_s, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, seed_out, &mut ungapped,
         );
     }
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, &subj_rc, subject_id,
+        query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
-        ql.lut_word_length(), n_mask,
+        ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
         for r in &mut results {
@@ -695,6 +864,7 @@ pub fn search_with_query_lookup_ungapped(
     chunk_offset: u32,
     ungap_out: &mut Vec<UngappedHit>,
     n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -703,20 +873,18 @@ pub fn search_with_query_lookup_ungapped(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            local_prep = prepare_subject_strands(subject_plus, n_mask);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     let masked_query_buf_u;
     let masked_query_u: &[u8] = if params.dust {
@@ -731,7 +899,7 @@ pub fn search_with_query_lookup_ungapped(
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
         collect_ungapped_combined(
-            query, masked_query_u, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query_u, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     } else {
@@ -740,14 +908,14 @@ pub fn search_with_query_lookup_ungapped(
             Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query_u, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query_u, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     }
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, &subj_rc, subject_id,
+        query, query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, ungap_out,
-        ql.lut_word_length(), n_mask,
+        ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
         for r in &mut results {
@@ -774,7 +942,7 @@ pub fn search_query_vs_subject(
     matrix: &ScoreMatrix,
 ) -> Vec<AlignResult> {
     let (ql, _) = build_query_lookup(query, params);
-    search_with_query_lookup(&ql, query, query_id, subject_plus, subject_id, params, matrix, 0, &[])
+    search_with_query_lookup(&ql, query, query_id, subject_plus, subject_id, params, matrix, 0, &[], None)
 }
 
 /// Filter HSPs by masklevel: an HSP is dropped if any single higher-scoring HSP
@@ -1861,6 +2029,7 @@ pub fn search_phase2a(
     params: &SearchParams,
     matrix: &ScoreMatrix,
     chunk_offset: u32,
+    prepared: Option<&PreparedSubject>,
 ) -> Vec<PrelimHsp> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
@@ -1869,25 +2038,24 @@ pub fn search_phase2a(
         return Vec::new();
     }
 
-    let subj_rc = revcomp_blastna(subject_plus);
-
-    let packed_plus = {
-        let n = subject_plus.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subject_plus[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
+    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // per-subject cache when supplied, else compute locally (identical bytes).
+    let local_prep;
+    let prep: &PreparedSubject = match prepared {
+        Some(p) => p,
+        None => {
+            // Phase 2a never touches the align views, so no n_mask is needed here.
+            local_prep = prepare_subject_strands(subject_plus, &[]);
+            &local_prep
+        }
     };
-    let packed_minus = {
-        let n = subj_rc.len().saturating_sub(2);
-        let mut blk = seqblk_from_blastna(&subj_rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
+    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
+        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
         collect_ungapped_combined(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], &subj_rc, s_len,
+            query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
             ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     } else {
@@ -1896,7 +2064,7 @@ pub fn search_phase2a(
             Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
         collect_ungapped(
-            query, masked_query, q_len, &subj_rc, &packed_minus[3..], s_len,
+            query, masked_query, q_len, subj_rc, &packed_minus[3..], s_len,
             Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
         );
     }
@@ -1968,21 +2136,15 @@ fn run_gapped_phase<U: UngapOut>(
     ungap_out: &mut U,
     lut_word_length: u32,
     n_mask: &[u8],
+    prep: &PreparedSubject,
 ) -> Vec<AlignResult> {
     // N/IUPAC handling: NCBI uses CRandom (2-bit scan) for Phase 2a (score-only filter)
     // and the original ambiguity code for Phase 2b (full traceback + improve_seed + reevaluate).
     // Phase 2a uses the original subject_plus/subj_rc parameters (CRandom at ambig positions).
-    // Phase 2b uses subject_align/subj_rc_align below (original BLASTNA code at ambig positions).
-    let subject_align: Vec<u8> = if n_mask.is_empty() {
-        subject_plus.to_vec()
-    } else {
-        let mut s = subject_plus.to_vec();
-        for (i, &code) in n_mask.iter().enumerate() {
-            if code != 0 { s[i + 1] = code; }
-        }
-        s
-    };
-    let subj_rc_align = revcomp_blastna(&subject_align);
+    // Phase 2b uses the align views below (original BLASTNA code at ambig positions),
+    // borrowed from the per-subject cache (built with this same n_mask).
+    let subject_align: &[u8] = &prep.align;
+    let subj_rc_align: &[u8] = &prep.align_rc;
 
     // Mirrors Blast_InitHitListSortByScore / score_compare_match in blast_extend.c.
     // NCBI sorts by combined-query q_start, which for plus strand = FWD q_start (< q_len)
@@ -2418,9 +2580,7 @@ fn run_gapped_phase<U: UngapOut>(
         let q_core   = &query[1..query.len() - 1];
         let src_core = &subject_align[1..subject_align.len() - 1];
         let rc_core  = &subj_rc_align[1..subj_rc_align.len() - 1];
-        let n_mask_rc_2b: Vec<u8> = if n_mask.is_empty() { Vec::new() } else {
-            n_mask.iter().rev().map(|&c| if c == 0 { 0 } else { BLASTNA_COMPLEMENT[c as usize] }).collect()
-        };
+        let n_mask_rc_2b: &[u8] = &prep.n_mask_rc;
 
         for slot in arr[extra_start..].iter_mut() {
             let mut r = match slot.take() { Some(r) => r, None => continue };

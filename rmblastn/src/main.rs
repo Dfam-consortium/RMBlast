@@ -19,6 +19,7 @@ use rmblast_lib::output::{
     write_pairwise_results, write_pairwise_footer, AlignResult, OutField,
 };
 use rmblast_lib::search::{apply_mask_level, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
+use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
 // use rmblast_lib::search::engine::{COUNT_SEEDS, COUNT_UNGAPPED_HITS, COUNT_PRELIM_GAPPED, COUNT_FINAL_GAPPED, COUNT_FINAL_HITS};
 // use rmblast_lib::search::gapped::TOTAL_DP_CELLS;
 use rmblast_lib::seq::{FastaReader, SubjectDb};
@@ -182,6 +183,17 @@ struct Args {
     /// Format: sseqid TAB strand TAB qstart TAB qend TAB sstart TAB send TAB score
     #[arg(long)]
     dump_prelims: Option<String>,
+
+    /// FAST MODE (not NCBI-faithful): skip Phase 2b traceback for preliminary
+    /// HSPs dominated (mask_level-style) by higher-scoring prelims, then
+    /// re-test against the survivors' final alignments and resurrect any no
+    /// longer dominated.  Output differs from faithful mode in a small
+    /// fraction of heavily-overlapped, mostly low-scoring hits (chr22
+    /// benchmark: balanced ~0.2% of annotated bp).  Modes: off (default),
+    /// conservative, balanced, aggressive.  Active only for multi-chunk
+    /// queries (>1 Mbp) with mask_level < 100.
+    #[arg(long, default_value = "off")]
+    prelim_cull: String,
 
     /// Karlin-Altschul lambda override for E-value statistics of a matrix
     /// absent from the baked table (NCBI -matrix_lambda; needs _k and _alpha too)
@@ -431,6 +443,33 @@ fn main() -> Result<()> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
 
+    // Fast-mode prelim cull presets (measured on chr22 x longlib; see
+    // PrelimCullParams docs).  Requires an active mask_level.
+    let prelim_cull: Option<PrelimCullParams> = match args.prelim_cull.as_str() {
+        "off" => None,
+        "conservative" => Some(PrelimCullParams {
+            cull_margin_pct: 110, cull_coverage: 95,
+            resurrect_margin_pct: 90, resurrect_slack: 100,
+        }),
+        "balanced" => Some(PrelimCullParams {
+            cull_margin_pct: 110, cull_coverage: 95,
+            resurrect_margin_pct: 100, resurrect_slack: 50,
+        }),
+        "aggressive" => Some(PrelimCullParams {
+            cull_margin_pct: 100, cull_coverage: 95,
+            resurrect_margin_pct: 100, resurrect_slack: 0,
+        }),
+        other => anyhow::bail!(
+            "--prelim-cull: unknown mode '{}' (off|conservative|balanced|aggressive)", other
+        ),
+    };
+    let prelim_cull = if prelim_cull.is_some() && params.mask_level >= 100 {
+        eprintln!("Note: --prelim-cull requires mask_level < 100; running faithful pipeline.");
+        None
+    } else {
+        prelim_cull
+    };
+
     let query_reader: Box<dyn std::io::Read> = if args.query == "-" {
         Box::new(std::io::stdin())
     } else {
@@ -457,7 +496,7 @@ fn main() -> Result<()> {
                 let full_q_len = qrec.len() as u32;
                 let mut results = search_db_parallel(
                     &qrec.seq, &qrec.id, &subject_names, &db, &params, &matrix,
-                    avg_subj_length, args.dump_prelims.as_deref(),
+                    avg_subj_length, args.dump_prelims.as_deref(), prelim_cull,
                     reap_for_query(full_q_len as i32),
                 );
                 results.sort_by(|a, b| {
@@ -496,7 +535,7 @@ fn main() -> Result<()> {
                 .map(|q| {
                     let mut qr = search_db_parallel(
                         &q.seq, &q.id, &subject_names, &db, &params, &matrix,
-                        avg_subj_length, None,
+                        avg_subj_length, None, prelim_cull,
                         reap_for_query(q.len() as i32),
                     );
                     qr.sort_by(|a, b| b.hsp.score.cmp(&a.hsp.score));
@@ -556,6 +595,25 @@ fn main() -> Result<()> {
     //     COUNT_FINAL_HITS.load(Ordering::Relaxed),
     //     dp_cells,
     // );
+
+    if std::env::var_os("RMBLAST_DP_STATS").is_some() {
+        use std::sync::atomic::Ordering;
+        use rmblast_lib::search::gapped::{SCORE_ONLY_CELLS, TOTAL_DP_CELLS};
+        use rmblast_lib::search::engine::{
+            COUNT_FINAL_GAPPED, COUNT_PRELIM_GAPPED, COUNT_SEEDS, COUNT_UNGAPPED_HITS,
+        };
+        let so_cells = SCORE_ONLY_CELLS.load(Ordering::Relaxed);
+        let total_cells = TOTAL_DP_CELLS.load(Ordering::Relaxed);
+        eprintln!(
+            "DP_STATS stages: seeds={} ungapped={} prelim_gapped={} final_gapped={} so_cells={} tb_cells={}",
+            COUNT_SEEDS.load(Ordering::Relaxed),
+            COUNT_UNGAPPED_HITS.load(Ordering::Relaxed),
+            COUNT_PRELIM_GAPPED.load(Ordering::Relaxed),
+            COUNT_FINAL_GAPPED.load(Ordering::Relaxed),
+            so_cells,
+            total_cells - so_cells,
+        );
+    }
 
     Ok(())
 }
@@ -682,6 +740,7 @@ fn search_db_parallel(
     matrix: &ScoreMatrix,
     avg_subj_length: u64,
     dump_prelims: Option<&str>,
+    prelim_cull: Option<PrelimCullParams>,
     // -evalue reap (NCBI Blast_HSPListReapByEvalue): drop HSPs whose E-value
     // exceeds the threshold, BEFORE masklevel — reaping changes which HSPs
     // compete there.  None when statistics are unavailable (NCBI sentinel
@@ -736,6 +795,13 @@ fn search_db_parallel(
 
     // Single-chunk path: use original run_gapped_phase pipeline (unchanged).
     if effective_num_chunks <= 1 {
+        if prelim_cull.is_some() {
+            eprintln!(
+                "Note: --prelim-cull applies only to multi-chunk queries (>1 Mbp); \
+                 running the faithful pipeline for '{}'.",
+                query_id
+            );
+        }
         let (chunk_lookup, _) = build_query_lookup(query, params);
         let mut results: Vec<AlignResult> = subject_names
             .par_iter()
@@ -745,8 +811,12 @@ fn search_db_parallel(
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
                 let n_mask = db.get_n_mask(name);
+                // Shared per-subject RC/packed strands: computed once in the db
+                // cache and reused across every query searched against `name`.
+                let prep = db.get_prepared(name).ok();
                 let mut r = search_with_query_lookup(
                     &chunk_lookup, query, query_id, &seq, name, params, matrix, 0, &n_mask,
+                    prep.as_deref(),
                 );
                 for h in &mut r { h.hsp.q_len = full_q_len_u32; }
                 r
@@ -808,7 +878,8 @@ fn search_db_parallel(
                     Ok(s) => s,
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
-                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, name, params, matrix, chunk_start as u32)
+                let prep = db.get_prepared(name).ok();
+                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, name, params, matrix, chunk_start as u32, prep.as_deref())
             })
             .collect();
 
@@ -846,21 +917,99 @@ fn search_db_parallel(
     // holding one ~full-query copy per concurrent thread.
     let query_rc = rmblast_lib::encoding::revcomp_blastna(query);
     let query_rc = &query_rc[..];
-    let mut all_results: Vec<AlignResult> = subject_names
-        .par_iter()
-        .zip(accumulated_prelims.into_par_iter())
-        .flat_map(|(name, prelims)| {
-            if prelims.is_empty() { return vec![]; }
-            let seq = match db.get_full_sequence_blastna(name) {
-                Ok(s) => s,
-                Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
-            };
-            let n_mask = db.get_n_mask(name);
-            let mut r = run_phase2b(query, query_rc, query_id, &seq, name, prelims, params, matrix, &n_mask);
-            for h in &mut r { h.hsp.q_len = full_q_len_u32; }
-            r
-        })
-        .collect();
+
+    // Fast-mode prelim cull, round 1: split the merged prelims into a Phase 2b
+    // wave-1 set and a culled store (see PrelimCullParams).
+    // Interior chunk-edge coordinates for the cull's boundary exemption:
+    // prelims truncated at a chunk edge under-represent their final extent.
+    let chunk_boundaries: Vec<u32> = if prelim_cull.is_some() {
+        let mut b: Vec<u32> = Vec::new();
+        for k in 0..effective_num_chunks {
+            let cs = k * step;
+            if cs >= full_q_len { break; }
+            let ce = (cs + chunk_size).min(full_q_len);
+            if cs > 0 { b.push(cs as u32); }
+            if ce < full_q_len { b.push(ce as u32); }
+        }
+        b.sort_unstable();
+        b
+    } else {
+        Vec::new()
+    };
+
+    let (wave1, culled_store): (Vec<Vec<PrelimHsp>>, Vec<(usize, PrelimHsp)>) =
+        match prelim_cull {
+            Some(cp) => {
+                let keep = cull_prelims(
+                    &accumulated_prelims, cp.cull_coverage, cp.cull_margin_pct,
+                    &chunk_boundaries,
+                );
+                let mut w1 = Vec::with_capacity(accumulated_prelims.len());
+                let mut culled = Vec::new();
+                for (si, (v, k)) in accumulated_prelims.into_iter().zip(keep).enumerate() {
+                    let mut kept = Vec::with_capacity(v.len());
+                    for (p, kp) in v.into_iter().zip(k) {
+                        if kp { kept.push(p); } else { culled.push((si, p)); }
+                    }
+                    w1.push(kept);
+                }
+                (w1, culled)
+            }
+            None => (accumulated_prelims, Vec::new()),
+        };
+
+    let phase2b_wave = |per_subject: Vec<Vec<PrelimHsp>>| -> Vec<AlignResult> {
+        subject_names
+            .par_iter()
+            .zip(per_subject.into_par_iter())
+            .flat_map(|(name, prelims)| {
+                if prelims.is_empty() { return vec![]; }
+                let seq = match db.get_full_sequence_blastna(name) {
+                    Ok(s) => s,
+                    Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
+                };
+                let n_mask = db.get_n_mask(name);
+                let mut r = run_phase2b(query, query_rc, query_id, &seq, name, prelims, params, matrix, &n_mask);
+                for h in &mut r { h.hsp.q_len = full_q_len_u32; }
+                r
+            })
+            .collect()
+    };
+
+    let mut all_results = phase2b_wave(wave1);
+
+    // Round 2: re-test culled prelims against the survivors' FINAL query spans
+    // and scores; resurrect (and traceback) those no longer dominated.
+    if let Some(cp) = prelim_cull {
+        if !culled_store.is_empty() {
+            let mut survivors: Vec<(u32, u32, i64)> = all_results
+                .iter()
+                .map(|r| {
+                    let (qs, qe) = if r.hsp.strand == Strand::Minus {
+                        (r.hsp.q_start + 1, r.hsp.q_end + 1)
+                    } else {
+                        (r.hsp.q_start, r.hsp.q_end)
+                    };
+                    (qs, qe, r.hsp.score as i64)
+                })
+                .collect();
+            survivors.sort_unstable();
+            let surv_max_span = survivors.iter().map(|s| s.1 - s.0).max().unwrap_or(0);
+            let resurrected = resurrect_prelims(
+                &culled_store, &survivors, surv_max_span,
+                params.mask_level, cp.resurrect_margin_pct, cp.resurrect_slack,
+            );
+            if !resurrected.is_empty() {
+                let mut by_subj: Vec<Vec<PrelimHsp>> = vec![Vec::new(); subject_names.len()];
+                for &ci in &resurrected {
+                    let (si, ref p) = culled_store[ci];
+                    by_subj[si].push(p.clone());
+                }
+                let mut r2 = phase2b_wave(by_subj);
+                all_results.append(&mut r2);
+            }
+        }
+    }
 
     if let Some((stats, expect)) = &reap {
         all_results.retain(|r| stats.evalue(r.hsp.score) <= *expect);
@@ -894,11 +1043,53 @@ fn load_gilist(path: Option<&str>) -> Result<Option<HashSet<String>>> {
         Some(p) => p,
     };
     let f = std::fs::File::open(p).with_context(|| format!("opening gilist '{}'", p))?;
-    let set: HashSet<String> = std::io::BufReader::new(f)
-        .lines()
-        .filter_map(|l| l.ok())
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
+    let mut set: HashSet<String> = HashSet::new();
+    for line in std::io::BufReader::new(f).lines() {
+        let entry = match line {
+            Ok(l) => l.trim().to_string(),
+            Err(_) => continue,
+        };
+        if entry.is_empty() {
+            continue;
+        }
+        // A bare GI number also matches the sequence named "gi|<n>".  This is
+        // the form RepeatModeler writes (RepeatModeler:1851 emits
+        // `($startGID+1) .. $sampleDBSize`, i.e. plain integers) while its
+        // databases name sequences "gi|N"; without this the all-vs-other
+        // batches would filter every subject out and silently return no hits.
+        if entry.chars().all(|c| c.is_ascii_digit()) {
+            set.insert(format!("gi|{}", entry));
+        }
+        set.insert(entry);
+    }
     Ok(Some(set))
+}
+
+#[cfg(test)]
+mod gilist_tests {
+    use super::load_gilist;
+    use std::io::Write;
+
+    /// RepeatModeler writes bare integers; the databases name sequences "gi|N".
+    /// Both spellings must select the subject (see wrappers/blastdb_aliastool).
+    #[test]
+    fn bare_numbers_and_gi_pipe_both_match() {
+        let dir = std::env::temp_dir().join("rmblastn_gilist_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bare = dir.join("bare.txt");
+        writeln!(std::fs::File::create(&bare).unwrap(), "2\n3\n").unwrap();
+        let set = load_gilist(Some(bare.to_str().unwrap())).unwrap().unwrap();
+        assert!(set.contains("gi|2") && set.contains("gi|3"));
+        assert!(set.contains("2"), "the raw spelling must still match");
+        assert!(!set.contains("gi|1"));
+
+        let piped = dir.join("piped.txt");
+        writeln!(std::fs::File::create(&piped).unwrap(), "gi|2\ngi|3\n").unwrap();
+        let set = load_gilist(Some(piped.to_str().unwrap())).unwrap().unwrap();
+        assert!(set.contains("gi|2") && set.contains("gi|3"));
+
+        assert!(load_gilist(None).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

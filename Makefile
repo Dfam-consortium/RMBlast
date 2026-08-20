@@ -2,6 +2,7 @@
 #
 # Layout produced by `make install`:
 #   $(PREFIX)/$(NAME)-$(VERSION)/bin/rmblastn      the compiled binary
+#   $(PREFIX)/$(NAME)-$(VERSION)/bin/dustmasker    NCBI-dustmasker-compatible CLI
 #   $(PREFIX)/$(NAME)-$(VERSION)/wrappers/*        RepeatMasker-facing wrapper scripts
 #   $(PREFIX)/$(NAME)-$(VERSION)/*.md              documentation
 #   $(PREFIX)/$(NAME)-$(VERSION)/matrices/*        scoring matrices (opt-in, see MATRIX_SRC)
@@ -19,6 +20,10 @@ NAME       ?= rmblast
 CARGO      ?= cargo
 INSTALL    ?= install
 BIN         = rmblastn
+# Additional binaries installed alongside rmblastn.  `dustmasker` is a drop-in
+# replacement for the NCBI application of the same name (FASTA in, text out);
+# installing it shadows NCBI's copy for anything that finds it on PATH first.
+EXTRA_BINS  = dustmasker
 MANIFEST    = rmblastn/Cargo.toml
 # Directory holding *.matrix files to bundle.  Empty by default (opt-in) since the
 # canonical matrices live outside the source tree; set on the command line.
@@ -49,6 +54,9 @@ test:
 install: build
 	$(INSTALL) -d $(PKGDIR)/bin
 	$(INSTALL) -m 0755 target/release/$(BIN) $(PKGDIR)/bin/$(BIN)
+	@for b in $(EXTRA_BINS); do \
+	  $(INSTALL) -m 0755 target/release/$$b $(PKGDIR)/bin/$$b && echo "  bin       <- $$b"; \
+	done
 	$(INSTALL) -d $(PKGDIR)/wrappers
 	$(INSTALL) -m 0755 wrappers/* $(PKGDIR)/wrappers/
 	$(INSTALL) -m 0644 *.md $(PKGDIR)/

@@ -1,0 +1,13 @@
+[package]
+name = "dustmasker"
+version = "3.0.1"
+edition = "2021"
+
+[[bin]]
+name = "dustmasker"
+path = "src/main.rs"
+
+[dependencies]
+rmblast-lib = { package = "rmblast-lib", path = "../rmblast-lib" }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -15,14 +15,23 @@ pub const DUST_LINKER: usize = 1;
 /// Port of NCBI's CRandom Lagged Fibonacci Generator (eGetRand_LFG).
 /// Uses the same hard-coded initial state as NCBI so that N-base randomisation
 /// produces byte-identical DUST results.
-struct NcbiLfg {
+///
+/// Public because a single generator must be threaded across several
+/// `dust_intervals` calls on one record: NCBI's `CSymDustMasker` owns the
+/// converter (and hence the RNG) as a member, so the N-split segments of
+/// `GetDustMasks_SkipNs` share one RNG stream.  See [`dustmasker_intervals`].
+pub struct NcbiLfg {
     state: [u32; 33],
     rk: isize,  // signed so we can detect < 0 wraparound
     rj: isize,
 }
 
+impl Default for NcbiLfg {
+    fn default() -> Self { Self::new() }
+}
+
 impl NcbiLfg {
-    fn new() -> Self {
+    pub fn new() -> Self {
         NcbiLfg {
             state: [
                 0xd53f1852, 0xdfc78b83, 0x4f256096, 0x0e643df7,
@@ -302,18 +311,39 @@ fn save_masked(
 
 // ── public API ────────────────────────────────────────────────────────────────
 
-/// Mask a BLASTNA-encoded sequence in place.
-/// `seq` must have sentinel bytes at positions 0 and n+1 (as produced by the engine).
-/// Masked positions are set to `mask_val`.
-/// Returns the list of masked intervals (absolute, 0-indexed in the base array).
-pub fn dust_mask(
-    seq: &mut [u8],
+/// Clamp DUST parameters to the ranges enforced by NCBI's `CSymDustMasker`
+/// constructor (`symdust.cpp:170`): out-of-range values silently fall back to
+/// the defaults rather than being rejected.
+pub fn clamp_dust_params(window: usize, level: u32, linker: usize) -> (usize, u32, usize) {
+    (
+        if (8..=64).contains(&window) { window } else { DUST_WINDOW },
+        if (2..=64).contains(&level)  { level }  else { DUST_LEVEL },
+        if (1..=32).contains(&linker) { linker } else { DUST_LINKER },
+    )
+}
+
+/// Compute DUST intervals over a run of BLASTNA bases (NO sentinels).
+///
+/// Mirrors `CSymDustMasker::operator()(seq, start, stop)` for the whole of
+/// `bases`; to dust a sub-range, pass the sub-slice and offset the returned
+/// intervals (NCBI's range form is the same code with an added offset — see
+/// `save_masked_regions(res, wstart, start)`).
+///
+/// `rng` is threaded in by the caller because NCBI's masker owns the
+/// IUPAC→ncbi2na converter — and therefore the CRandom stream — as a member,
+/// so several calls covering one record share one stream.  See
+/// [`dustmasker_intervals`].
+///
+/// Returns merged, inclusive `[start, stop]` intervals relative to `bases[0]`.
+pub fn dust_intervals(
+    bases: &[u8],
     window: usize,
     level: u32,
     linker: usize,
-    mask_val: u8,
+    rng: &mut NcbiLfg,
 ) -> Vec<(usize, usize)> {
-    let n = seq.len().saturating_sub(2); // real base count
+    let (window, level, linker) = clamp_dust_params(window, level, linker);
+    let n = bases.len();
     if n < 3 { return Vec::new(); }
 
     // Base conversion to ncbi2na for the triplet computation, mirroring NCBI
@@ -330,7 +360,6 @@ pub fn dust_mask(
     // (e.g. HAL1ME poly-T+NN @2422-2428 stayed unmasked → spurious seeds).  We replicate
     // NCBI by keeping `rng` persistent across restarts and re-filling `conv` from `j_start`
     // each outer iteration.
-    let mut rng = NcbiLfg::new();
     let mut conv = vec![0u8; n]; // ncbi2na of real bases, (re)filled per outer iteration
 
     // Threshold table: thresholds[0]=1, thresholds[i]=i*level for i>=1.
@@ -376,7 +405,7 @@ pub fn dust_mask(
             // save_masked_regions(*res, w.start(), start)
             save_masked(&mut perfect, &mut res, w.start, linker);
 
-            while conv_from <= j + 2 { conv[conv_from] = cvt_base(seq[1 + conv_from], &mut rng); conv_from += 1; }
+            while conv_from <= j + 2 { conv[conv_from] = cvt_base(bases[conv_from], rng); conv_from += 1; }
             let t = (conv[j] << 4) | (conv[j + 1] << 2) | conv[j + 2];
             j += 1; // mirrors NCBI ++it (advance before calling shift_window)
 
@@ -390,7 +419,7 @@ pub fn dust_mask(
                 loop {
                     if j >= j_end { break; }
                     save_masked(&mut perfect, &mut res, w.start, linker);
-                    while conv_from <= j + 2 { conv[conv_from] = cvt_base(seq[1 + conv_from], &mut rng); conv_from += 1; }
+                    while conv_from <= j + 2 { conv[conv_from] = cvt_base(bases[conv_from], rng); conv_from += 1; }
                     let t2 = (conv[j] << 4) | (conv[j + 1] << 2) | conv[j + 2];
                     if w.shift_window(t2, &mut perfect) {
                         done = true;
@@ -422,7 +451,29 @@ pub fn dust_mask(
     // Sort and merge (save_masked already merges incrementally, but res may be
     // slightly out of order across outer-loop restarts).
     res.sort_unstable();
-    let merged = merge_intervals(res, linker);
+    merge_intervals(res, linker)
+}
+
+/// Mask a BLASTNA-encoded sequence in place.
+/// `seq` must have sentinel bytes at positions 0 and n+1 (as produced by the engine).
+/// Masked positions are set to `mask_val`.
+/// Returns the list of masked intervals (absolute, 0-indexed in the base array).
+///
+/// This is the BLAST-engine path (`dust_filter.cpp`): one fresh CRandom stream
+/// per call, no N-run preprocessing.  The `dustmasker` application path is
+/// [`dustmasker_intervals`].
+pub fn dust_mask(
+    seq: &mut [u8],
+    window: usize,
+    level: u32,
+    linker: usize,
+    mask_val: u8,
+) -> Vec<(usize, usize)> {
+    let n = seq.len().saturating_sub(2); // real base count
+    if n < 3 { return Vec::new(); }
+
+    let mut rng = NcbiLfg::new();
+    let merged = dust_intervals(&seq[1..=n], window, level, linker, &mut rng);
 
     // Apply masking: interval (s, e) means mask base positions s..=e (inclusive,
     // matching NCBI's [first, second] convention).
@@ -434,6 +485,123 @@ pub fn dust_mask(
     }
 
     merged
+}
+
+// ── dustmasker application path (N-run splitting) ─────────────────────────────
+
+/// Mirror of `s_FindSegmentWithLongNs` (`dust_mask_app.cpp:186`).
+///
+/// Reports runs of N longer than `max_ns`, plus **any** run that starts at
+/// position 0 or that runs to the end of the sequence (both are reported
+/// regardless of length — that asymmetry is NCBI's, not ours).
+fn find_long_n_runs(bases: &[u8], max_ns: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    let mut ns = 0usize;
+    for &b in bases {
+        if b == 14 {
+            ns += 1;
+        } else {
+            if ns > 0 {
+                if ns > max_ns || pos == 0 {
+                    out.push((pos, pos + ns - 1));
+                }
+                pos += ns;
+                ns = 0;
+            }
+            pos += 1;
+        }
+    }
+    if ns > 0 {
+        out.push((pos, pos + ns - 1));
+    }
+    out
+}
+
+/// Mirror of `s_InsertMerge` (`dust_mask_app.cpp:222`).
+/// Note the **exact equality** test — this is not the `>=` used inside
+/// `save_masked_regions`.
+fn insert_merge(list: &mut Vec<(usize, usize)>, new_mask: (usize, usize), linker: usize) {
+    if let Some(last) = list.last_mut() {
+        if last.1 + linker == new_mask.0 {
+            last.1 = new_mask.1;
+            return;
+        }
+    }
+    list.push(new_mask);
+}
+
+/// Mirror of `CSymDustMasker::operator()(seq, start, stop)`: dust `bases[start..=stop]`
+/// and return absolute (offset) intervals.
+fn dust_range(
+    bases: &[u8],
+    start: usize,
+    stop: usize,
+    window: usize,
+    level: u32,
+    linker: usize,
+    rng: &mut NcbiLfg,
+) -> Vec<(usize, usize)> {
+    if bases.is_empty() { return Vec::new(); }
+    let stop = stop.min(bases.len() - 1);
+    let start = start.min(stop);
+    dust_intervals(&bases[start..=stop], window, level, linker, rng)
+        .into_iter()
+        .map(|(s, e)| (s + start, e + start))
+        .collect()
+}
+
+/// Mirror of `GetDustMasks_SkipNs` (`dust_mask_app.cpp:236`) — the masking the
+/// `dustmasker` **application** performs, which differs from the BLAST filter
+/// path ([`dust_mask`]): long N-runs are reported as masked and the segments
+/// between them are dusted independently, sharing one CRandom stream (NCBI
+/// constructs a single `CSymDustMasker` per record).
+///
+/// `bases` are BLASTNA codes with no sentinels; intervals are inclusive.
+pub fn dustmasker_intervals(
+    bases: &[u8],
+    window: usize,
+    level: u32,
+    linker: usize,
+) -> Vec<(usize, usize)> {
+    let mut rng = NcbiLfg::new();
+    // NOTE: the N-run threshold and the insert_merge linker use the RAW
+    // parameters; only the masker itself clamps them (NCBI passes the raw
+    // command-line values to GetDustMasks_SkipNs).
+    let ns_ranges = find_long_n_runs(bases, window);
+    if ns_ranges.is_empty() {
+        return dust_intervals(bases, window, level, linker, &mut rng);
+    }
+
+    let mut rv: Vec<(usize, usize)> = Vec::new();
+    let mut seq_start = 0usize;
+
+    for &iv in &ns_ranges {
+        if iv.0 == 0 {
+            seq_start = iv.1 + 1;
+            rv.push(iv);
+            continue;
+        }
+        let seg = dust_range(bases, seq_start, iv.0 - 1, window, level, linker, &mut rng);
+        if !seg.is_empty() {
+            insert_merge(&mut rv, seg[0], linker);
+            rv.extend_from_slice(&seg[1..]);
+            insert_merge(&mut rv, iv, linker);
+        } else {
+            rv.push(iv);
+        }
+        seq_start = iv.1 + 1;
+    }
+
+    if seq_start < bases.len() {
+        let seg = dust_range(bases, seq_start, bases.len() - 1, window, level, linker, &mut rng);
+        if !seg.is_empty() {
+            insert_merge(&mut rv, seg[0], linker);
+            rv.extend_from_slice(&seg[1..]);
+        }
+    }
+
+    rv
 }
 
 /// Wrapper around `dust_mask` that replicates the off-by-one in NCBI's
@@ -633,6 +801,45 @@ mod tests {
 
         assert_eq!(m1, ncbi_r1, "region1 Rust DUST differs from NCBI");
         assert_eq!(m2, ncbi_r2, "region2 Rust DUST differs from NCBI");
+    }
+
+    /// The `dustmasker` application path (`GetDustMasks_SkipNs`), which differs
+    /// from the BLAST filter path: N-runs longer than `window` — plus any run at
+    /// the very start or very end, whatever its length — are reported as masked,
+    /// and the segments between them are dusted separately off one shared
+    /// CRandom stream.
+    ///
+    /// Expected values are the output of NCBI dustmasker 2.17.0
+    /// (`-in nstest.fa -outfmt acclist`) on exactly this sequence.
+    #[test]
+    fn test_dustmasker_skip_ns_vs_ncbi() {
+        let mut s = String::new();
+        s.push_str(&"N".repeat(5));                        // leading short N run
+        s.push_str(&"ACGTTGCAAGCTTACGGATCCGTATCAGCTAGCTTAGCATCGGATTACGCA".repeat(3));
+        s.push_str("CACACACACACACACACACACACACACACACACACACACA");
+        s.push_str(&"GATTACAGGCTTACGGATCCGTAAGCTTACGGATCCGTATCAGCTAGCAT".repeat(2));
+        s.push_str(&"N".repeat(30));                       // short internal run (<= window)
+        s.push_str("TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT");
+        s.push_str(&"ACGTTGCAAGCTTACGGATCCGTATCAGCTAGCTTAGCATCGGATTACGCA".repeat(2));
+        s.push_str(&"N".repeat(100));                      // long internal run (> window)
+        s.push_str("GGCCGGGCGCGGTGGCTCACGCCTGTAATCCCAGCACTTTGGGAGGCCGA");
+        s.push_str("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        s.push_str("TCAGGATCCGTAAGCTTACGGATCCGTATCAGCTAGCATCGGATTACGCA");
+        s.push_str(&"N".repeat(7));                        // trailing short N run
+
+        let enc = encode(s.as_bytes());
+        let bases = &enc[1..enc.len() - 1];
+        let masks = dustmasker_intervals(bases, DUST_WINDOW, DUST_LEVEL, DUST_LINKER);
+
+        let expected = vec![
+            (0usize, 4usize),     // leading N run: reported despite being short
+            (156, 197),           // (CA)n
+            (328, 367),           // poly-T   (the 30-N run at 298..327 is NOT reported)
+            (470, 569),           // long internal N run
+            (619, 669),           // poly-A
+            (720, 726),           // trailing N run: reported despite being short
+        ];
+        assert_eq!(masks, expected);
     }
 
     #[test]

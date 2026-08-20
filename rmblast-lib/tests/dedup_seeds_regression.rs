@@ -121,7 +121,7 @@ fn dedup_seed_regression_chr22() {
             search_with_query_lookup_seeds(
                 &ql, &chunk, &qrec.id, &seq, name,
                 &params, &matrix, chunk_start as u32,
-                &mut seeds, &[],
+                &mut seeds, &[], None,
             );
             for s in &seeds {
                 all_seeds.push(seed_text(s));
