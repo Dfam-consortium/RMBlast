@@ -49,5 +49,12 @@ fn build_alp() {
     }
     build.file("csrc/alp_shim.cpp");
     build.compile("alp_shim");
-    println!("cargo:rustc-link-lib=stdc++");
+    // The C++ standard library the shim needs is named differently per target:
+    // libstdc++ on GNU/Linux, libc++ on Apple platforms (macOS SDKs no longer
+    // ship libstdc++ at all, so hardcoding stdc++ fails the link there).
+    let cpp_stdlib = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") | Ok("ios") | Ok("freebsd") | Ok("openbsd") => "c++",
+        _ => "stdc++",
+    };
+    println!("cargo:rustc-link-lib={cpp_stdlib}");
 }

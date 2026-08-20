@@ -12,3 +12,10 @@
 *~
 *.swp
 rmblast-stats/fits/*.err
+
+# Local reference docs (mirrors dfam-curator; drop this to track it)
+how-to-release
+
+# Release staging produced by `make dist`
+/stage/
+/rmblast-*.tar.gz
