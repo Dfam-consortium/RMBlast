@@ -598,28 +598,19 @@ fn main() -> Result<()> {
 
     if std::env::var_os("RMBLAST_DP_STATS").is_some() {
         use std::sync::atomic::Ordering;
-        use rmblast_lib::search::gapped::{
-            SCORE_ONLY_CELLS, SCORE_ONLY_ROWS, SCORE_ONLY_SIMD_ROWS, SCORE_ONLY_WIDE_CELLS,
-            TOTAL_DP_CELLS,
-        };
+        use rmblast_lib::search::gapped::{SCORE_ONLY_CELLS, TOTAL_DP_CELLS};
         use rmblast_lib::search::engine::{
             COUNT_FINAL_GAPPED, COUNT_PRELIM_GAPPED, COUNT_SEEDS, COUNT_UNGAPPED_HITS,
         };
         let so_cells = SCORE_ONLY_CELLS.load(Ordering::Relaxed);
         let total_cells = TOTAL_DP_CELLS.load(Ordering::Relaxed);
         eprintln!(
-            "DP_STATS score_only: rows={} simd_rows={} cells={} wide_cells={}",
-            SCORE_ONLY_ROWS.load(Ordering::Relaxed),
-            SCORE_ONLY_SIMD_ROWS.load(Ordering::Relaxed),
-            so_cells,
-            SCORE_ONLY_WIDE_CELLS.load(Ordering::Relaxed),
-        );
-        eprintln!(
-            "DP_STATS stages: seeds={} ungapped={} prelim_gapped={} final_gapped={} tb_cells={}",
+            "DP_STATS stages: seeds={} ungapped={} prelim_gapped={} final_gapped={} so_cells={} tb_cells={}",
             COUNT_SEEDS.load(Ordering::Relaxed),
             COUNT_UNGAPPED_HITS.load(Ordering::Relaxed),
             COUNT_PRELIM_GAPPED.load(Ordering::Relaxed),
             COUNT_FINAL_GAPPED.load(Ordering::Relaxed),
+            so_cells,
             total_cells - so_cells,
         );
     }
