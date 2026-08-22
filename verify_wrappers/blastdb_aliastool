@@ -1,0 +1,45 @@
+#!/bin/bash
+#
+# Replacement for NCBI blastdb_aliastool used with the Rust rmblastn port.
+#
+# RepeatModeler's all-vs-other stage uses exactly one form:
+#
+#   blastdb_aliastool -gi_file_in <text> -gi_file_out <binary>
+#
+# The real tool converts a text list of GI numbers into NCBI's packed binary
+# gilist format.  The Rust rmblastn reads the plain text list directly, so this
+# wrapper just copies the file through.
+#
+# NOTE ON CONTENT: RepeatModeler writes BARE INTEGERS, one per line
+# (RepeatModeler:1851, `my @giList = (($startGID+1) .. $sampleDBSize)`), while
+# the sequences in the database are named "gi|N".  rmblastn's gilist loader
+# accepts both spellings — a line "2" matches the subject named "gi|2" — so no
+# translation is needed here.  Do not "fix" this by rewriting the file; keep the
+# two spellings handled in one place (rmblastn's load_gilist).
+#
+# Anything other than the -gi_file_in/-gi_file_out pair exits non-zero rather
+# than pretending to have done something.
+
+die() { echo "[blastdb_aliastool] Error: $*" >&2; exit 1; }
+
+gi_in=""
+gi_out=""
+
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+        -gi_file_in)  i=$((i+1)); gi_in="${args[$i]}" ;;
+        -gi_file_out) i=$((i+1)); gi_out="${args[$i]}" ;;
+        -dbtype)      i=$((i+1)) ;;   # accepted and ignored
+        -help|-h)     sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)            die "option not supported by this wrapper: ${args[$i]}" ;;
+    esac
+    i=$((i+1))
+done
+
+[ -n "$gi_in" ]  || die "-gi_file_in <file> is required"
+[ -n "$gi_out" ] || die "-gi_file_out <file> is required"
+[ -f "$gi_in" ]  || die "input gi file not found: $gi_in"
+
+cp -- "$gi_in" "$gi_out" || die "could not write $gi_out"

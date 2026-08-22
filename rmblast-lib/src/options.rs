@@ -80,7 +80,11 @@ pub struct SearchParams {
     pub complexity_adjust: bool,
     pub dust: bool,
     /// Maximum query coverage by a higher-scoring HSP before this HSP is suppressed.
-    /// 80 = RepeatMasker default; 101 = effectively disabled (matches NCBI -mask_level 101).
+    /// 80 = RepeatMasker's usual setting (it passes `-mask_level` explicitly);
+    /// 101 = effectively disabled, and the DEFAULT, matching NCBI rmblastn's
+    /// `-mask_level` default of -1.  Callers that do not set `-mask_level` must
+    /// get no masklevel filtering, or self-vs-self searches collapse to their
+    /// self-hits alone (a 100%-coverage self-hit dominates every other HSP).
     pub mask_level: u32,
 
     // Multithreading
@@ -106,7 +110,7 @@ impl Default for SearchParams {
             ungapped_cutoff: None,
             complexity_adjust: false,
             dust: true,
-            mask_level: 80,
+            mask_level: 101,
             num_threads: 1,
             mt_mode: MtMode::SplitByDb,
             seed_mode: SeedMode::Combined,

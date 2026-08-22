@@ -12,13 +12,61 @@
 #   2. Underscores in flag names are replaced with hyphens  (foo_bar → foo-bar).
 #   3. -dust no/yes is converted to --dust false/true.
 #   4. -num_alignments (and its value) is silently dropped.
+#
+# (1) and (2) are now also done by the binary itself, so they are belt-and-
+# braces; (3) and (4) and the -db handling below are still the wrapper's job.
 #   5. The -db value is passed as the FASTA path (any trailing ".2bit" is
 #      stripped).  The Rust binary reads FASTA directly; the 2bit format
 #      degrades IUB ambiguity codes to N, and all result-equivalence
 #      validation was performed against FASTA databases (matches the
 #      verify_wrappers behaviour).
 
-REAL_RMBLASTN="/home/rhubley/projects/Claude/rmblast-port/rmblast/target/release/rmblastn"
+# ── Locate the Rust binaries relative to this wrapper ─────────────────────────
+# The same script has to work from two layouts:
+#   installed release   <root>/wrappers/<this>   -> <root>/bin/<name>
+#   source checkout     rmblast/wrappers/<this>  -> rmblast/target/release/<name>
+# Both are one level up from the wrapper, so try ../bin first and
+# ../target/release second.  Setting RMBLAST_BIN_DIR overrides the search: the
+# binary must then be in that directory or the wrapper fails.
+#
+# Symlinks are followed so the wrappers can be linked onto PATH individually.
+__rmb_self="${BASH_SOURCE[0]}"
+while [ -L "$__rmb_self" ]; do
+    __rmb_dir="$(cd -- "$(dirname -- "$__rmb_self")" && pwd)"
+    __rmb_self="$(readlink -- "$__rmb_self")"
+    case "$__rmb_self" in /*) ;; *) __rmb_self="$__rmb_dir/$__rmb_self" ;; esac
+done
+RMBLAST_HERE="$(cd -- "$(dirname -- "$__rmb_self")" && pwd)"
+
+rmblast_find_bin() {
+    local name="$1" cand
+    # An explicit RMBLAST_BIN_DIR is authoritative: if the binary is not there,
+    # fail loudly rather than silently searching elsewhere.
+    if [ -n "$RMBLAST_BIN_DIR" ]; then
+        if [ -x "$RMBLAST_BIN_DIR/$name" ]; then
+            printf '%s\n' "$RMBLAST_BIN_DIR/$name"
+            return 0
+        fi
+        echo "[$(basename -- "$0")] Error: RMBLAST_BIN_DIR is set to '$RMBLAST_BIN_DIR'" \
+             "but it holds no executable '$name'." >&2
+        return 1
+    fi
+    for cand in "$RMBLAST_HERE/../bin/$name" \
+                "$RMBLAST_HERE/../target/release/$name"; do
+        [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+    done
+    {
+        echo "[$(basename -- "$0")] Error: cannot find the rmblast '$name' binary."
+        echo "  looked in: $RMBLAST_HERE/../bin/"
+        echo "             $RMBLAST_HERE/../target/release/"
+        echo "  Build it with 'cargo build --release' / 'make', or set"
+        echo "  RMBLAST_BIN_DIR=<directory containing $name>."
+    } >&2
+    return 1
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
+REAL_RMBLASTN="$(rmblast_find_bin rmblastn)" || exit 1
 
 args=("$@")
 new_args=()

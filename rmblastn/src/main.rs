@@ -33,10 +33,18 @@ use rmblast_lib::seq::{FastaReader, SubjectDb};
 // used here — follows POSIX/GNU convention and requires double-dash for long
 // options (`--word_size 8`, `--gapopen 4`).
 //
-// `normalize_args()` bridges the gap by rewriting any token of the form
-// `-<letter><rest>` to `--<letter><rest>` before clap sees argv.  Short
-// single-character options (`-h`, `-v`), the stdin marker (`-`), and the
-// end-of-options sentinel (`--`) are left unchanged.
+// NCBI also spells multi-word option names with underscores (`-word_size`,
+// `-mask_level`, `-xdrop_ungap`), while clap's derive macro kebab-cases every
+// long name (`--word-size`, `--mask-level`, `--xdrop-ungap`).
+//
+// `normalize_args()` bridges both gaps by rewriting any token of the form
+// `-<letter><rest>` to `--<letter><rest>` and replacing `_` with `-` inside the
+// option NAME before clap sees argv.  Short single-character options (`-h`,
+// `-v`), the stdin marker (`-`), and the end-of-options sentinel (`--`) are
+// left unchanged.  Underscores are rewritten in the name only: for the
+// `--flag=value` spelling everything from the first `=` onward is a value and
+// passes through verbatim, so paths like `--query=my_reads.fa` survive.  Bare
+// value tokens are never touched, since they do not start with `-`.
 //
 // IMPORTANT LIMITATION: Because normalization happens before clap parses, the
 // POSIX convention of bundling single-character flags into one token is NOT
@@ -47,29 +55,49 @@ use rmblast_lib::seq::{FastaReader, SubjectDb};
 // users migrating from NCBI rmblastn.  New scripts should use double-dash
 // (`--`) prefixes.  The single-dash form may be removed in a future release.
 //
-/// Rewrite NCBI-style single-dash long options to double-dash before clap parsing.
+/// Rewrite NCBI-style option spellings to clap's before parsing.
 ///
-/// Rule: `-<letter><one-or-more-chars>` → `--<letter><one-or-more-chars>`
-/// All other tokens (bare `-`, `--`, `--foo`, `-x`, values) pass through unchanged.
+/// Rules, applied to long-option tokens only:
+///   * `-<letter><one-or-more-chars>` → `--<letter><one-or-more-chars>`
+///   * `_` → `-` within the option name (the part before any `=`)
+///
+/// All other tokens (bare `-`, `--`, `-x`, values, and everything after the
+/// first `=`) pass through unchanged.
 fn normalize_args() -> Vec<std::ffi::OsString> {
-    std::env::args_os()
+    normalize_arg_iter(std::env::args_os())
+}
+
+fn normalize_arg_iter<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    args.into_iter()
         .map(|arg| {
             let s = match arg.to_str() {
                 Some(s) => s,
                 None => return arg,
             };
-            if s.starts_with("--") || s == "-" {
+            if s == "-" || s == "--" {
                 return arg;
             }
-            if let Some(rest) = s.strip_prefix('-') {
+            // Split a `--flag=value` / `-flag=value` token: only the name is rewritten.
+            let (head, tail) = match s.find('=') {
+                Some(i) => (&s[..i], &s[i..]),
+                None => (s, ""),
+            };
+            let name = if let Some(rest) = head.strip_prefix("--") {
+                rest
+            } else if let Some(rest) = head.strip_prefix('-') {
+                // A single-character short option (`-h`) keeps its single dash.
                 let mut chars = rest.chars();
-                if let Some(first) = chars.next() {
-                    if first.is_ascii_alphabetic() && chars.next().is_some() {
-                        return format!("--{}", rest).into();
-                    }
+                match (chars.next(), chars.next()) {
+                    (Some(first), Some(_)) if first.is_ascii_alphabetic() => rest,
+                    _ => return arg,
                 }
-            }
-            arg
+            } else {
+                return arg;
+            };
+            format!("--{}{}", name.replace('_', "-"), tail).into()
         })
         .collect()
 }
@@ -82,9 +110,15 @@ fn normalize_args() -> Vec<std::ffi::OsString> {
     about = "RepeatMasker BLAST — Rust port of NCBI rmblastn",
     after_help = "\
 ARGUMENT SYNTAX NOTES:
-  Both single-dash and double-dash long options are accepted:
+  Long options are accepted with either dash count and with underscores or
+  hyphens in the name -- all four spellings below are equivalent:
     -word_size 8        (NCBI rmblastn style, compatibility shim)
-    --word_size 8       (preferred)
+    -word-size 8
+    --word_size 8
+    --word-size 8       (preferred)
+
+  In the '--flag=value' spelling only the name is rewritten; the value is
+  passed through untouched (so '--query=my_reads.fa' keeps its underscore).
 
   Single-character flags CANNOT be bundled into one token.
   Write '-a -b -c' as three separate arguments, not '-abc'.
@@ -159,9 +193,16 @@ struct Args {
     #[arg(long, default_value = "0")]
     outfmt: String,
 
-    /// Masklevel: drop an HSP if >N% of its query span is covered by a better HSP (default 80; 101 = disabled)
-    #[arg(long, default_value_t = 80)]
-    mask_level: u32,
+    /// Masklevel: drop an HSP if >N% of its query span is covered by a better HSP.
+    ///
+    /// Range 0-101, or -1.  The DEFAULT is -1 (no masklevel filtering), matching
+    /// NCBI rmblastn; anything < 0 or >= 100 disables filtering.  RepeatMasker
+    /// passes `-mask_level 80` explicitly (NCBIBlastSearchEngine.pm), but
+    /// RepeatModeler does not — and its round-1 all-vs-all is a self-comparison
+    /// where every query's 100%-coverage self-hit would mask every other HSP.
+    #[arg(long, allow_hyphen_values = true, default_value_t = -1,
+          value_parser = clap::value_parser!(i32).range(-1..=101))]
+    mask_level: i32,
 
     /// File with subject sequence IDs to include (one per line)
     #[arg(long)]
@@ -328,7 +369,9 @@ fn main() -> Result<()> {
         ungapped_cutoff: None,
         complexity_adjust: args.complexity_adjust,
         dust,
-        mask_level: args.mask_level,
+        // NCBI accepts -1 (its default, meaning "off") through 101.  apply_mask_level
+        // treats >= 100 as a no-op, so fold every disabling spelling onto 101.
+        mask_level: if args.mask_level < 0 { 101 } else { args.mask_level as u32 },
         num_threads: args.num_threads,
         mt_mode: if args.mt_mode == 1 { MtMode::SplitByQueries } else { MtMode::SplitByDb },
         seed_mode,
@@ -1091,5 +1134,103 @@ mod gilist_tests {
 
         assert!(load_gilist(None).unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{normalize_arg_iter, Args};
+    use clap::Parser;
+
+    // ── Argument-spelling compatibility ───────────────────────────────────────
+    // NCBI writes long options with a single dash and underscores
+    // (`-word_size 7`); clap's derive macro kebab-cases them (`--word-size`).
+    // Both halves of that translation have to happen, or NCBI-style callers
+    // (RepeatMasker, RepeatModeler) are rejected outright.
+
+    fn norm(argv: &[&str]) -> Vec<String> {
+        normalize_arg_iter(argv.iter().map(|s| std::ffi::OsString::from(*s)))
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn normalize_args_accepts_all_four_long_option_spellings() {
+        for spelling in ["-word_size", "-word-size", "--word_size", "--word-size"] {
+            assert_eq!(norm(&[spelling, "7"]), vec!["--word-size", "7"]);
+        }
+        assert_eq!(
+            norm(&["-min_raw_gapped_score", "150"]),
+            vec!["--min-raw-gapped-score", "150"]
+        );
+    }
+
+    #[test]
+    fn normalize_args_rewrites_only_the_name_of_an_inline_value() {
+        // Everything from the first '=' on is a value and must survive verbatim,
+        // underscores included.
+        assert_eq!(
+            norm(&["-query=my_reads.fa"]),
+            vec!["--query=my_reads.fa"]
+        );
+        assert_eq!(
+            norm(&["--outfmt=6 score qseqid"]),
+            vec!["--outfmt=6 score qseqid"]
+        );
+    }
+
+    #[test]
+    fn normalize_args_leaves_non_option_tokens_alone() {
+        // argv[0], bare values, the stdin marker, the end-of-options sentinel,
+        // short flags, and negative numbers (`-mask_level -1`) all pass through.
+        assert_eq!(
+            norm(&["/usr/local/bin/rmblastn", "-", "--", "-h", "-V", "some_file.fa"]),
+            vec!["/usr/local/bin/rmblastn", "-", "--", "-h", "-V", "some_file.fa"]
+        );
+        assert_eq!(norm(&["-mask_level", "-1"]), vec!["--mask-level", "-1"]);
+        assert_eq!(norm(&["-matrix", "../nt/comparison.matrix"]),
+                   vec!["--matrix", "../nt/comparison.matrix"]);
+    }
+
+    // ── mask_level default ────────────────────────────────────────────────────
+    // NCBI rmblastn's -mask_level defaults to -1 (no masklevel filtering).
+    // RepeatModeler never passes the flag, and its round-1 all-vs-all is a
+    // self-comparison: with filtering on, every query's 100%-coverage self-hit
+    // masks every other HSP and only the self-hits survive.
+
+    fn parse(argv: &[&str]) -> Args {
+        let mut full = vec!["rmblastn", "--db", "d", "--query", "q"];
+        full.extend_from_slice(argv);
+        Args::parse_from(normalize_arg_iter(
+            full.iter().map(|s| std::ffi::OsString::from(*s)),
+        ))
+    }
+
+    /// Mirrors the `mask_level:` expression in the SearchParams construction.
+    fn effective(raw: i32) -> u32 {
+        if raw < 0 { 101 } else { raw as u32 }
+    }
+
+    #[test]
+    fn mask_level_defaults_to_disabled_like_ncbi() {
+        assert_eq!(parse(&[]).mask_level, -1);
+        assert_eq!(effective(parse(&[]).mask_level), 101);
+    }
+
+    #[test]
+    fn mask_level_accepts_ncbi_spellings_and_range() {
+        assert_eq!(effective(parse(&["-mask_level", "-1"]).mask_level), 101);
+        assert_eq!(effective(parse(&["-mask_level", "0"]).mask_level), 0);
+        assert_eq!(effective(parse(&["-mask_level", "80"]).mask_level), 80);
+        assert_eq!(effective(parse(&["--mask-level", "101"]).mask_level), 101);
+
+        // NCBI caps the option at 101; anything higher is a usage error.
+        assert!(Args::try_parse_from(normalize_arg_iter(
+            ["rmblastn", "--db", "d", "--query", "q", "-mask_level", "102"]
+                .iter()
+                .map(|s| std::ffi::OsString::from(*s))
+        ))
+        .is_err());
     }
 }

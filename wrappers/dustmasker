@@ -1,0 +1,60 @@
+#!/bin/bash
+# Replacement for NCBI dustmasker used with the Rust rmblastn port.
+#
+# Unlike the other wrappers in this directory, nothing has to be translated:
+# the Rust `dustmasker` is a drop-in for the NCBI application of the same name
+# (same single-dash option spellings, same interval/fasta/acclist outputs,
+# byte-identical against NCBI 2.17.0 across the run_dustmasker_compare.sh
+# suite).  This wrapper exists only so that callers which look for `dustmasker`
+# next to `rmblastn` on PATH -- RepeatModeler does -- actually find one.
+#
+# Options this port has deliberately not implemented exit non-zero rather than
+# being silently ignored, so a pass-through is safe.
+# ── Locate the Rust binaries relative to this wrapper ─────────────────────────
+# The same script has to work from two layouts:
+#   installed release   <root>/wrappers/<this>   -> <root>/bin/<name>
+#   source checkout     rmblast/wrappers/<this>  -> rmblast/target/release/<name>
+# Both are one level up from the wrapper, so try ../bin first and
+# ../target/release second.  Setting RMBLAST_BIN_DIR overrides the search: the
+# binary must then be in that directory or the wrapper fails.
+#
+# Symlinks are followed so the wrappers can be linked onto PATH individually.
+__rmb_self="${BASH_SOURCE[0]}"
+while [ -L "$__rmb_self" ]; do
+    __rmb_dir="$(cd -- "$(dirname -- "$__rmb_self")" && pwd)"
+    __rmb_self="$(readlink -- "$__rmb_self")"
+    case "$__rmb_self" in /*) ;; *) __rmb_self="$__rmb_dir/$__rmb_self" ;; esac
+done
+RMBLAST_HERE="$(cd -- "$(dirname -- "$__rmb_self")" && pwd)"
+
+rmblast_find_bin() {
+    local name="$1" cand
+    # An explicit RMBLAST_BIN_DIR is authoritative: if the binary is not there,
+    # fail loudly rather than silently searching elsewhere.
+    if [ -n "$RMBLAST_BIN_DIR" ]; then
+        if [ -x "$RMBLAST_BIN_DIR/$name" ]; then
+            printf '%s\n' "$RMBLAST_BIN_DIR/$name"
+            return 0
+        fi
+        echo "[$(basename -- "$0")] Error: RMBLAST_BIN_DIR is set to '$RMBLAST_BIN_DIR'" \
+             "but it holds no executable '$name'." >&2
+        return 1
+    fi
+    for cand in "$RMBLAST_HERE/../bin/$name" \
+                "$RMBLAST_HERE/../target/release/$name"; do
+        [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+    done
+    {
+        echo "[$(basename -- "$0")] Error: cannot find the rmblast '$name' binary."
+        echo "  looked in: $RMBLAST_HERE/../bin/"
+        echo "             $RMBLAST_HERE/../target/release/"
+        echo "  Build it with 'cargo build --release' / 'make', or set"
+        echo "  RMBLAST_BIN_DIR=<directory containing $name>."
+    } >&2
+    return 1
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
+REAL_DUSTMASKER="$(rmblast_find_bin dustmasker)" || exit 1
+
+exec "$REAL_DUSTMASKER" "$@"

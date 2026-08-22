@@ -41,7 +41,52 @@
 # engines are behaving correctly.  (comparison.matrix is absent from NCBI's
 # table, so it runs sentinel/no-cull in both engines and is unaffected.)
 
-REAL_RMBLASTN="/home/rhubley/projects/Claude/rmblast-port/rmblast/target/release/rmblastn"
+# ── Locate the Rust binaries relative to this wrapper ─────────────────────────
+# The same script has to work from two layouts:
+#   installed release   <root>/wrappers/<this>   -> <root>/bin/<name>
+#   source checkout     rmblast/wrappers/<this>  -> rmblast/target/release/<name>
+# Both are one level up from the wrapper, so try ../bin first and
+# ../target/release second.  Setting RMBLAST_BIN_DIR overrides the search: the
+# binary must then be in that directory or the wrapper fails.
+#
+# Symlinks are followed so the wrappers can be linked onto PATH individually.
+__rmb_self="${BASH_SOURCE[0]}"
+while [ -L "$__rmb_self" ]; do
+    __rmb_dir="$(cd -- "$(dirname -- "$__rmb_self")" && pwd)"
+    __rmb_self="$(readlink -- "$__rmb_self")"
+    case "$__rmb_self" in /*) ;; *) __rmb_self="$__rmb_dir/$__rmb_self" ;; esac
+done
+RMBLAST_HERE="$(cd -- "$(dirname -- "$__rmb_self")" && pwd)"
+
+rmblast_find_bin() {
+    local name="$1" cand
+    # An explicit RMBLAST_BIN_DIR is authoritative: if the binary is not there,
+    # fail loudly rather than silently searching elsewhere.
+    if [ -n "$RMBLAST_BIN_DIR" ]; then
+        if [ -x "$RMBLAST_BIN_DIR/$name" ]; then
+            printf '%s\n' "$RMBLAST_BIN_DIR/$name"
+            return 0
+        fi
+        echo "[$(basename -- "$0")] Error: RMBLAST_BIN_DIR is set to '$RMBLAST_BIN_DIR'" \
+             "but it holds no executable '$name'." >&2
+        return 1
+    fi
+    for cand in "$RMBLAST_HERE/../bin/$name" \
+                "$RMBLAST_HERE/../target/release/$name"; do
+        [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+    done
+    {
+        echo "[$(basename -- "$0")] Error: cannot find the rmblast '$name' binary."
+        echo "  looked in: $RMBLAST_HERE/../bin/"
+        echo "             $RMBLAST_HERE/../target/release/"
+        echo "  Build it with 'cargo build --release' / 'make', or set"
+        echo "  RMBLAST_BIN_DIR=<directory containing $name>."
+    } >&2
+    return 1
+}
+# ──────────────────────────────────────────────────────────────────────────────
+
+REAL_RMBLASTN="$(rmblast_find_bin rmblastn)" || exit 1
 NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
 NCBI_RMBLASTN="$NCBI_DIR/rmblastn"
 NCBI_MAKEBLASTDB="$NCBI_DIR/makeblastdb"
@@ -345,13 +390,20 @@ else
     # Inputs: query (the -query value), the FASTA db + its index files, matrix.
     qf=""
     mat_val=""
+    gil=""
     for (( j=0; j<${#ncbi_run[@]}; j++ )); do
         [[ "${ncbi_run[$j]}" == "-query"  || "${ncbi_run[$j]}" == "--query"  ]] && qf="${ncbi_run[$((j+1))]}"
         [[ "${ncbi_run[$j]}" == -query=*  || "${ncbi_run[$j]}" == --query=*  ]] && qf="${ncbi_run[$j]#*=}"
         [[ "${ncbi_run[$j]}" == "-matrix" || "${ncbi_run[$j]}" == "--matrix" ]] && mat_val="${ncbi_run[$((j+1))]}"
         [[ "${ncbi_run[$j]}" == -matrix=* || "${ncbi_run[$j]}" == --matrix=* ]] && mat_val="${ncbi_run[$j]#*=}"
+        [[ "${ncbi_run[$j]}" == "-gilist" || "${ncbi_run[$j]}" == "--gilist" ]] && gil="${ncbi_run[$((j+1))]}"
+        [[ "${ncbi_run[$j]}" == -gilist=* || "${ncbi_run[$j]}" == --gilist=* ]] && gil="${ncbi_run[$j]#*=}"
     done
     [ -n "$qf" ] && [ -f "$qf" ] && cp "$qf" "$dir/" 2>/dev/null
+    # The gilist restricts which subjects are searched, so the bundle is not
+    # reproducible without it -- and RepeatModeler deletes its per-batch gilists
+    # when the round finishes, so copying it here is the only chance.
+    [ -n "$gil" ] && [ -f "$gil" ] && cp "$gil" "$dir/" 2>/dev/null
     if [ -n "$db_base" ]; then
         for f in "$db_base" "$db_base".*; do [ -f "$f" ] && cp "$f" "$dir/" 2>/dev/null; done
     fi
@@ -400,6 +452,7 @@ else
     qbn="$(basename "${qf:-query}")"
     dbn="$(basename "${db_base:-db}")"
     matbn="$(basename "${mat_file:-$mat_val}")"
+    gilbn="$(basename "${gil:-gilist}")"
     relocal() {   # %q-escape one token, swapping known input paths for basenames
         local t="$1"
         case "$t" in
@@ -407,9 +460,11 @@ else
             "$db_base")   t="$dbn"   ;;
             "$mat_file")  t="$matbn" ;;
             "$mat_val")   t="$matbn" ;;
+            "${gil:-\0}") t="$gilbn" ;;   # ${gil:-\0} never matches a real token when gil is unset
             -query=*|--query=*)   t="${t%%=*}=$qbn"   ;;
             -db=*|--db=*)         t="${t%%=*}=$dbn"   ;;
             -matrix=*|--matrix=*) t="${t%%=*}=$matbn" ;;
+            -gilist=*|--gilist=*) t="${t%%=*}=$gilbn" ;;
         esac
         printf '%q ' "$t"
     }

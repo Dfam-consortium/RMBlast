@@ -4,6 +4,7 @@
 #   $(PREFIX)/$(NAME)-$(VERSION)/bin/rmblastn      the compiled binary
 #   $(PREFIX)/$(NAME)-$(VERSION)/bin/dustmasker    NCBI-dustmasker-compatible CLI
 #   $(PREFIX)/$(NAME)-$(VERSION)/wrappers/*        RepeatMasker-facing wrapper scripts
+#   $(PREFIX)/$(NAME)-$(VERSION)/verify_wrappers/* same, but A/B-checking rmblastn
 #   $(PREFIX)/$(NAME)-$(VERSION)/*.md              documentation
 #   $(PREFIX)/$(NAME)-$(VERSION)/matrices/*        scoring matrices (opt-in, see MATRIX_SRC)
 #
@@ -51,6 +52,12 @@ test:
 	$(CARGO) test --release
 
 # Install into a top-level <prefix>/<name>-<version>/ hierarchy.
+#
+# verify_wrappers/ ships alongside wrappers/: it is only useful where NCBI
+# rmblastn is also installed, but it costs nothing and it has to stay in sync
+# with wrappers/.  Both directories locate the binaries relative to themselves
+# (../bin here, ../target/release in a source checkout), so neither needs
+# editing after install.
 install: build
 	$(INSTALL) -d $(PKGDIR)/bin
 	$(INSTALL) -m 0755 target/release/$(BIN) $(PKGDIR)/bin/$(BIN)
@@ -59,6 +66,9 @@ install: build
 	done
 	$(INSTALL) -d $(PKGDIR)/wrappers
 	$(INSTALL) -m 0755 wrappers/* $(PKGDIR)/wrappers/
+	$(INSTALL) -d $(PKGDIR)/verify_wrappers
+	$(INSTALL) -m 0755 $(filter-out %.md,$(wildcard verify_wrappers/*)) $(PKGDIR)/verify_wrappers/
+	$(INSTALL) -m 0644 verify_wrappers/README.md $(PKGDIR)/verify_wrappers/
 	$(INSTALL) -m 0644 *.md $(PKGDIR)/
 	@if [ -n "$(MATRIX_SRC)" ] && [ -d "$(MATRIX_SRC)" ]; then \
 	  $(INSTALL) -d $(PKGDIR)/matrices; \

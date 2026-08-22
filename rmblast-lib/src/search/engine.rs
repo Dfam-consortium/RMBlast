@@ -1777,6 +1777,11 @@ pub fn run_phase2b(
             phsp.s_start, phsp.s_end,
             phsp.strand == Strand::Minus,
         );
+        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+            eprintln!("RUST_IMPROVE strand={:?} prelim q=[{},{}] s=[{},{}] seed=({},{}) -> ({},{})",
+                phsp.strand, phsp.q_start, phsp.q_end, phsp.s_start, phsp.s_end,
+                phsp.q_seed, phsp.s_seed, new_q_seed, new_s_seed);
+        }
 
         let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
             let tq = qa_len - 1 - new_q_seed;
@@ -1793,6 +1798,12 @@ pub fn run_phase2b(
             params.xdrop_gap_final,
             matrix, &mut ws,
         );
+        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+            if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
+                eprintln!("RUST_TB seed=({},{}) -> score={} q=[{},{}] s=[{},{}]",
+                    tq_seed, ts_seed, sc, q0, q1, s0, s1);
+            }
+        }
         let (mut score, q_start, q_end, s_start, s_end, mut edit_script, q_bases, s_bases) = match gapped {
             None => { continue; }
             Some((sc, q0, q1, s0, s1, es)) => {
@@ -2458,6 +2469,11 @@ fn run_gapped_phase<U: UngapOut>(
             phsp.s_start, phsp.s_end,
             phsp.strand == Strand::Minus,
         );
+        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+            eprintln!("RUST_IMPROVE strand={:?} prelim q=[{},{}] s=[{},{}] seed=({},{}) -> ({},{})",
+                phsp.strand, phsp.q_start, phsp.q_end, phsp.s_start, phsp.s_end,
+                phsp.q_seed, phsp.s_seed, new_q_seed, new_s_seed);
+        }
 
         // Full traceback: minus strand uses NCBI orientation (RC-query, FWD-TE) so seed is in LEFT.
         let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
@@ -2475,6 +2491,12 @@ fn run_gapped_phase<U: UngapOut>(
             params.xdrop_gap_final,
             matrix, &mut ws,
         );
+        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+            if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
+                eprintln!("RUST_TB seed=({},{}) -> score={} q=[{},{}] s=[{},{}]",
+                    tq_seed, ts_seed, sc, q0, q1, s0, s1);
+            }
+        }
         let (mut score, q_start, q_end, s_start, s_end, mut edit_script, q_bases, s_bases) = match gapped {
             None => continue,
             Some((sc, q0, q1, s0, s1, es)) => {
@@ -3646,9 +3668,10 @@ fn gapped_extend_bidirectional(
         gap_open, gap_extend, xdrop, matrix,
         true, ws,
     );
-    if left.a_len == 0 || left.b_len == 0 {
-        return None;
-    }
+    // NCBI keeps an empty left half (BLAST_GappedAlignmentWithTraceback: sl=0,
+    // alignment starts at seed+1).  This happens when improve_seed snaps the
+    // seed into an N-x-N identity run whose columns all score negatively —
+    // dropping the HSP here loses hits NCBI reports (bug #47).
     let q_start = q_seed + 1 - left.a_len as u32;
     let s_start = s_seed + 1 - left.b_len as u32;
 
@@ -3667,19 +3690,45 @@ fn gapped_extend_bidirectional(
         GapAlignResult { score: 0, a_len: 0, b_len: 0, edit_script: EditScript::new() }
     };
 
-    let total_score = left.score + right.score;
+    let mut total_score = left.score + right.score;
 
-    if total_score < 0 {
-        return None;
-    }
-
-    let q_end = q_seed + 1 + right.a_len as u32;
-    let s_end = s_seed + 1 + right.b_len as u32;
+    let mut q_start = q_start;
+    let mut s_start = s_start;
+    let mut q_end = q_seed + 1 + right.a_len as u32;
+    let mut s_end = s_seed + 1 + right.b_len as u32;
 
     let mut edit_script = left.edit_script;
     edit_script.reverse(); // flip left-extension to forward direction
     for (op, count) in right.edit_script.ops {
         edit_script.push(op, count);
+    }
+
+    // NCBI BLAST_GappedAlignmentWithTraceback (blast_gapalign.c): "rarely ... it
+    // is possible to compute an optimal alignment with a leading or trailing
+    // gap.  Prune these unneeded gaps here and update the score and alignment
+    // boundaries."  This fires when the forced seed cell sits in an N-run and
+    // the adjacent path enters/leaves it through a gap op.
+    while let Some(&(op, n)) = edit_script.ops.first() {
+        if op == EditOp::Sub { break; }
+        total_score += gap_open + n as i32 * gap_extend;
+        match op {
+            EditOp::GapInQuery => s_start += n,
+            _ => q_start += n,
+        }
+        edit_script.ops.remove(0);
+    }
+    while let Some(&(op, n)) = edit_script.ops.last() {
+        if op == EditOp::Sub { break; }
+        total_score += gap_open + n as i32 * gap_extend;
+        match op {
+            EditOp::GapInQuery => s_end -= n,
+            _ => q_end -= n,
+        }
+        edit_script.ops.pop();
+    }
+
+    if total_score < 0 {
+        return None;
     }
 
     Some((total_score, q_start, q_end, s_start, s_end, edit_script))
@@ -3749,6 +3798,66 @@ mod tests {
     // Port of NCBI's testCheckHSPCommonEndpoints (blasthits_unit_test.cpp).
     // Verifies that purge_prelim_common_endpoints removes HSPs sharing a
     // query-start or query-end point with a higher-scoring HSP.
+    // ── bug #47 regression tests ─────────────────────────────────────────────
+    // NCBI's BlastGetStartForGappedAlignmentNucl can snap the traceback seed
+    // into an N-x-N identity run (blastna N==N counts as a byte-equality
+    // match).  Two behaviors around the forced seed must match NCBI:
+    // an empty left half keeps the HSP, and leading/trailing gap ops are
+    // pruned with their cost refunded (BLAST_GappedAlignmentWithTraceback).
+
+    fn n_penalty_matrix(match_score: i32, mismatch: i32) -> ScoreMatrix {
+        let mut scores = [[0i32; 16]; 16];
+        for i in 0..16usize {
+            for j in 0..16usize {
+                scores[i][j] = if i < 4 && j < 4 {
+                    if i == j { match_score } else { mismatch }
+                } else {
+                    -1 // N rows/cols: -1, like the RM nt matrix
+                };
+            }
+        }
+        ScoreMatrix { scores, freqs: [0.0f64; 16], lambda: 0.0, name: "n_pen".to_string(), karlin: None }
+    }
+
+    #[test]
+    fn test_bug47_empty_left_half_keeps_hsp() {
+        // Seed placed mid N-run: every column left of the seed scores -1, so
+        // the left extension is empty.  NCBI keeps the HSP (alignment starts
+        // at seed+1); the old code returned None and lost the hit.
+        let seq = dna_to_blastna_sentinels(b"NNNNNNNNNNNNAAAAAAAAAAAAAAAAAAAA");
+        let matrix = n_penalty_matrix(1, -3);
+        let mut ws = AlignWorkspace::new();
+        let r = gapped_extend_bidirectional(&seq, &seq, 6, 6, 20, 5, 250, &matrix, &mut ws);
+        let (score, q_start, q_end, s_start, s_end, es) =
+            r.expect("HSP with empty left half must be kept (NCBI sl=0 case)");
+        // right half: 5 N,N columns (-1 each) then 20 A,A (+1 each) = 15
+        assert_eq!(score, 15);
+        assert_eq!((q_start, q_end, s_start, s_end), (7, 32, 7, 32));
+        assert_eq!(es.ops, vec![(EditOp::Sub, 25)]);
+    }
+
+    #[test]
+    fn test_bug47_trailing_gap_pruned() {
+        // Left half's optimal path leaves the forced seed corner through a
+        // 1-base subject gap (mismatch at the corner costs more than a gap).
+        // NCBI prunes the trailing gap op, refunds gap_open + gap_extend, and
+        // pulls in the subject boundary.
+        let qa = dna_to_blastna_sentinels(b"AAAAAAAAAAAAAAAAAAAAA"); // 21 A
+        let sa = dna_to_blastna_sentinels(b"AAAAAAAAAAAAAAAAAAAAT"); // 20 A + T
+        let mut matrix = n_penalty_matrix(9, -3);
+        matrix.scores[0][3] = -40; // A vs T worse than a gap (open 20 + ext 5)
+        matrix.scores[3][0] = -40;
+        let mut ws = AlignWorkspace::new();
+        let r = gapped_extend_bidirectional(&qa, &sa, 20, 20, 20, 5, 250, &matrix, &mut ws);
+        let (score, q_start, q_end, s_start, s_end, es) =
+            r.expect("alignment expected");
+        // Unpruned: 20 A,A matches (+180) plus trailing gap (-25) ending at
+        // s_end 21.  After NCBI-style pruning: score 180, s_end 20.
+        assert_eq!(score, 180);
+        assert_eq!((q_start, q_end, s_start, s_end), (1, 21, 0, 20));
+        assert_eq!(es.ops, vec![(EditOp::Sub, 20)]);
+    }
+
     #[test]
     fn test_purge_prelim_common_endpoints_ncbi() {
         let scores: [i32; 9] =    [1044, 995, 965, 219, 160, 125, 110, 107, 103];

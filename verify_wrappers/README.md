@@ -49,9 +49,13 @@ Put this directory ahead of the real NCBI tools on `PATH` (or set it as the
 RepeatMasker/RepeatModeler `RMBLAST_DIR`):
 
 ```sh
-export PATH=/home/rhubley/projects/Claude/rmblast-port/rmblast/verify_wrappers:$PATH
-# callers then invoke `makeblastdb`/`rmblastn`/`blastdbcmd` unchanged
+export PATH=<rmblast-root>/verify_wrappers:$PATH
+# callers then invoke `makeblastdb`/`rmblastn`/`blastdbcmd`/`dustmasker` unchanged
 ```
+
+`<rmblast-root>` is either an installed release (`/usr/local/rmblast-<version>`)
+or the `rmblast/` directory of a source checkout — the wrappers find the Rust
+binaries relative to themselves, so neither needs editing.
 
 The caller must still set `BLASTMAT` to the matrix directory (as usual for NCBI
 rmblastn); both engines inherit it and resolve the matrix the same way.
@@ -103,8 +107,20 @@ subdirectory containing:
 - `commands.txt` — the exact invocations and `BLASTMAT`
 - `reproduce.sh` — reruns both engines against the copied-in files and diffs
 
-## Configuration (edit at the top of each script)
+## Configuration
 
-- `NCBI_DIR`        = `/usr/local/rmblast-2.17.1/bin`
-- `REAL_RMBLASTN`   = `…/rmblast/target/release/rmblastn`
-- `RMBLAST_VERIFY_DIR` (env) overrides the bundle directory
+Environment variables (no editing required):
+
+- `NCBI_DIR` — where the real NCBI tools live.
+  Default `/usr/local/rmblast-2.17.1/bin`.
+- `RMBLAST_BIN_DIR` — where the Rust binaries live.  By default the wrappers
+  resolve `../bin/<name>` (installed release) and then
+  `../target/release/<name>` (source checkout), relative to the wrapper itself
+  with symlinks followed.
+- `RMBLAST_VERIFY_DIR` — overrides the bundle directory.
+- `RMBLAST_VERIFY_DUSTMASKER` — `ncbi` (default) or `rust`.  Only `rmblastn` is
+  A/B-compared here; `makeblastdb`, `blastdbcmd` and `dustmasker` defer to the
+  real NCBI binaries so that any reported diff is attributable to `rmblastn`
+  alone.  Set this to `rust` to exercise the port's dustmasker instead.
+- `blastdb_aliastool` is the same pass-through copy as in `../wrappers/`: it
+  writes the GI list out as plain text, which both engines accept.
