@@ -20,6 +20,17 @@ single-engine wrappers precisely because the names collide.
 Key point: the Rust engine is pointed at the **FASTA file** as its database,
 never a `.2bit` — only the FASTA reproduces NCBI's ambiguity-code handling.
 
+Because of that, both `makeblastdb` wrappers copy the `-in` FASTA to the `-out`
+base path whenever the two differ, so a FASTA is always sitting where
+`rmblastn` looks for `-db <base>`.  RepeatMasker builds its databases in place
+(`-in x.fa -out x.fa`) and is unaffected, but RepeatModeler's
+`RepeatUtil::ncbiMaskDatabaseNativeMT` builds
+`makeblastdb -out <round-N>/tmpConsDB-1 -in <root>/consensi.fa` and then
+searches `-db <round-N>/tmpConsDB-1`; without the copy the `rmblastn` wrappers
+abort with `database file not found`.  It is a copy rather than a symlink
+because `consensi.fa` keeps growing between rounds and the database has to stay
+paired with the sequences it was built from.
+
 ## `--ncbi-compat` is forced on the Rust side
 
 This wrapper appends `--ncbi-compat` to every Rust invocation (both the
@@ -124,3 +135,22 @@ Environment variables (no editing required):
   alone.  Set this to `rust` to exercise the port's dustmasker instead.
 - `blastdb_aliastool` is the same pass-through copy as in `../wrappers/`: it
   writes the GI list out as plain text, which both engines accept.
+- `-version` / `--version` / `-v` is answered by the wrapper, not passed
+  through.  The Rust binary prints clap's plain `rmblastn 3.0.3`; both
+  `rmblastn` wrappers reshape that into NCBI's form:
+
+  ```
+  rmblastn: 3.0.3+
+   Package: rmblast 3.0.3, Rust port
+  ```
+
+  The colon and the trailing `+` are load-bearing.  Every caller-side version
+  probe needs them: `NCBIBlastSearchEngine::setPathToEngine` matches
+  `/(\d+)\.(\d+)\.(\d+)\+/` before setting `hasTabFormat`, and without it the
+  caller omits `-outfmt "6 score perc_sub ..."` and silently falls back to the
+  legacy pairwise parser (losing kdiv / cpg_kdiv / transi / transv /
+  cpg_sites).  `RepModelConfig.pm` and `RepeatModeler/configure` additionally
+  need the colon.  The reshaping lives in the wrappers on purpose: `+` is an
+  NCBI packaging convention, not this project's version, so the binary keeps
+  reporting its own `rmblastn <ver>`.  The number is always read back from the
+  binary, never hardcoded.

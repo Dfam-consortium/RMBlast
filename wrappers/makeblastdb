@@ -1,16 +1,31 @@
 #!/bin/bash
 # Replacement for NCBI makeblastdb used with the Rust rmblastn port.
 #
-# The Rust rmblastn binary uses a UCSC 2bit file as its database, not a BLAST
-# database.  This wrapper:
-#   1. Converts the input FASTA to a .2bit file via faToTwoBit (the actual
-#      database used at search time).
-#   2. Creates dummy BLAST database index files (.ndb, .nhr, .nin, .nog, .nos,
+# The Rust rmblastn binary reads the FASTA (or a UCSC 2bit) as its database,
+# not a BLAST database.  This wrapper:
+#   1. Converts the input FASTA to a .2bit file via faToTwoBit.
+#   2. Places the source FASTA at the database base path when '-out' names
+#      something other than '-in' -- ../wrappers/rmblastn hands the Rust
+#      engine '-db <base>' and reads that FASTA directly, because 2bit
+#      degrades IUB ambiguity codes to N.
+#   3. Creates dummy BLAST database index files (.ndb, .nhr, .nin, .nog, .nos,
 #      .not, .nsq, .ntf, .nto) containing only the word "dummy", so that any
 #      caller checking for the existence of a BLAST database will find non-zero
 #      files and proceed normally.
 #
 # The real NCBI makeblastdb is NOT called.
+#
+# Step 2 matters whenever '-out' differs from '-in'.  RepeatMasker builds its
+# databases in place ('-in x.fa -out x.fa'), so the FASTA is already where the
+# rmblastn wrapper looks.  But RepeatModeler's
+# RepeatUtil::ncbiMaskDatabaseNativeMT builds
+#   makeblastdb -out <round-N>/tmpConsDB-1 -in <root>/consensi.fa
+# and then searches '-db <round-N>/tmpConsDB-1'.  Nothing ever wrote a FASTA at
+# that path, so the rmblastn wrapper aborted with
+#   "[rmblastn] Error: database file not found: .../tmpConsDB-1".
+# Copying (not symlinking) is deliberate: consensi.fa keeps growing between
+# rounds, and the database must stay paired with the sequences it was built
+# from.
 
 FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
 
@@ -25,9 +40,12 @@ args=("$@")
 i=0
 while [ $i -lt ${#args[@]} ]; do
     case "${args[$i]}" in
-        -in)     i=$((i+1)); in_file="${args[$i]}" ;;
-        -out)    i=$((i+1)); out_name="${args[$i]}" ;;
-        -dbtype) i=$((i+1)); dbtype="${args[$i]}" ;;
+        -in)      i=$((i+1)); in_file="${args[$i]}" ;;
+        -in=*)               in_file="${args[$i]#*=}" ;;
+        -out)     i=$((i+1)); out_name="${args[$i]}" ;;
+        -out=*)              out_name="${args[$i]#*=}" ;;
+        -dbtype)  i=$((i+1)); dbtype="${args[$i]}" ;;
+        -dbtype=*)           dbtype="${args[$i]#*=}" ;;
     esac
     i=$((i+1))
 done
@@ -54,7 +72,19 @@ if [ "$dbtype" = "nucl" ]; then
     fi
 fi
 
-# Step 2: create dummy BLAST index files so callers see a complete-looking database.
+# Step 2: put the source FASTA at the database base path when it is not
+# already there.  '-ef' compares device+inode, so './x.fa' vs 'x.fa' (and
+# symlinks to the same file) count as identical and are left alone.
+if [ ! "$in_file" -ef "$base" ]; then
+    if cp -f -- "$in_file" "$base"; then
+        echo "[makeblastdb] Copied $in_file -> $base (FASTA for the Rust engine)" >&2
+    else
+        echo "[makeblastdb] Error: failed to copy $in_file -> $base" >&2
+        exit 1
+    fi
+fi
+
+# Step 3: create dummy BLAST index files so callers see a complete-looking database.
 for ext in "${NUCL_EXTENSIONS[@]}"; do
     echo "dummy" > "${base}.${ext}"
 done

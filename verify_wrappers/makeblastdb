@@ -6,11 +6,57 @@
 #   - The Rust port reads the FASTA file directly (NOT a .2bit) -- only the
 #     FASTA reproduces NCBI's ambiguity-code handling.
 #
-# So this wrapper simply runs the REAL NCBI makeblastdb to build the index and
-# leaves the FASTA in place for the Rust engine.  (No faToTwoBit / .2bit is
-# produced, unlike the plain ../wrappers/makeblastdb.)
+# So this wrapper runs the REAL NCBI makeblastdb to build the index, and then
+# makes sure a FASTA is sitting at the database's base path for the Rust
+# engine.  (No faToTwoBit / .2bit is produced, unlike ../wrappers/makeblastdb.)
+#
+# The FASTA copy matters whenever '-out' names something other than '-in'.
+# RepeatMasker builds its databases in place ('-in x.fa -out x.fa'), so the
+# FASTA is already where ../verify_wrappers/rmblastn looks for it.  But
+# RepeatModeler's RepeatUtil::ncbiMaskDatabaseNativeMT builds
+#   makeblastdb -out <round-N>/tmpConsDB-1 -in <root>/consensi.fa
+# and then searches '-db <round-N>/tmpConsDB-1'.  Nothing ever writes a FASTA
+# at that path, so the rmblastn wrapper used to abort with
+#   "[verify rmblastn] Error: FASTA database not found: .../tmpConsDB-1".
+# Copying (not symlinking) is deliberate: consensi.fa keeps growing between
+# rounds, and the database must stay paired with the sequences it was built
+# from.
 
 NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
 NCBI_MAKEBLASTDB="$NCBI_DIR/makeblastdb"
 
-exec "$NCBI_MAKEBLASTDB" "$@"
+# Pull out -in / -out (NCBI accepts only the space-separated form, but accept
+# '-flag=value' too so the wrapper is not the fussier of the two).
+in_file=""
+out_name=""
+args=("$@")
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+        -in)   i=$((i+1)); in_file="${args[$i]}"  ;;
+        -in=*)            in_file="${args[$i]#*=}" ;;
+        -out)  i=$((i+1)); out_name="${args[$i]}" ;;
+        -out=*)           out_name="${args[$i]#*=}" ;;
+    esac
+    i=$((i+1))
+done
+
+"$NCBI_MAKEBLASTDB" "$@"
+rc=$?
+[ $rc -ne 0 ] && exit $rc
+
+# Put the source FASTA at the database base path when it is not already there.
+# '-ef' compares device+inode, so './x.fa' vs 'x.fa' (and symlinks to the same
+# file) count as identical and are left alone.  A non-regular -in (a file list,
+# a process substitution, stdin) is skipped rather than guessed at.
+if [ -n "$out_name" ] && [ -n "$in_file" ] && [ -f "$in_file" ] \
+   && [ ! "$in_file" -ef "$out_name" ]; then
+    if cp -f -- "$in_file" "$out_name"; then
+        echo "[verify makeblastdb] Copied $in_file -> $out_name (FASTA for the Rust engine)" >&2
+    else
+        echo "[verify makeblastdb] Error: failed to copy $in_file -> $out_name" >&2
+        exit 1
+    fi
+fi
+
+exit $rc

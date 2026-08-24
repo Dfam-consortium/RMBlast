@@ -68,6 +68,52 @@ rmblast_find_bin() {
 
 REAL_RMBLASTN="$(rmblast_find_bin rmblastn)" || exit 1
 
+# ── NCBI-shaped "-version" output ─────────────────────────────────────────────
+# The Rust binary prints clap's plain "rmblastn 3.0.3".  NCBI prints:
+#   rmblastn: 2.17.1+
+#    Package: blast 2.17.0, build Apr 28 2026 12:15:13
+# The colon and the trailing '+' are not decoration -- every RepeatMasker /
+# RepeatModeler version probe depends on that exact shape:
+#   NCBIBlastSearchEngine::setPathToEngine
+#       /rmblast[n]\s*:?\s*(\S.*)/  then  /(\d+)\.(\d+)\.(\d+)\+/
+#       Without the '+' the second match fails, so hasTabFormat /
+#       hasQueryThreading / hasDBSoftMasking are never set -- the caller then
+#       omits '-outfmt "6 score perc_sub ..."' entirely and silently falls back
+#       to the legacy pairwise parser, losing the precomputed kdiv / cpg_kdiv /
+#       transi / transv / cross_match stat fields.
+#   RepModelConfig.pm         /rmblastn:\s+(\d+\.\d+\.\d+\+?)/
+#   RepeatModeler/configure   /rmblastn:\s+(\d+)\.(\d+)\.(\d+)/
+#       Both of these need the COLON, which clap does not print either.
+#
+# Reshaping here rather than in the binary is deliberate: the '+' is an NCBI
+# packaging convention, not this project's version, so the Rust binary goes on
+# reporting its own honest "rmblastn <ver>".  The version number itself is
+# always taken from the binary -- it is never hardcoded in the wrapper.
+rmblast_print_version() {
+    local raw ver
+    raw="$("$REAL_RMBLASTN" --version 2>&1)"
+    ver="$(printf '%s\n' "$raw" \
+           | sed -n '1s/^[[:space:]]*rmblastn[: ][[:space:]]*\([0-9][^[:space:]]*\).*/\1/p')"
+    if [ -z "$ver" ]; then
+        printf '%s\n' "$raw"     # unrecognized -- pass the binary through untouched
+        return
+    fi
+    ver="${ver%+}"               # never double up the '+'
+    printf 'rmblastn: %s+\n' "$ver"
+    printf ' Package: rmblast %s, Rust port\n' "$ver"
+}
+
+# Informational invocations short-circuit before any argument translation.
+# ('-h' in particular would otherwise be rewritten to the unknown '--h'.)
+for a in "$@"; do
+    case "$a" in
+        -version|--version|-v)
+            rmblast_print_version; exit 0 ;;
+        -h|-help|--help)
+            exec "$REAL_RMBLASTN" --help ;;
+    esac
+done
+
 args=("$@")
 new_args=()
 i=0
