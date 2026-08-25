@@ -327,6 +327,130 @@ fn parse_output_format(s: &str) -> Result<OutputFormat> {
     Ok(OutputFormat::Tabular(fields))
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Matrix file lookup
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The environment rmblastn consults when resolving `-matrix`. Captured up front
+/// so the lookup itself is a pure function of (name, environment).
+#[derive(Default)]
+struct MatrixEnv {
+    data_path: String,
+    data_dir: String,
+    blastmat: String,
+}
+
+impl MatrixEnv {
+    fn from_env() -> Self {
+        let get = |k: &str| std::env::var(k).unwrap_or_default();
+        MatrixEnv {
+            data_path: get("NCBI_DATA_PATH"),
+            data_dir: get("NCBI_DATA_DIR"),
+            blastmat: get("BLASTMAT"),
+        }
+    }
+}
+
+/// `s_FileExistsInDir` (rmblastn_app.cpp:53): an empty directory never matches.
+fn file_exists_in_dir(dir: &str, name: &str) -> bool {
+    !dir.is_empty()
+        && std::path::Path::new(&format!("{}/{}", dir.trim_end_matches('/'), name)).is_file()
+}
+
+/// Port of `s_ValidateCustomMatrixFile` (rmblastn_app.cpp:69), the pre-flight
+/// check rmblastn runs before it ever calls `BlastFindMatrixPath`. It only tries
+/// the name in its original case, which makes the upper-cased branches of the
+/// real lookup unreachable unless the name was already upper-cased, and it
+/// treats `NCBI_DATA_PATH` as a single directory rather than a `:` list.
+fn matrix_gate_passes(name: &str, env: &MatrixEnv) -> bool {
+    let blastmat_nt = format!("{}/nt", env.blastmat.trim_end_matches('/'));
+    file_exists_in_dir(&env.data_path, name)
+        || file_exists_in_dir(&env.data_dir, name)
+        || file_exists_in_dir(&env.blastmat, name)
+        || (!env.blastmat.is_empty() && file_exists_in_dir(&blastmat_nt, name))
+        || file_exists_in_dir("data", name)
+}
+
+/// Port of `g_FindDataFile` (util_misc.cpp:139): search `NCBI_DATA_PATH`
+/// (colon-separated). An absolute name is checked as-is.
+///
+/// `g_FindDataFile` also consults the `NCBI/Data` registry parameter, but that
+/// one reads `NCBI_DATA`, not `NCBI_DATA_DIR` — and the pre-flight gate reads
+/// `NCBI_DATA_DIR` and not `NCBI_DATA`, so neither variable can resolve a matrix
+/// on its own: `NCBI_DATA` fails the gate, `NCBI_DATA_DIR` passes it and then
+/// fails the load. `NCBI_DATA` is omitted here so we fail alongside NCBI rather
+/// than succeeding where it errors out. Verified against rmblast-2.17.1.
+fn find_data_file(name: &str, env: &MatrixEnv) -> Option<String> {
+    let mut dirs: Vec<&str> = Vec::new();
+    if std::path::Path::new(name).is_absolute() {
+        dirs.push("");
+    } else {
+        dirs.extend(env.data_path.split(':').filter(|s| !s.is_empty()));
+    }
+    dirs.into_iter()
+        .map(|dir| {
+            if dir.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", dir.trim_end_matches('/'), name)
+            }
+        })
+        .find(|cand| std::path::Path::new(cand).is_file())
+}
+
+/// Port of `BlastFindMatrixPath` (blast_setup_cxx.cpp:1308) for the nucleotide
+/// case. Each directory is tried with the upper-cased name first, then with the
+/// name exactly as given — the `-RMH-` case-preserving additions RMBlast makes
+/// for custom matrices such as `comparison.matrix`. The `nt` subdirectory of
+/// `BLASTMAT` is part of that search, so `BLASTMAT=<...>/Matrices/ncbi` resolves
+/// `-matrix comparison.matrix` to `<...>/Matrices/ncbi/nt/comparison.matrix`.
+fn blast_find_matrix_path(name: &str, env: &MatrixEnv) -> Option<String> {
+    let upper = name.to_uppercase();
+
+    for n in [upper.as_str(), name] {
+        if let Some(p) = find_data_file(n, env) {
+            return Some(p);
+        }
+    }
+
+    if std::path::Path::new(&env.blastmat).is_dir() {
+        let base = env.blastmat.trim_end_matches('/');
+        for cand in [
+            format!("{}/{}", base, upper),
+            format!("{}/{}", base, name),
+            format!("{}/nt/{}", base, upper),
+            format!("{}/nt/{}", base, name),
+        ] {
+            if std::path::Path::new(&cand).is_file() {
+                return Some(cand);
+            }
+        }
+    }
+
+    [format!("data/{}", upper), format!("data/{}", name)]
+        .into_iter()
+        .find(|cand| std::path::Path::new(cand).is_file())
+}
+
+/// Resolve `--matrix` the way rmblastn does: the pre-flight gate first, then the
+/// real lookup. When the gate passes but the lookup comes up empty, NCBI reports
+/// "Could not open matrix for reading" and exits, so we fail there too.
+///
+/// One deliberate superset: neither the gate nor the lookup resolves a bare
+/// path, so stock rmblastn rejects `-matrix /abs/path/comparison.matrix`. We
+/// accept it as a last resort, after every directory NCBI consults, which keeps
+/// this port's harness scripts working without ever changing *which* file gets
+/// loaded in a case NCBI can resolve.
+fn find_matrix_path(name: &str, env: &MatrixEnv) -> Option<String> {
+    if matrix_gate_passes(name, env) {
+        return blast_find_matrix_path(name, env);
+    }
+    if std::path::Path::new(name).is_file() {
+        return Some(name.to_string());
+    }
+    None
+}
+
 fn main() -> Result<()> {
     let args = Args::parse_from(normalize_args());
 
@@ -334,17 +458,15 @@ fn main() -> Result<()> {
         anyhow::bail!("--matrix is required");
     }
 
-    let matrix_path = if std::path::Path::new(&args.matrix).exists() {
-        args.matrix.clone()
-    } else if let Ok(blastmat) = std::env::var("BLASTMAT") {
-        let candidate = format!("{}/{}", blastmat, args.matrix);
-        if std::path::Path::new(&candidate).exists() {
-            candidate
-        } else {
-            anyhow::bail!("cannot find matrix '{}' (also tried BLASTMAT: '{}')", args.matrix, candidate);
-        }
-    } else {
-        args.matrix.clone()
+    let matrix_path = match find_matrix_path(&args.matrix, &MatrixEnv::from_env()) {
+        Some(p) => p,
+        None => anyhow::bail!(
+            "Cannot find substitution matrix file '{}'.\nSearched (in order):\n               NCBI_DATA_PATH : {}\n  NCBI_DATA_DIR  : {}\n  BLASTMAT       : {}\n               ./data/          (subdirectory of current working directory)",
+            args.matrix,
+            std::env::var("NCBI_DATA_PATH").unwrap_or_else(|_| "(not set)".into()),
+            std::env::var("NCBI_DATA_DIR").unwrap_or_else(|_| "(not set)".into()),
+            std::env::var("BLASTMAT").unwrap_or_else(|_| "(not set)".into()),
+        ),
     };
     let matrix = ScoreMatrix::from_file(&matrix_path)
         .with_context(|| format!("loading matrix '{}'", matrix_path))?;
@@ -1139,7 +1261,7 @@ mod gilist_tests {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{normalize_arg_iter, Args};
+    use super::{find_matrix_path, normalize_arg_iter, Args, MatrixEnv};
     use clap::Parser;
 
     // ── Argument-spelling compatibility ───────────────────────────────────────
@@ -1232,5 +1354,139 @@ mod cli_tests {
                 .map(|s| std::ffi::OsString::from(*s))
         ))
         .is_err());
+    }
+
+    // ── Matrix file lookup ────────────────────────────────────────────────────
+    // NCBI resolves `-matrix comparison.matrix` against $BLASTMAT/nt as well as
+    // $BLASTMAT, so BLASTMAT=<...>/Matrices/ncbi finds the matrix one directory
+    // down. RepeatMasker points BLASTMAT straight at the `nt` directory, which
+    // is why the missing branch stayed hidden until someone set BLASTMAT to the
+    // parent. See PORTING_NOTES.md 15.1 for the full order and its quirks.
+
+    /// Build an isolated directory tree under the system temp dir. `files` are
+    /// paths relative to the returned root; each is created empty.
+    fn matrix_fixture(tag: &str, files: &[&str]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "rmblastn-matrix-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for rel in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn blastmat_env(dir: &std::path::Path) -> MatrixEnv {
+        MatrixEnv { blastmat: dir.display().to_string(), ..MatrixEnv::default() }
+    }
+
+    #[test]
+    fn matrix_lookup_finds_blastmat_nt_subdirectory() {
+        let root = matrix_fixture("nt-subdir", &["nt/comparison.matrix"]);
+        assert_eq!(
+            find_matrix_path("comparison.matrix", &blastmat_env(&root)),
+            Some(root.join("nt/comparison.matrix").display().to_string())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_lookup_prefers_blastmat_itself_over_its_nt_subdirectory() {
+        // BlastFindMatrixPath checks $BLASTMAT before $BLASTMAT/nt.
+        let root = matrix_fixture(
+            "precedence",
+            &["comparison.matrix", "nt/comparison.matrix"],
+        );
+        assert_eq!(
+            find_matrix_path("comparison.matrix", &blastmat_env(&root)),
+            Some(root.join("comparison.matrix").display().to_string())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_lookup_tolerates_a_trailing_slash_on_blastmat() {
+        let root = matrix_fixture("trailing-slash", &["nt/comparison.matrix"]);
+        let env = MatrixEnv {
+            blastmat: format!("{}/", root.display()),
+            ..MatrixEnv::default()
+        };
+        assert_eq!(
+            find_matrix_path("comparison.matrix", &env),
+            Some(root.join("nt/comparison.matrix").display().to_string())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_lookup_searches_ncbi_data_path() {
+        let root = matrix_fixture("data-path", &["comparison.matrix"]);
+        let env = MatrixEnv {
+            data_path: root.display().to_string(),
+            ..MatrixEnv::default()
+        };
+        assert_eq!(
+            find_matrix_path("comparison.matrix", &env),
+            Some(root.join("comparison.matrix").display().to_string())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_lookup_rejects_what_ncbi_rejects() {
+        let root = matrix_fixture(
+            "rejects",
+            &["nt/comparison.matrix", "up/nt/COMPARISON.MATRIX"],
+        );
+
+        // Nothing set at all.
+        assert_eq!(
+            find_matrix_path("comparison.matrix", &MatrixEnv::default()),
+            None
+        );
+
+        // BLASTMAT pointing somewhere that does not exist.
+        let env = MatrixEnv {
+            blastmat: root.join("nonexistent").display().to_string(),
+            ..MatrixEnv::default()
+        };
+        assert_eq!(find_matrix_path("comparison.matrix", &env), None);
+
+        // NCBI_DATA_DIR passes the pre-flight gate but the load then fails, so
+        // rmblastn errors out; we must not resolve it either.
+        let env = MatrixEnv {
+            data_dir: root.display().to_string(),
+            ..MatrixEnv::default()
+        };
+        assert_eq!(find_matrix_path("nt", &env), None);
+
+        // The gate only ever tries the original case, so an upper-cased file
+        // under $BLASTMAT/nt is unreachable for a lower-cased request.
+        let env = blastmat_env(&root.join("up"));
+        assert_eq!(find_matrix_path("comparison.matrix", &env), None);
+        assert_eq!(
+            find_matrix_path("COMPARISON.MATRIX", &env),
+            Some(root.join("up/nt/COMPARISON.MATRIX").display().to_string())
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn matrix_lookup_still_accepts_a_direct_path() {
+        // Documented superset: stock rmblastn rejects this, but the port's own
+        // harness scripts pass an absolute matrix path.
+        let root = matrix_fixture("direct", &["comparison.matrix"]);
+        let direct = root.join("comparison.matrix").display().to_string();
+        assert_eq!(
+            find_matrix_path(&direct, &MatrixEnv::default()),
+            Some(direct.clone())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
