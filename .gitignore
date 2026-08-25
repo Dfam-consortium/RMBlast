@@ -13,8 +13,14 @@
 *.swp
 rmblast-stats/fits/*.err
 
-# Local reference docs (mirrors dfam-curator; drop this to track it)
+# Maintainer notes, kept local (delete a line here to start tracking that file).
+# The user-visible
+# parts of DESIGN_NOTES.md live in README.md's "Known differences from NCBI".
 how-to-release
+DESIGN_NOTES.md
+
+# Local experimental analysis scripts
+/tools/
 
 # Release staging produced by `make dist`
 /stage/

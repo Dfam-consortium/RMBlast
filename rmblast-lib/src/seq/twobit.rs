@@ -21,7 +21,8 @@
 //! (R/Y/K/M/W/S/B/D/H/V) to N, losing the original code.  The .2bit format
 //! therefore only supports N-level ambiguity.  All N-block positions are
 //! randomised as pure N (any of A/C/G/T).  For full IUB fidelity, supply the
-//! database in FASTA format instead (see SubjectDb / DESIGN_NOTES.md).
+//! database in FASTA format instead (see SubjectDb, and "Known differences
+//! from NCBI" in README.md).
 //!
 //! Lowercase (soft-masked) regions in mask blocks → treated as uppercase here;
 //! RepeatMasker provides its own masking via -dust / the query mask.

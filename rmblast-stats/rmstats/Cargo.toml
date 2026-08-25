@@ -2,6 +2,7 @@
 name = "rmstats"
 version = "0.1.0"
 edition = "2021"
+license = "CC0-1.0"
 description = "Faithful Rust port of NCBI BLAST (RMBlast-patched) Karlin-Altschul E-value/bit-score statistics for rmblastn"
 
 [features]

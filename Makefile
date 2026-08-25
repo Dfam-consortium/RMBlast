@@ -5,7 +5,7 @@
 #   $(PREFIX)/$(NAME)-$(VERSION)/bin/dustmasker    NCBI-dustmasker-compatible CLI
 #   $(PREFIX)/$(NAME)-$(VERSION)/wrappers/*        RepeatMasker-facing wrapper scripts
 #   $(PREFIX)/$(NAME)-$(VERSION)/verify_wrappers/* same, but A/B-checking rmblastn
-#   $(PREFIX)/$(NAME)-$(VERSION)/*.md              documentation
+#   $(PREFIX)/$(NAME)-$(VERSION)/README.md         documentation (see DOCS)
 #   $(PREFIX)/$(NAME)-$(VERSION)/matrices/*        scoring matrices (opt-in, see MATRIX_SRC)
 #
 # Examples:
@@ -26,6 +26,10 @@ BIN         = rmblastn
 # installing it shadows NCBI's copy for anything that finds it on PATH first.
 EXTRA_BINS  = dustmasker
 MANIFEST    = rmblastn/Cargo.toml
+# Documentation shipped in a binary release.  Listed by name rather than globbed
+# as *.md, so that a maintainer note dropped at the top level does not silently
+# end up in a release tarball.
+DOCS        = README.md LICENSE
 # Directory holding *.matrix files to bundle.  Empty by default (opt-in) since the
 # canonical matrices live outside the source tree; set on the command line.
 MATRIX_SRC ?=
@@ -69,7 +73,9 @@ install: build
 	$(INSTALL) -d $(PKGDIR)/verify_wrappers
 	$(INSTALL) -m 0755 $(filter-out %.md,$(wildcard verify_wrappers/*)) $(PKGDIR)/verify_wrappers/
 	$(INSTALL) -m 0644 verify_wrappers/README.md $(PKGDIR)/verify_wrappers/
-	$(INSTALL) -m 0644 *.md $(PKGDIR)/
+	@for d in $(DOCS); do \
+	  $(INSTALL) -m 0644 $$d $(PKGDIR)/ && echo "  doc       <- $$d"; \
+	done
 	@if [ -n "$(MATRIX_SRC)" ] && [ -d "$(MATRIX_SRC)" ]; then \
 	  $(INSTALL) -d $(PKGDIR)/matrices; \
 	  $(INSTALL) -m 0644 $(MATRIX_SRC)/*.matrix $(PKGDIR)/matrices/ && \
