@@ -29,8 +29,11 @@
 
 FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
 
-# Nucleotide BLAST DB extensions created by the real makeblastdb.
-NUCL_EXTENSIONS=(ndb nhr nin nog nos not nsq ntf nto)
+# Nucleotide BLAST DB extensions created by the real makeblastdb.  '.njs' is
+# in the list because RepeatModeler's Refiner cleans up after itself with
+#   rm <fam>.nin <fam>.nhr <fam>.nsq <fam>.njs
+# and prints an error for every one of the four that is missing.
+NUCL_EXTENSIONS=(ndb nhr nin njs nog nos not nsq ntf nto)
 
 in_file=""
 out_name=""

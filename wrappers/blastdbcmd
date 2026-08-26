@@ -5,8 +5,8 @@
 # The port's "database" is a UCSC 2bit file (what the makeblastdb wrapper
 # produces) or a plain FASTA file — not a BLAST index.  This wrapper implements
 # the handful of blastdbcmd invocations that BuildDatabase / RepeatModeler /
-# util/align.pl actually make, on top of twoBitInfo / twoBitToFa (2bit) or awk
-# (FASTA).
+# util/align.pl actually make, on top of twoBitInfo / twoBitToFa (2bit) or
+# awk/perl (FASTA).
 #
 # Supported:
 #   -db <name> -info
@@ -17,6 +17,9 @@
 #   -db <name> -entry_batch <file>                 -> "seqID start-end" per line
 #   -dbtype/-line_length/-target_only/-long_seqids are accepted and ignored
 #   -out <file>
+#
+# For a BuildDatabase database we translate sequence names to the "gi|N" form
+# the database stores.  See BUILDDATABASE NAMES below.
 #
 # Anything else exits non-zero with a "not supported" message rather than
 # quietly producing something different from what the caller expects.
@@ -35,7 +38,12 @@
 #     of NCBI's ">name:1basedStart-end description".  The extracted BASES are
 #     identical (verified against NCBI); only the header text differs.
 #     sampleFromDB() discards these deflines and re-headers by position.
+#   * -entry_batch deflines carry the name as stored in the file we read, so
+#     under a BuildDatabase translation they say ">chr7:0-40000" where real
+#     blastdbcmd says ">gi|1:1-40000".  The bases and their order are the same.
 #   * ids carry no "lcl|" prefix, and 2bit-backed sequences have no description
+#   * bases come back uppercase, as they do from a real nucleotide database:
+#     any soft-masking in the file we read is dropped
 #     (a 2bit file stores only the name).
 #   * a 2bit-backed database cannot round-trip non-N IUB codes (R/Y/K/M/W/S/...
 #     come back as N) — that is the 2bit format, not this wrapper.  Point -db at
@@ -97,8 +105,9 @@ fi
 
 [ -n "$out" ] && exec > "$out"
 
-# "seqID<TAB>length", one line per sequence, in database order.
-list_ids_lengths() {
+# "seqID<TAB>length", one line per sequence, in database order, under the
+# names as they are stored in the file we resolved.
+list_ids_lengths_raw() {
     if [ "$dbtype_detected" = "2bit" ]; then
         "$TWOBITINFO" "$dbfile" stdout
     else
@@ -106,6 +115,98 @@ list_ids_lengths() {
                   { gsub(/[ \t\r]/, ""); len += length($0) }
              END  { if (n != "") print n "\t" len }' "$dbfile"
     fi
+}
+
+# ── BUILDDATABASE NAMES ──────────────────────────────────────────────────────
+#
+# RepeatModeler's BuildDatabase renames every input sequence to "gi|<N>" before
+# handing the FASTA to makeblastdb, and records "<original>\t<N>" in
+# <db>.translation.  The database holds the gi| names and the callers count on
+# it: sampleFromDB() copies the name straight into the sampleDB deflines,
+# RepeatModeler builds genome.2bit out of our own "-entry all" output, and
+# Refiner requires /^gi\|\d+$/ for RepeatModeler input, dying with "Could not
+# parse genomic coordinates for id/desc" otherwise.
+#
+# We cannot read an NCBI BLAST index, so for a BuildDatabase database the loop
+# above falls through to BuildDatabase's *input* FASTA, still sitting next to
+# it as <db>.fa and still carrying the original names.  Left alone, Refiner
+# then sees "chr7" where it demands "gi|1" and every family fails to refine.
+# Translate the names to the ones the database actually holds.
+#
+# Guard: we translate only when the first stored name is one of the table's
+# keys.  A database our own makeblastdb wrapper built already holds gi| names,
+# and a stale .translation left over from some other database will not match.
+xlate=""
+if [ -f "$db.translation" ]; then
+    if [ "$dbtype_detected" = "2bit" ]; then
+        first_name=$("$TWOBITINFO" "$dbfile" stdout 2>/dev/null | head -1 | cut -f1)
+    else
+        first_name=$(head -1 "$dbfile" | sed -n 's/^>[[:space:]]*\([^[:space:]]*\).*/\1/p')
+    fi
+    if [ -n "$first_name" ] &&
+       awk -F'\t' -v n="$first_name" '$1 == n { hit = 1; exit } END { exit !hit }' \
+           "$db.translation"; then
+        xlate="$db.translation"
+    fi
+fi
+
+if [ -z "$xlate" ] && [ "$dbfile" != "$db" ] && [ "$dbfile" != "$db.2bit" ] &&
+   { [ -f "$db.nsq" ] || [ -f "$db.nin" ]; }; then
+    echo "[blastdbcmd] Warning: $db is an NCBI BLAST database this wrapper cannot" >&2
+    echo "[blastdbcmd] read; reading $dbfile instead.  Sequence names come from that" >&2
+    echo "[blastdbcmd] file and need not be the ones the database stores." >&2
+fi
+
+# awk prologue: fwd[stored name] -> "gi|<N>", rev["gi|<N>"] -> stored name.
+XLATE_AWK='
+function load_xlate(   line, t) {
+    if (xlate == "") return
+    while ((getline line < xlate) > 0) {
+        sub(/\r$/, "", line)
+        t = index(line, "\t")
+        if (t == 0) continue
+        fwd[substr(line, 1, t - 1)] = "gi|" substr(line, t + 1)
+        rev["gi|" substr(line, t + 1)] = substr(line, 1, t - 1)
+    }
+    close(xlate)
+}
+function xname(n) { return (n in fwd) ? fwd[n] : n }
+function rname(n) { return (n in rev) ? rev[n] : n }
+'
+
+# The stored name behind a caller-supplied one.
+raw_name() {
+    if [ -z "$xlate" ]; then printf '%s\n' "$1"; return; fi
+    awk -F'\t' -v want="$1" '"gi|" $2 == want { print $1; hit = 1; exit }
+                              END { if (!hit) print want }' "$xlate"
+}
+
+# FASTA as the database would report it.
+#
+# Deflines: BuildDatabase writes ">gi|N" with no title, so real blastdbcmd
+# prints ">gi|N ", trailing space included.
+#
+# Bases: a nucleotide BLAST database stores no case, so blastdbcmd hands back
+# uppercase however soft-masked the input FASTA was.  Reading a FASTA (or a
+# 2bit) keeps the case instead.  RepeatModeler then searches a soft-masked
+# sampleDB-#.fa and RAMExtend extends consensi against a soft-masked
+# genome.2bit; 58% of the lines in one chr7 run's sampleDB-2.fa held
+# soft-masked bases.  So uppercase everything we emit.
+db_fasta() {
+    awk -v xlate="$xlate" "$XLATE_AWK"'
+        BEGIN { load_xlate() }
+        /^>/  { n = substr($1, 2)
+                if (n in fwd) print ">" fwd[n] " "; else print
+                next }
+              { print toupper($0) }'
+}
+
+# "seqID<TAB>length" under the database's names.
+list_ids_lengths() {
+    if [ -z "$xlate" ]; then list_ids_lengths_raw; return; fi
+    list_ids_lengths_raw | awk -F'\t' -v xlate="$xlate" "$XLATE_AWK"'
+        BEGIN { load_xlate() }
+              { print xname($1) "\t" $2 }'
 }
 
 # ── -info ────────────────────────────────────────────────────────────────────
@@ -157,52 +258,107 @@ if [ -n "$entry_batch" ]; then
     names=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_names_XXXXXX")
     trap 'rm -f "$speclist" "$names"' EXIT
     list_ids_lengths | cut -f1 > "$names"
-    awk -v namesfile="$names" '
-         BEGIN { while ((getline nm < namesfile) > 0) have[nm] = 1 }
+    awk -v namesfile="$names" -v xlate="$xlate" "$XLATE_AWK"'
+         BEGIN { load_xlate(); while ((getline nm < namesfile) > 0) have[nm] = 1 }
          {
             if (NF == 0) next
             id = $1
-            if (!(id in have)) { print "[blastdbcmd] Skipped " id > "/dev/stderr"; next }
+            if (!(id in have) && !(id in fwd)) {
+                print "[blastdbcmd] Skipped " id > "/dev/stderr"; next
+            }
+            # The extraction below scans the file, so it needs the stored name.
+            name = rname(id)
             rest = $2
             if (NF >= 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) rest = $2 "-" $3
             if (rest ~ /^[0-9]+-[0-9]+$/) {
                 split(rest, r, "-")
-                printf "%s:%d-%d\n", id, r[1] - 1, r[2]
+                printf "%s:%d-%d\n", name, r[1] - 1, r[2]
             } else {
-                print id
+                print name
             }
          }' "$entry_batch" > "$speclist"
 
     if [ "$dbtype_detected" = "2bit" ]; then
-        "$TWOBITTOFA" -seqList="$speclist" "$dbfile" stdout
+        "$TWOBITTOFA" -seqList="$speclist" "$dbfile" stdout | db_fasta
     else
-        # FASTA backend: hold only the requested sequences in memory, then emit
-        # them in batch order.  Fine for sample databases; a whole-genome FASTA
-        # with a big batch will be memory hungry (use a .2bit there).
-        awk -v speclist="$speclist" '
-            BEGIN {
-                while ((getline line < speclist) > 0) {
-                    nspec++; spec[nspec] = line
-                    id = line; sub(/:[0-9]+-[0-9]+$/, "", id)
-                    want[id] = 1
+        # FASTA backend: read the file once, filling every requested interval
+        # as its bases go past.  Holds only the requested intervals in memory,
+        # not a whole chromosome.
+        #
+        # The old version accumulated each wanted record into an awk array
+        # element ("seq[cur] = seq[cur] $0").  gawk appends in place only for
+        # plain scalars, so every one of a chromosome's millions of sequence
+        # lines reallocated and recopied the whole growing string.  Timed on
+        # prefixes of chr7: 2 MB took 11 s and 5 MB took 81 s, which
+        # extrapolates to roughly a day for the full 160 Mb.  The same
+        # 1000-interval batch now takes 4.6 s.
+        perl -e '
+            my ($speclist, $fasta) = @ARGV;
+            open(my $sl, "<", $speclist) or die "[blastdbcmd] Error: cannot read $speclist: $!\n";
+            my (@spec, %by_id);
+            while (my $line = <$sl>) {
+                chomp $line;
+                next if $line eq "";
+                my ($id, $st, $en) = ($line, 0, -1);
+                if ($line =~ /^(.*):(\d+)-(\d+)$/) { ($id, $st, $en) = ($1, $2, $3) }
+                push @{ $by_id{$id} }, scalar @spec;
+                push @spec, { label => $line, id => $id, st => $st, en => $en, out => "" };
+            }
+            close $sl;
+
+            # Sort the intervals of each record by start, so the scan can
+            # keep a small active set instead of testing every interval
+            # against every line.
+            for my $id (keys %by_id) {
+                @{ $by_id{$id} } = sort { $spec[$a]{st} <=> $spec[$b]{st} } @{ $by_id{$id} };
+            }
+
+            open(my $fh, "<", $fasta) or die "[blastdbcmd] Error: cannot read $fasta: $!\n";
+            my ($cur, $pos, $ni, @active, %seen) = ("", 0, 0);
+            while (my $line = <$fh>) {
+                if (substr($line, 0, 1) eq ">") {
+                    my ($id) = $line =~ /^>(\S*)/;
+                    if (exists $by_id{$id}) { ($cur, $pos, $ni, @active) = ($id, 0, 0, ()) }
+                    else                    { $cur = "" }
+                    next;
+                }
+                next if $cur eq "";
+                $seen{$cur} = 1;
+                $line =~ tr/ \t\r\n//d;
+                my $len = length $line;
+                next if $len == 0;
+                my $end = $pos + $len;
+                my $q = $by_id{$cur};
+                push @active, $q->[$ni++] while $ni < @$q && $spec[$q->[$ni]]{st} < $end;
+                if (@active) {
+                    my @keep;
+                    for my $k (@active) {
+                        my $s = $spec[$k];
+                        my $e = $s->{en};
+                        next if $e >= 0 && $e <= $pos;              # finished earlier
+                        my $a = $s->{st} > $pos ? $s->{st} : $pos;
+                        my $b = ($e >= 0 && $e < $end) ? $e : $end;
+                        $s->{out} .= substr($line, $a - $pos, $b - $a) if $b > $a;
+                        push @keep, $k unless $e >= 0 && $e <= $end;
+                    }
+                    @active = @keep;
+                }
+                $pos = $end;
+                # Nothing left to collect here: skip the rest of the record
+                # instead of stripping whitespace off every line of it.
+                $cur = "" if !@active && $ni >= @$q;
+            }
+            close $fh;
+
+            for my $s (@spec) {
+                if (!$seen{ $s->{id} }) { print STDERR "[blastdbcmd] Skipped $s->{id}\n"; next }
+                print ">", $s->{label}, "\n";
+                my $bases = uc $s->{out};   # a nucleotide BLAST DB has no case
+                for (my $p = 0; $p < length $bases; $p += 50) {
+                    print substr($bases, $p, 50), "\n";
                 }
             }
-            /^>/ { keep = want[substr($1,2)]; if (keep) cur = substr($1,2); else cur = ""; next }
-            cur != "" { gsub(/[ \t\r]/, ""); seq[cur] = seq[cur] $0 }
-            END {
-                for (k = 1; k <= nspec; k++) {
-                    s = spec[k]; id = s; st = 0; en = -1
-                    if (match(s, /:[0-9]+-[0-9]+$/)) {
-                        id = substr(s, 1, RSTART - 1)
-                        split(substr(s, RSTART + 1), r, "-"); st = r[1]; en = r[2]
-                    }
-                    if (!(id in seq)) { print "[blastdbcmd] Skipped " id > "/dev/stderr"; continue }
-                    if (en < 0) en = length(seq[id])
-                    print ">" s
-                    sq = substr(seq[id], st + 1, en - st)
-                    for (p = 1; p <= length(sq); p += 50) print substr(sq, p, 50)
-                }
-            }' "$dbfile"
+        ' "$speclist" "$dbfile"
     fi
     exit $?     # propagate a real extraction failure instead of masking it
 fi
@@ -213,9 +369,9 @@ case "$outfmt" in
     ""|"%f")
         if [ "$entry" = "all" ]; then
             if [ "$dbtype_detected" = "2bit" ]; then
-                "$TWOBITTOFA" "$dbfile" stdout
+                "$TWOBITTOFA" "$dbfile" stdout | db_fasta
             else
-                cat "$dbfile"
+                db_fasta < "$dbfile"
             fi
         else
             if [ "$dbtype_detected" = "2bit" ]; then
@@ -225,10 +381,13 @@ case "$outfmt" in
                 # handles those, and 'gi|N', fine.
                 one=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_seq_XXXXXX")
                 trap 'rm -f "$one"' EXIT
-                printf '%s\n' "$entry" > "$one"
-                "$TWOBITTOFA" -seqList="$one" "$dbfile" stdout
+                raw_name "$entry" > "$one"
+                "$TWOBITTOFA" -seqList="$one" "$dbfile" stdout | db_fasta
             else
-                awk -v want="$entry" '/^>/ { p = (substr($1,2) == want) } p' "$dbfile"
+                awk -v want="$entry" -v xlate="$xlate" "$XLATE_AWK"'
+                    BEGIN { load_xlate() }
+                    /^>/  { p = (xname(substr($1, 2)) == want) }
+                    p' "$dbfile" | db_fasta
             fi
         fi
         ;;

@@ -1,16 +1,22 @@
 # RMBlast — Rust port
 
-A Rust reimplementation of `rmblastn`, the RepeatMasker-specific nucleotide
-search program from RMBlast.
+A Rust reimplementation of `rmblastn`, the RepeatMasker nucleotide alignment
+program.
 
-Given the same FASTA database, it reproduces NCBI RMBlast 2.17.1 output byte for
-byte. Two things change that, both covered below: a `.2bit` database loses IUB
-ambiguity codes, and E-value culling is off by default unless you pass
-`--ncbi-compat`.
+***THIS IS AN EXPERIMENTAL PORT and should not be used with the current releases
+   of RepeatMasker or RepeatModeler in production settings at this time. For the
+   current supported version please see: http://www.repeatmasker.org/rmblast***
 
-The package also ships a `dustmasker` that is a drop-in for the NCBI application
-of the same name, and wrapper scripts that let RepeatMasker and RepeatModeler
-use the port unmodified.
+Given the same FASTA formatted database, it reproduces NCBI RMBlast 2.17.1 output 
+faithfully. In addition, we have switched out the NCBI database format for the UCSC
+twobit format (currently without IUB support).  In addition, in this port E-value
+culling is off by default unless you pass the `--ncbi-compat` flag.
+
+The package also ships a `dustmasker` port that is a drop-in for the NCBI application
+of the same name, and wrapper scripts that support testing of this port with 
+the current version of RepeatMasker (nucleotide tools only).  RepeatModeler can als
+be tested using the wrapper scripts, however, there is a dependency on blastx in
+the last classification step that this package does not provide. 
 
 ## What this is a port of
 
@@ -18,18 +24,14 @@ The algorithms here were translated from two sources, both in the public domain:
 
 - NCBI BLAST 2.17.0 C++ toolkit: the lookup table, ungapped and gapped
   extension, traceback, DUST filtering, and Karlin-Altschul statistics.
-- The rmblastn extensions in RMBlast 2.17.1, by Robert Hubley, Arian Smit, and
-  Jeb Rosen at the Institute for Systems Biology. These are what separate
+- The rmblastn extensions in RMBlast 2.17.1, by Robert Hubley
+  at the Institute for Systems Biology. These are what separate
   `rmblastn` from stock `blastn`: custom scoring matrices without
   Karlin-Altschul statistics, cross_match-style complexity-adjusted scoring, and
   cross_match-style masklevel filtering.
 
 We ported from the C sources rather than from NCBI's output. Where NCBI has a
-quirk that changes results, the port reproduces it on purpose. We keep the
-reasoning in maintainer notes outside this repository: `PORTING_NOTES.md` for
-the faithfulness calls, `DESIGN_NOTES.md` for the places the port had a real
-choice. What those decisions mean for you is under "Known differences from
-NCBI" below.
+quirk that changes results, the port reproduces it on purpose. 
 
 ## Requirements
 
@@ -188,6 +190,13 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   across all three output formats.
 - The `blastdbcmd` and `blastdb_aliastool` wrappers cover what RepeatMasker and
   RepeatModeler call, not the full tools. Unsupported options exit non-zero.
+- `blastdbcmd` reads the `.2bit` our `makeblastdb` writes or a FASTA beside the
+  database, never an NCBI BLAST index. For a database BuildDatabase built with
+  the real NCBI `makeblastdb`, it therefore falls back to BuildDatabase's input
+  FASTA, and reads `<db>.translation` so that it still reports the `gi|N` names
+  the index holds. It also uppercases the bases, the way a nucleotide database
+  does. RepeatModeler's Refiner needs the names; RAMExtend and the round
+  searches see the case.
 
 ## Repository layout
 
