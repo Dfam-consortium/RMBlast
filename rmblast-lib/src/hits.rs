@@ -107,3 +107,27 @@ pub struct Hsp {
     /// Subject bases in alignment (BLASTNA; gaps encoded as 15).
     pub s_seq: Vec<u8>,
 }
+
+impl Hsp {
+    /// Query span as NCBI stores it: on the minus strand the offsets are
+    /// positions in the reverse-complemented query.
+    pub fn ncbi_query_span(&self) -> (u32, u32) {
+        match self.strand {
+            Strand::Plus => (self.q_start, self.q_end),
+            Strand::Minus => (self.q_len - self.q_end, self.q_len - self.q_start),
+        }
+    }
+}
+
+/// NCBI's `ScoreCompareHSPs` (blast_hits.c): score DESC, subject offset ASC,
+/// subject end DESC, query offset ASC, query end DESC, with the query offsets
+/// taken in NCBI's strand-context coordinates.
+pub fn score_compare_hsps(a: &Hsp, b: &Hsp) -> std::cmp::Ordering {
+    let (q_off_a, q_end_a) = a.ncbi_query_span();
+    let (q_off_b, q_end_b) = b.ncbi_query_span();
+    b.score.cmp(&a.score)
+        .then_with(|| a.s_start.cmp(&b.s_start))
+        .then_with(|| b.s_end.cmp(&a.s_end))
+        .then_with(|| q_off_a.cmp(&q_off_b))
+        .then_with(|| q_end_b.cmp(&q_end_a))
+}

@@ -103,8 +103,10 @@ near the top of `rmblastn` to exec `$NCBI_RMBLASTN --version` instead.
   return code.
 - A one-line `# verify rmblastn: Rust MATCHES NCBI (...)` note is printed to
   STDERR on a clean match.
-- On any mismatch (different output lines, or either engine exiting non-zero) a
-  preview is printed to STDERR and a full bundle is saved.
+- On any mismatch (different output lines, the same lines in a different
+  order, or either engine exiting non-zero) the wrapper prints a preview to
+  STDERR and saves a full bundle.  The log status is `MISMATCH`, `ORDER`, or
+  `ERROR`.
 
 ## Mismatch bundles
 
@@ -114,7 +116,8 @@ subdirectory containing:
 
 - the query FASTA, the database FASTA + its BLAST index files, the matrix
 - `ncbi.tab` / `rust.tab` — raw outputs, and `*.stderr` captures
-- `diff.txt` — `<` lines are NCBI-only, `>` lines are Rust-only
+- `diff.txt` — `<` lines are NCBI-only, `>` lines are Rust-only; for an
+  order-only mismatch, a plain diff of the two raw outputs
 - `commands.txt` — the exact invocations and `BLASTMAT`
 - `reproduce.sh` — reruns both engines against the copied-in files and diffs
 

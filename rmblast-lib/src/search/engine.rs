@@ -18,6 +18,7 @@
 //!
 //! Threading: parallelism is over subject sequences (see search_db_parallel in main.rs).
 
+use crate::hits::score_compare_hsps;
 use crate::search::diag_hash::BlastDiagHash;
 use crate::search::itree::{BlastIntervalTree, ITreeHsp};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1076,6 +1077,39 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
 
     let mut j = 0;
     results.retain(|_| { let k = keep[j]; j += 1; k });
+}
+
+/// Puts one query's results in the order NCBI hands to its formatters.
+///
+/// After traceback NCBI sorts the hit list with `s_EvalueCompareHSPLists`
+/// (best e-value ASC, top score DESC, oid DESC) and each subject's HSPs with
+/// `s_EvalueCompareHSPs` (e-value ASC, then `ScoreCompareHSPs`), and both the
+/// tabular and the pairwise formatter print in that order: every HSP of one
+/// subject, then the next subject.  Within one query the e-value is a monotone
+/// function of the score (and a constant sentinel for table matrices), so the
+/// e-value keys never reorder anything the score keys do not, and this
+/// function sorts on the score keys only.  `oid` is the index in `subject_names`; unknown names get
+/// oid 0, as in `apply_mask_level`.
+pub fn sort_hit_list_order(results: &mut [AlignResult], subject_names: &[String]) {
+    let oid_map: std::collections::HashMap<&str, usize> = subject_names.iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
+    // (top score, oid) per subject, keyed by owned name so the map does not
+    // borrow `results` while we sort it.
+    let mut rank: std::collections::HashMap<String, (i32, usize)> = std::collections::HashMap::new();
+    for r in results.iter() {
+        let oid = oid_map.get(r.subject_id.as_str()).copied().unwrap_or(0);
+        let e = rank.entry(r.subject_id.clone()).or_insert((i32::MIN, oid));
+        e.0 = e.0.max(r.hsp.score);
+    }
+    results.sort_by(|a, b| {
+        let (best_a, oid_a) = rank[a.subject_id.as_str()];
+        let (best_b, oid_b) = rank[b.subject_id.as_str()];
+        best_b.cmp(&best_a)
+            .then_with(|| oid_b.cmp(&oid_a))
+            .then_with(|| score_compare_hsps(&a.hsp, &b.hsp))
+    });
 }
 
 /// Phase 1: scan and collect all passing ungapped hits for one strand.
@@ -4096,5 +4130,61 @@ mod tests {
             assert_eq!(s_start, 3629, "seed7 s_start");
             assert_eq!(s_end,   3649, "seed7 s_end");
         }
+    }
+}
+
+#[cfg(test)]
+mod hit_list_order_tests {
+    use super::sort_hit_list_order;
+    use crate::hits::{EditScript, Hsp, Strand};
+    use crate::output::AlignResult;
+    use crate::stats::AlignStats;
+
+    fn hit(subject: &str, score: i32, q_start: u32, q_end: u32, s_start: u32, s_end: u32, strand: Strand) -> AlignResult {
+        AlignResult {
+            hsp: Hsp {
+                score, q_start, q_end, q_len: 1000, s_start, s_end, s_len: 500, strand,
+                edit_script: EditScript::new(), q_seq: Vec::new(), s_seq: Vec::new(),
+            },
+            query_id: "q".to_string(),
+            subject_id: subject.to_string(),
+            stats: AlignStats::default(),
+        }
+    }
+
+    fn key(r: &AlignResult) -> (String, i32, u32) {
+        (r.subject_id.clone(), r.hsp.score, r.hsp.q_start)
+    }
+
+    /// Subjects come out grouped and ranked by their top score, tied top
+    /// scores by higher oid first, and each subject's HSPs in
+    /// ScoreCompareHSPs order (NCBI measures the minus-strand query offset in
+    /// reverse-complement coordinates).
+    #[test]
+    fn groups_by_subject_and_ranks_like_ncbi() {
+        let names: Vec<String> = ["s0", "s1", "s2"].iter().map(|s| s.to_string()).collect();
+        let mut results = vec![
+            hit("s1", 300, 10, 50, 0, 40, Strand::Plus),
+            hit("s0", 900, 100, 200, 0, 100, Strand::Plus),
+            hit("s2", 900, 300, 400, 0, 100, Strand::Plus),
+            hit("s1", 700, 500, 600, 0, 100, Strand::Plus),
+            hit("s0", 100, 700, 720, 0, 20, Strand::Plus),
+            // Same score and subject span: minus-strand q_off = 1000-960 = 40,
+            // which sorts before the plus-strand q_off of 60.
+            hit("s2", 500, 60, 80, 0, 20, Strand::Plus),
+            hit("s2", 500, 940, 960, 0, 20, Strand::Minus),
+        ];
+        sort_hit_list_order(&mut results, &names);
+        let got: Vec<_> = results.iter().map(key).collect();
+        let want = vec![
+            ("s2".to_string(), 900, 300),
+            ("s2".to_string(), 500, 940),
+            ("s2".to_string(), 500, 60),
+            ("s0".to_string(), 900, 100),
+            ("s0".to_string(), 100, 700),
+            ("s1".to_string(), 700, 500),
+            ("s1".to_string(), 300, 10),
+        ];
+        assert_eq!(got, want);
     }
 }

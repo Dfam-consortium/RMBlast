@@ -9,7 +9,7 @@ program.
 
 Given the same FASTA formatted database, it reproduces NCBI RMBlast 2.17.1 output 
 faithfully. In addition, we have switched out the NCBI database format for the UCSC
-twobit format (currently without IUB support).  In addition, in this port E-value
+twobit format (currently without IUB support).  Finally, in this port E-value
 culling is off by default unless you pass the `--ncbi-compat` flag.
 
 The package also ships a `dustmasker` port that is a drop-in for the NCBI application

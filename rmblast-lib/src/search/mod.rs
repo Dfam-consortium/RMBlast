@@ -12,7 +12,7 @@ pub use gapped::DpCell;
 pub use complexity_adjust::apply_complexity_adjust;
 pub use ka_cutoff::{ungapped_cutoff, KaCutoffInfo};
 pub use engine::{
-    apply_mask_level,
+    apply_mask_level, sort_hit_list_order,
     build_query_lookup, build_query_lookup_premask, mask_query_for_alignment,
     search_query_vs_subject, search_with_query_lookup,
     search_with_query_lookup_seeds, search_with_query_lookup_ungapped,

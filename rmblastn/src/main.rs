@@ -18,7 +18,7 @@ use rmblast_lib::output::{
     outfmt_needs_stats, parse_outfmt, write_tabular, write_pairwise_program_header,
     write_pairwise_results, write_pairwise_footer, AlignResult, OutField,
 };
-use rmblast_lib::search::{apply_mask_level, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
+use rmblast_lib::search::{apply_mask_level, sort_hit_list_order, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
 // use rmblast_lib::search::engine::{COUNT_SEEDS, COUNT_UNGAPPED_HITS, COUNT_PRELIM_GAPPED, COUNT_FINAL_GAPPED, COUNT_FINAL_HITS};
 // use rmblast_lib::search::gapped::TOTAL_DP_CELLS;
@@ -664,19 +664,7 @@ fn main() -> Result<()> {
                     avg_subj_length, args.dump_prelims.as_deref(), prelim_cull,
                     reap_for_query(full_q_len as i32),
                 );
-                results.sort_by(|a, b| {
-                    let qa = a.hsp.q_len;
-                    let qb = b.hsp.q_len;
-                    let q_off_a = match a.hsp.strand { Strand::Plus => a.hsp.q_start, Strand::Minus => qa - a.hsp.q_end };
-                    let q_off_b = match b.hsp.strand { Strand::Plus => b.hsp.q_start, Strand::Minus => qb - b.hsp.q_end };
-                    let q_end_a = match a.hsp.strand { Strand::Plus => a.hsp.q_end, Strand::Minus => qa - a.hsp.q_start };
-                    let q_end_b = match b.hsp.strand { Strand::Plus => b.hsp.q_end, Strand::Minus => qb - b.hsp.q_start };
-                    b.hsp.score.cmp(&a.hsp.score)
-                        .then_with(|| a.hsp.s_start.cmp(&b.hsp.s_start))
-                        .then_with(|| b.hsp.s_end.cmp(&a.hsp.s_end))
-                        .then_with(|| q_off_a.cmp(&q_off_b))
-                        .then_with(|| q_end_b.cmp(&q_end_a))
-                });
+                sort_hit_list_order(&mut results, &subject_names);
                 match &output_format {
                     OutputFormat::Pairwise => {
                         write_pairwise_results(&mut out, &results, &qrec.defline, full_q_len)
@@ -703,7 +691,7 @@ fn main() -> Result<()> {
                         avg_subj_length, None, prelim_cull,
                         reap_for_query(q.len() as i32),
                     );
-                    qr.sort_by(|a, b| b.hsp.score.cmp(&a.hsp.score));
+                    sort_hit_list_order(&mut qr, &subject_names);
                     qr
                 })
                 .collect();

@@ -12,7 +12,10 @@
 #      the FASTA file as its database (NOT a .2bit file) -- only the FASTA is
 #      guaranteed to reproduce NCBI's ambiguity-code handling.
 #   3. The two result sets are compared as a sorted multiset of output lines
-#      (the same comparison alignVerify.pl performs).
+#      (the same comparison alignVerify.pl performs), and then line by line
+#      in output order: NCBI's final sort is deterministic and the Rust port
+#      reproduces it, so a matching multiset in a different order is also a
+#      mismatch (status ORDER).
 #   4. If they differ, a per-failure directory of inputs / parameters / outputs /
 #      diff / reproduce.sh is written under $RMBLAST_VERIFY_DIR
 #      (default: ./rmblast_verify_failures).
@@ -20,7 +23,7 @@
 #      deployment); the wrapper exits with the Rust engine's return code.
 #   6. EVERY invocation appends one stats line to $RMBLAST_VERIFY_DIR/
 #      verify_log.tsv (datetime, query, db, per-engine runtime and peak RSS,
-#      hit counts, diff count, PASS/MISMATCH/ERROR status, bundle name).  The
+#      hit counts, diff count, PASS/MISMATCH/ORDER/ERROR status, bundle name).  The
 #      directory is created unconditionally for the log; mismatch bundles are
 #      still written only on failure.  Runtime/RSS figures cover the
 #      comparison runs; the extra caller-format Rust pass that non-tabular
@@ -385,7 +388,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Compare results as a sorted multiset of non-blank lines.
+# 5. Compare results as a sorted multiset of non-blank lines, then in output
+#    order.  The multiset diff shows which alignments differ; the ordered diff
+#    catches the right alignments in the wrong order.
 # ---------------------------------------------------------------------------
 sort "$ncbi_tab" | grep -v '^[[:space:]]*$' > "$tmpdir/ncbi.sorted"
 sort "$rust_tab" | grep -v '^[[:space:]]*$' > "$tmpdir/rust.sorted"
@@ -400,8 +405,18 @@ comm -23 "$tmpdir/ncbi.sorted" "$tmpdir/rust.sorted" > "$only_ncbi"
 comm -13 "$tmpdir/ncbi.sorted" "$tmpdir/rust.sorted" > "$only_rust"
 num_diffs=$(( $(wc -l < "$only_ncbi") + $(wc -l < "$only_rust") ))
 
+grep -v '^[[:space:]]*$' "$ncbi_tab" > "$tmpdir/ncbi.ordered"
+grep -v '^[[:space:]]*$' "$rust_tab" > "$tmpdir/rust.ordered"
+order_diff="$tmpdir/order_diff"
+: > "$order_diff"
+order_diffs=0
+if [ "$num_diffs" -eq 0 ] && ! cmp -s "$tmpdir/ncbi.ordered" "$tmpdir/rust.ordered"; then
+    diff "$tmpdir/ncbi.ordered" "$tmpdir/rust.ordered" > "$order_diff"
+    order_diffs=$(grep -c '^[<>]' "$order_diff")
+fi
+
 dir=""   # failure-bundle directory (set only on mismatch; logged below)
-if [ "$ncbi_rc" -eq 0 ] && [ "$rust_rc" -eq 0 ] && [ "$num_diffs" -eq 0 ]; then
+if [ "$ncbi_rc" -eq 0 ] && [ "$rust_rc" -eq 0 ] && [ "$num_diffs" -eq 0 ] && [ "$order_diffs" -eq 0 ]; then
     echo "# verify rmblastn: Rust MATCHES NCBI ($ncbi_n alignments, 0 diffs)" >&2
 else
     # ---- Mismatch: report to STDERR and archive a debug bundle ----
@@ -411,10 +426,15 @@ else
     echo "#   NCBI exit : $ncbi_rc, hits: $ncbi_n" >&2
     echo "#   Rust exit : $rust_rc, hits: $rust_n" >&2
     echo "#   diff lines: $num_diffs (only-NCBI=$(wc -l < "$only_ncbi"), only-Rust=$(wc -l < "$only_rust"))" >&2
+    [ "$order_diffs" -gt 0 ] && echo "#   same alignments, different output order: $order_diffs lines out of place" >&2
     echo "##############################################################" >&2
 
     # Preview up to 20 diff lines on STDERR.
-    { sed 's/^/< /' "$only_ncbi"; sed 's/^/> /' "$only_rust"; } | head -20 >&2
+    if [ "$order_diffs" -gt 0 ]; then
+        grep '^[<>]' "$order_diff" | head -20 >&2
+    else
+        { sed 's/^/< /' "$only_ncbi"; sed 's/^/> /' "$only_rust"; } | head -20 >&2
+    fi
 
     mkdir -p "$VERIFY_DIR"
     stem="$(basename "${db_base:-db}")_$(date +%s)_$$"
@@ -464,6 +484,10 @@ else
         echo "# '>' lines were produced by the Rust port but not NCBI rmblastn"
         sed 's/^/< /' "$only_ncbi"
         sed 's/^/> /' "$only_rust"
+        if [ "$order_diffs" -gt 0 ]; then
+            echo "# Same alignments in a different order (diff of the raw outputs, NCBI first):"
+            cat "$order_diff"
+        fi
     } > "$dir/diff.txt"
 
     # commands.txt: exact invocations (BLASTMAT is inherited from the caller).
@@ -512,13 +536,16 @@ else
         echo ""
         echo "echo '== NCBI rmblastn =='"
         printf '%q ' "$NCBI_RMBLASTN"; for t in "${ncbi_run[@]}"; do relocal "$t"; done
-        echo "2>ncbi.repro.stderr | sort > ncbi.repro.tab"
+        echo "2>ncbi.repro.stderr > ncbi.repro.tab"
         echo ""
         echo "echo '== Rust rmblastn =='"
         printf '%q ' "$REAL_RMBLASTN"; for t in "${rust_run[@]}"; do relocal "$t"; done
-        echo "2>rust.repro.stderr | sort > rust.repro.tab"
+        echo "2>rust.repro.stderr > rust.repro.tab"
         echo ""
-        echo "echo '== diff (NCBI vs Rust) =='"
+        echo "echo '== diff (NCBI vs Rust, as sorted multisets) =='"
+        echo "sort ncbi.repro.tab > ncbi.repro.sorted; sort rust.repro.tab > rust.repro.sorted"
+        echo "diff ncbi.repro.sorted rust.repro.sorted"
+        echo "echo '== diff (NCBI vs Rust, in output order) =='"
         echo "diff ncbi.repro.tab rust.repro.tab"
     } > "$dir/reproduce.sh"
     chmod 0755 "$dir/reproduce.sh"
@@ -538,8 +565,10 @@ ncbi_sec="-"; ncbi_rss="-"; rust_sec="-"; rust_rss="-"
 [ -s "$tmpdir/rust.time" ] && read -r rust_sec rust_rss <<< "$(tail -n 1 "$tmpdir/rust.time")"
 if [ "$ncbi_rc" -ne 0 ] || [ "$rust_rc" -ne 0 ]; then
     status="ERROR(ncbi=$ncbi_rc,rust=$rust_rc)"
-elif [ "$num_diffs" -eq 0 ]; then
+elif [ "$num_diffs" -eq 0 ] && [ "$order_diffs" -eq 0 ]; then
     status="PASS"
+elif [ "$num_diffs" -eq 0 ]; then
+    status="ORDER"
 else
     status="MISMATCH"
 fi
@@ -554,7 +583,7 @@ printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date '+%Y-%m-%d %H:%M:%S')" \
     "$(basename "${qf:-?}")" "$(basename "${db_base:-?}")" \
     "$ncbi_sec" "$rust_sec" "$ncbi_rss" "$rust_rss" \
-    "$ncbi_n" "$rust_n" "$num_diffs" "$status" "$bundle" >> "$log"
+    "$ncbi_n" "$rust_n" "$(( num_diffs + order_diffs ))" "$status" "$bundle" >> "$log"
 
 # ---------------------------------------------------------------------------
 # 6. Emit the Rust output (in the caller's requested format) to the caller and
