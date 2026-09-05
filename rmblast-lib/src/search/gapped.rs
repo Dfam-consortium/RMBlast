@@ -105,12 +105,11 @@ pub fn align_ex_score_only(
     matrix: &ScoreMatrix,
     reverse: bool,
     dp: &mut Vec<DpCell>,
-    dump: bool,
 ) -> (i32, usize, usize) {
     if reverse {
-        align_ex_score_only_inner::<true>(a, b, m, n, gap_open, gap_extend, x_dropoff, matrix, dp, dump)
+        align_ex_score_only_inner::<true>(a, b, m, n, gap_open, gap_extend, x_dropoff, matrix, dp)
     } else {
-        align_ex_score_only_inner::<false>(a, b, m, n, gap_open, gap_extend, x_dropoff, matrix, dp, dump)
+        align_ex_score_only_inner::<false>(a, b, m, n, gap_open, gap_extend, x_dropoff, matrix, dp)
     }
 }
 
@@ -125,7 +124,6 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
     x_dropoff: i32,
     matrix: &ScoreMatrix,
     dp: &mut Vec<DpCell>,
-    dump: bool,
 ) -> (i32, usize, usize) {
     let m = m.min(a.len());
     let n = n.min(b.len());
@@ -283,7 +281,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
         }
 
         if best_score > prev_best { best_a = a_idx + 1; }
-        if dump && !REVERSE {
+        if crate::diag_enabled!("RMBLAST_DUMP_DP_ROWS") && !REVERSE {
             eprintln!("ROW_R a={} fbi={} bsz={} prev={} best={} best_b={}",
                 a_idx, first_b_index, b_size, prev_best, best_score, best_b);
         }
@@ -354,7 +352,6 @@ pub fn gapped_extend_score_only(
     xdrop: i32,
     matrix: &ScoreMatrix,
     dp: &mut Vec<DpCell>,
-    dump: bool,
 ) -> Option<(i32, u32, u32, u32, u32)> {
     let qa = &query[1..query.len() - 1];
     let sa = &subject[1..subject.len() - 1];
@@ -374,7 +371,7 @@ pub fn gapped_extend_score_only(
     let (ls, la, lb) = align_ex_score_only(
         &sa[..left_m], &qa[..left_n],
         left_m, left_n,
-        gap_open, gap_extend, xdrop, matrix, true, dp, false,
+        gap_open, gap_extend, xdrop, matrix, true, dp,
     );
     let s_start = s_seed - la as u32;
     let q_start = q_seed - lb as u32;
@@ -385,7 +382,7 @@ pub fn gapped_extend_score_only(
     let rs = s_seed as usize;
     let right_m = sa.len().saturating_sub(rs);
     let right_n = qa.len().saturating_sub(rq);
-    if dump {
+    if crate::diag_enabled!("RMBLAST_DUMP_DP_ROWS") {
         eprintln!("RIGHT_EXT s_seed={} q_seed={} right_m={} right_n={} xdrop={}",
             s_seed, q_seed, right_m, right_n, xdrop);
     }
@@ -393,7 +390,7 @@ pub fn gapped_extend_score_only(
         align_ex_score_only(
             &sa[rs..], &qa[rq..],
             right_m, right_n,
-            gap_open, gap_extend, xdrop, matrix, false, dp, dump,
+            gap_open, gap_extend, xdrop, matrix, false, dp,
         )
     } else { (0, 0, 0) };
 
@@ -872,7 +869,7 @@ T -4  -4  -4   5
             let xdrop = 1 + (next() % 20) as i32;
             for &reverse in &[true, false] {
                 let (score, ..) = align_ex_score_only(
-                    &a, &b, alen, blen, 8, 2, xdrop, &m, reverse, &mut dp, false,
+                    &a, &b, alen, blen, 8, 2, xdrop, &m, reverse, &mut dp,
                 );
                 assert!(score >= 0, "trial {} reverse {} score {}", trial, reverse, score);
             }

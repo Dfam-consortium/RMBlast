@@ -53,7 +53,7 @@ make install PREFIX=/opt  # -> /opt/rmblast-<version>/
 
 The default build leaves out the stage counters and dump hooks
 (`RMBLAST_DP_STATS`, `RMBLAST_DEBUG_COUNTERS`, `BLAST_DUMP_SEEDS`,
-`RMBLAST_DUMP_IMPROVE`). To get them, build with the `diagnostics` feature:
+`RMBLAST_DUMP_IMPROVE`, `RMBLAST_DUMP_DP_ROWS`). To get them, build with the `diagnostics` feature:
 
 ```sh
 cargo build --release --features diagnostics

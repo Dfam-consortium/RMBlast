@@ -1673,7 +1673,6 @@ fn run_phase2a_inner(
             params.gap_open, params.gap_extend,
             phase2a_xdrop,
             matrix, &mut ws.dp_score,
-            false,
         );
 
         let (prelim_score, q_start, q_end, s_start, s_end) = match prelim {
@@ -2394,7 +2393,6 @@ fn run_gapped_phase<U: UngapOut>(
             params.gap_open, params.gap_extend,
             phase2a_xdrop,
             matrix, &mut ws.dp_score,
-            false,
         );
 
         let (prelim_score, q_start, q_end, s_start, s_end) = match prelim {
