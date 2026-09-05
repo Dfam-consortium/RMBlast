@@ -21,17 +21,24 @@
 use crate::hits::score_compare_hsps;
 use crate::search::diag_hash::BlastDiagHash;
 use crate::search::itree::{BlastIntervalTree, ITreeHsp};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::AtomicU64;
 
+#[cfg(feature = "diagnostics")]
 pub static COUNT_SEEDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
 pub static COUNT_UNGAPPED_HITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
 pub static COUNT_PRELIM_GAPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
 pub static COUNT_FINAL_GAPPED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
 pub static COUNT_FINAL_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: times `improve_seed`'s minus branch produced a negative
 /// `max_offset` and fell back to the unimproved seed.  Expected to stay at 0 — it is
 /// only reachable at `score == 1` with the scan pinned to the array start.
+#[cfg(feature = "diagnostics")]
 pub static IMPROVE_SEED_NEGATIVE_OFFSET: AtomicU64 = AtomicU64::new(0);
 
 use crate::blast::mblookup::{blast_mb_lookup_table_new, blast_mb_scan_subject, BlastMBLookupTable};
@@ -520,7 +527,7 @@ fn improve_seed(
                 // NCBI's frame keeps this non-negative, so there is no faithful value to
                 // mirror; fall back to NCBI's no-improvement outcome rather than emit a
                 // wrapped seed (which is what the usize arithmetic used to return).
-                IMPROVE_SEED_NEGATIVE_OFFSET.fetch_add(1, Ordering::Relaxed);
+                crate::diag_count!(IMPROVE_SEED_NEGATIVE_OFFSET);
                 return (q_seed as u32, s_seed as u32);
             }
             let delta = search_q_top as i64 - max_offset;
@@ -1279,13 +1286,13 @@ fn collect_ungapped<S: SeedOut>(
                     if s_off < last_se { continue; }
 
                     seed_out.push_seed(SeedRecord { q_off, s_off, strand: Strand::Plus });
-                    COUNT_SEEDS.fetch_add(1, Ordering::Relaxed);
+                    crate::diag_count!(COUNT_SEEDS);
                     let raw_p = extend_ungapped(query, subject, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
                     let s_end_store = if raw_p.score >= ungapped_cutoff { raw_p.s_end } else { s_off + params.word_size as u32 };
                     diag_hash.insert(diag, s_end_store, s_off, 1 - params.word_size as i32);
                     if raw_p.score < ungapped_cutoff { continue; }
                     let ung = raw_p;
-                    COUNT_UNGAPPED_HITS.fetch_add(1, Ordering::Relaxed);
+                    crate::diag_count!(COUNT_UNGAPPED_HITS);
                     ungapped.push(UngappedRecord {
                         q_seed: q_off, s_seed: s_off,
                         q_start: ung.q_start, q_end: ung.q_end,
@@ -1319,7 +1326,7 @@ fn collect_ungapped<S: SeedOut>(
 
             let s_seed = s_len.saturating_sub(s_off + params.word_size as u32);
             seed_out.push_seed(SeedRecord { q_off, s_off: s_seed, strand: Strand::Minus });
-            COUNT_SEEDS.fetch_add(1, Ordering::Relaxed);
+            crate::diag_count!(COUNT_SEEDS);
             let qn = q_len_local - 1 - q_off;
             let sn = s_len - 1 - s_off;
             let raw_ncbi = extend_ungapped(&query_rc_full, &subject_fwd, qn, sn, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
@@ -1334,7 +1341,7 @@ fn collect_ungapped<S: SeedOut>(
             diag_hash.insert(diag, fwd_se_store, fwd_s_start, 1 - params.word_size as i32);
             if raw_m.score < ungapped_cutoff { continue; }
             let ung = raw_m;
-            COUNT_UNGAPPED_HITS.fetch_add(1, Ordering::Relaxed);
+            crate::diag_count!(COUNT_UNGAPPED_HITS);
             ungapped.push(UngappedRecord {
                 q_seed: q_off, s_seed: s_off,
                 q_start: ung.q_start, q_end: ung.q_end,
@@ -1453,18 +1460,18 @@ fn collect_ungapped_combined<S: SeedOut>(
                 // which passes the left-shifted s_offset to s_BlastnDiagHashExtendInitialHit.
                 if s_off < last_se { continue; }
 
-                if std::env::var("BLAST_DUMP_SEEDS").is_ok() {
+                if crate::diag_enabled!("BLAST_DUMP_SEEDS") {
                     eprintln!("SEED strand=+ q={} s={}", q_off, s_off);
                 }
                 seed_out.push_seed(SeedRecord { q_off, s_off, strand: Strand::Plus });
-                COUNT_SEEDS.fetch_add(1, Ordering::Relaxed);
+                crate::diag_count!(COUNT_SEEDS);
                 // NCBI: mask_at_hash=TRUE — unmasked query for ungapped extension scoring.
                 let raw_plus = extend_ungapped(query, subject_plus, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
                 let s_end_store = if raw_plus.score >= ungapped_cutoff { raw_plus.s_end } else { s_off + params.word_size as u32 };
                 diag_hash.insert(diag, s_end_store, s_off, 1 - params.word_size as i32);
                 if raw_plus.score < ungapped_cutoff { continue; }
                 let ung = raw_plus;
-                COUNT_UNGAPPED_HITS.fetch_add(1, Ordering::Relaxed);
+                crate::diag_count!(COUNT_UNGAPPED_HITS);
                 ungapped.push(UngappedRecord {
                     q_seed: q_off, s_seed: s_off,
                     q_start: ung.q_start, q_end: ung.q_end,
@@ -1525,11 +1532,11 @@ fn collect_ungapped_combined<S: SeedOut>(
 
                 let q_seed = q_off.saturating_sub(ext_needed.max(0) as u32);
                 let s_seed = s_len.saturating_sub(s_off + lw as u32);
-                if std::env::var("BLAST_DUMP_SEEDS").is_ok() {
+                if crate::diag_enabled!("BLAST_DUMP_SEEDS") {
                     eprintln!("SEED strand=- q={} s={}", q_seed, s_seed);
                 }
                 seed_out.push_seed(SeedRecord { q_off: q_seed, s_off: s_seed, strand: Strand::Minus });
-                COUNT_SEEDS.fetch_add(1, Ordering::Relaxed);
+                crate::diag_count!(COUNT_SEEDS);
                 // Ungapped extension in NCBI's native (RC_query, FWD_subject) frame.
                 // Map the (FWD_q, RC_s) anchor to (RC_q, FWD_s): qn = q_len-1-q_off,
                 // sn = s_len-1-s_off.  Using the plus-strand code (left=fixed, right=adaptive)
@@ -1555,7 +1562,7 @@ fn collect_ungapped_combined<S: SeedOut>(
                 diag_hash.insert(diag, fwd_se_store, s_fwd_eff, 1 - params.word_size as i32);
                 if raw_minus.score < ungapped_cutoff { continue; }
                 let ung = raw_minus;
-                COUNT_UNGAPPED_HITS.fetch_add(1, Ordering::Relaxed);
+                crate::diag_count!(COUNT_UNGAPPED_HITS);
                 ungapped.push(UngappedRecord {
                     q_seed: q_off, s_seed: s_off,
                     q_start: ung.q_start, q_end: ung.q_end,
@@ -1660,7 +1667,7 @@ fn run_phase2a_inner(
             (query, subject_plus, q_seed_prelim, s_seed_prelim)
         };
         let phase2a_xdrop = params.xdrop_gap.min(ung.score);
-        COUNT_PRELIM_GAPPED.fetch_add(1, Ordering::Relaxed);
+        crate::diag_count!(COUNT_PRELIM_GAPPED);
         let prelim = gapped_extend_score_only(
             pq_seq, ps_seq, pq_seed, ps_seed,
             params.gap_open, params.gap_extend,
@@ -1811,7 +1818,7 @@ pub fn run_phase2b(
             phsp.s_start, phsp.s_end,
             phsp.strand == Strand::Minus,
         );
-        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
             eprintln!("RUST_IMPROVE strand={:?} prelim q=[{},{}] s=[{},{}] seed=({},{}) -> ({},{})",
                 phsp.strand, phsp.q_start, phsp.q_end, phsp.s_start, phsp.s_end,
                 phsp.q_seed, phsp.s_seed, new_q_seed, new_s_seed);
@@ -1825,14 +1832,14 @@ pub fn run_phase2b(
             (query, subject_plus, new_q_seed, new_s_seed)
         };
 
-        COUNT_FINAL_GAPPED.fetch_add(1, Ordering::Relaxed);
+        crate::diag_count!(COUNT_FINAL_GAPPED);
         let gapped = gapped_extend_bidirectional(
             tq_seq, ts_seq, tq_seed, ts_seed,
             params.gap_open, params.gap_extend,
             params.xdrop_gap_final,
             matrix, &mut ws,
         );
-        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
             if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
                 eprintln!("RUST_TB seed=({},{}) -> score={} q=[{},{}] s=[{},{}]",
                     tq_seed, ts_seed, sc, q0, q1, s0, s1);
@@ -1891,7 +1898,7 @@ pub fn run_phase2b(
             Strand::Minus => (q_start, q_end, s_len - s_end, s_len - s_start),
         };
 
-        COUNT_FINAL_HITS.fetch_add(1, Ordering::Relaxed);
+        crate::diag_count!(COUNT_FINAL_HITS);
 
         {
             let tree = if phsp.strand == Strand::Plus { &mut tb_accepted_plus } else { &mut tb_accepted_minus };
@@ -2381,7 +2388,7 @@ fn run_gapped_phase<U: UngapOut>(
         // NCBI caps Phase 2a xdrop at min(xdrop_gap, ungapped_score):
         // blast_gapalign.c s_BlastDynProgNtGappedAlignment lines 2970-2972.
         let phase2a_xdrop = params.xdrop_gap.min(ung.score);
-        COUNT_PRELIM_GAPPED.fetch_add(1, Ordering::Relaxed);
+        crate::diag_count!(COUNT_PRELIM_GAPPED);
         let prelim = gapped_extend_score_only(
             pq_seq, ps_seq, pq_seed, ps_seed,
             params.gap_open, params.gap_extend,
@@ -2503,7 +2510,7 @@ fn run_gapped_phase<U: UngapOut>(
             phsp.s_start, phsp.s_end,
             phsp.strand == Strand::Minus,
         );
-        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
             eprintln!("RUST_IMPROVE strand={:?} prelim q=[{},{}] s=[{},{}] seed=({},{}) -> ({},{})",
                 phsp.strand, phsp.q_start, phsp.q_end, phsp.s_start, phsp.s_end,
                 phsp.q_seed, phsp.s_seed, new_q_seed, new_s_seed);
@@ -2518,14 +2525,14 @@ fn run_gapped_phase<U: UngapOut>(
             (query, &subject_align[..], new_q_seed, new_s_seed)
         };
 
-        COUNT_FINAL_GAPPED.fetch_add(1, Ordering::Relaxed);
+        crate::diag_count!(COUNT_FINAL_GAPPED);
         let gapped = gapped_extend_bidirectional(
             tq_seq, ts_seq, tq_seed, ts_seed,
             params.gap_open, params.gap_extend,
             params.xdrop_gap_final,
             matrix, &mut ws,
         );
-        if std::env::var("RMBLAST_DUMP_IMPROVE").is_ok() {
+        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
             if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
                 eprintln!("RUST_TB seed=({},{}) -> score={} q=[{},{}] s=[{},{}]",
                     tq_seed, ts_seed, sc, q0, q1, s0, s1);
@@ -2583,7 +2590,7 @@ fn run_gapped_phase<U: UngapOut>(
             Strand::Minus => (q_start, q_end, s_len - s_end, s_len - s_start),
         };
 
-        COUNT_FINAL_HITS.fetch_add(1, Ordering::Relaxed);
+        crate::diag_count!(COUNT_FINAL_HITS);
 
         // Add traceback result to the interval tree so subsequent prelim HSPs
         // can be checked against it.

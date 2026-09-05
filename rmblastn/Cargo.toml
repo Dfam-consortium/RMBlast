@@ -1,12 +1,15 @@
 [package]
 name = "rmblastn"
-version = "3.0.7"
+version = "3.0.8"
 edition = "2021"
 license = "CC0-1.0"
 
 [[bin]]
 name = "rmblastn"
 path = "src/main.rs"
+
+[features]
+diagnostics = ["rmblast-lib/diagnostics"]
 
 [dependencies]
 rmblast-lib = { package = "rmblast-lib", path = "../rmblast-lib" }

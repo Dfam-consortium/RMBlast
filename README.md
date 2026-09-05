@@ -51,6 +51,14 @@ make test                 # cargo test --release
 make install PREFIX=/opt  # -> /opt/rmblast-<version>/
 ```
 
+The default build leaves out the stage counters and dump hooks
+(`RMBLAST_DP_STATS`, `RMBLAST_DEBUG_COUNTERS`, `BLAST_DUMP_SEEDS`,
+`RMBLAST_DUMP_IMPROVE`). To get them, build with the `diagnostics` feature:
+
+```sh
+cargo build --release --features diagnostics
+```
+
 `make install` produces a self-contained, relocatable tree:
 
 ```

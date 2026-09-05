@@ -1,6 +1,6 @@
 [package]
 name = "rmblast-lib"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "CC0-1.0"
 
@@ -10,6 +10,11 @@ license = "CC0-1.0"
 # Default-on; requires a C++ toolchain at build time.
 default = ["alp-fit"]
 alp-fit = ["rmstats/alp-fit"]
+# Stage counters and dump hooks (RMBLAST_DP_STATS, RMBLAST_DEBUG_COUNTERS,
+# BLAST_DUMP_SEEDS, RMBLAST_DUMP_IMPROVE). Off by default: the counters sit in
+# the seed loop, and at 32 threads they cost more than the search itself.
+# See src/diag.rs.
+diagnostics = []
 
 [dependencies]
 rayon = { workspace = true }

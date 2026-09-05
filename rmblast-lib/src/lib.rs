@@ -1,3 +1,5 @@
+#[macro_use]
+pub mod diag;
 pub mod encoding;
 pub mod matrix;
 pub mod options;

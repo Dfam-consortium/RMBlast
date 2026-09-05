@@ -20,8 +20,6 @@ use rmblast_lib::output::{
 };
 use rmblast_lib::search::{apply_mask_level, sort_hit_list_order, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
-// use rmblast_lib::search::engine::{COUNT_SEEDS, COUNT_UNGAPPED_HITS, COUNT_PRELIM_GAPPED, COUNT_FINAL_GAPPED, COUNT_FINAL_HITS};
-// use rmblast_lib::search::gapped::TOTAL_DP_CELLS;
 use rmblast_lib::seq::{FastaReader, SubjectDb};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -728,29 +726,25 @@ fn main() -> Result<()> {
 
     out.flush()?;
 
+    diagnostics_report();
+
+    Ok(())
+}
+
+/// Print the stage counters when RMBLAST_DP_STATS or RMBLAST_DEBUG_COUNTERS is
+/// set. Without the `diagnostics` feature there are no counters, and this
+/// prints a note instead so the variables are not silently ignored.
+#[cfg(feature = "diagnostics")]
+fn diagnostics_report() {
+    use std::sync::atomic::Ordering;
     if std::env::var_os("RMBLAST_DEBUG_COUNTERS").is_some() {
         eprintln!(
             "REVERSE_FBI_CLAMPED={} IMPROVE_SEED_NEGATIVE_OFFSET={}",
-            rmblast_lib::search::gapped::REVERSE_FBI_CLAMPED
-                .load(std::sync::atomic::Ordering::Relaxed),
-            rmblast_lib::search::engine::IMPROVE_SEED_NEGATIVE_OFFSET
-                .load(std::sync::atomic::Ordering::Relaxed),
+            rmblast_lib::search::gapped::REVERSE_FBI_CLAMPED.load(Ordering::Relaxed),
+            rmblast_lib::search::engine::IMPROVE_SEED_NEGATIVE_OFFSET.load(Ordering::Relaxed),
         );
     }
-
-    // use std::sync::atomic::Ordering;
-    // let dp_cells = TOTAL_DP_CELLS.load(Ordering::Relaxed);
-    // eprintln!("COUNTS seeds={} ungapped_hits={} prelim_gapped={} final_gapped={} final_hits={} dp_cells={}",
-    //     COUNT_SEEDS.load(Ordering::Relaxed),
-    //     COUNT_UNGAPPED_HITS.load(Ordering::Relaxed),
-    //     COUNT_PRELIM_GAPPED.load(Ordering::Relaxed),
-    //     COUNT_FINAL_GAPPED.load(Ordering::Relaxed),
-    //     COUNT_FINAL_HITS.load(Ordering::Relaxed),
-    //     dp_cells,
-    // );
-
     if std::env::var_os("RMBLAST_DP_STATS").is_some() {
-        use std::sync::atomic::Ordering;
         use rmblast_lib::search::gapped::{SCORE_ONLY_CELLS, TOTAL_DP_CELLS};
         use rmblast_lib::search::engine::{
             COUNT_FINAL_GAPPED, COUNT_PRELIM_GAPPED, COUNT_SEEDS, COUNT_UNGAPPED_HITS,
@@ -767,8 +761,16 @@ fn main() -> Result<()> {
             total_cells - so_cells,
         );
     }
+}
 
-    Ok(())
+#[cfg(not(feature = "diagnostics"))]
+fn diagnostics_report() {
+    if std::env::var_os("RMBLAST_DP_STATS").is_some()
+        || std::env::var_os("RMBLAST_DEBUG_COUNTERS").is_some()
+    {
+        eprintln!("note: this rmblastn was built without the diagnostics feature. \
+                   Rebuild with `cargo build --release --features diagnostics` for stage counters.");
+    }
 }
 
 /// Cross-chunk HSP merge, mirroring NCBI BlastHSPStreamMerge → Blast_HSPListsMerge

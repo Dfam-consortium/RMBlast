@@ -17,19 +17,23 @@
 //!   SCRIPT_EXTEND_GAP_A = 0x10
 //!   SCRIPT_EXTEND_GAP_B = 0x40
 
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "diagnostics")]
+use std::sync::atomic::AtomicU64;
 use crate::hits::{EditOp, EditScript};
 use crate::matrix::ScoreMatrix;
 
+#[cfg(feature = "diagnostics")]
 pub static TOTAL_DP_CELLS: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: number of times the REVERSE band pointer had to be clamped
 /// because `first_b_index` reached `n` (see `align_ex_score_only_inner`).  The clamp
 /// is behaviour-neutral — the inner loop runs zero times in that state — this counter
 /// only records how often the degenerate band state occurs.
+#[cfg(feature = "diagnostics")]
 pub static REVERSE_FBI_CLAMPED: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: total score-only DP cells (subset of TOTAL_DP_CELLS).
+#[cfg(feature = "diagnostics")]
 pub static SCORE_ONLY_CELLS: AtomicU64 = AtomicU64::new(0);
 
 const SCRIPT_GAP_IN_A: u8 = 0;
@@ -199,7 +203,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
             if first_b_index < n {
                 unsafe { b.as_ptr().add(n - 1 - first_b_index) }
             } else {
-                REVERSE_FBI_CLAMPED.fetch_add(1, Ordering::Relaxed);
+                crate::diag_count!(REVERSE_FBI_CLAMPED);
                 b.as_ptr()
             }
         } else {
@@ -310,8 +314,8 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
         }
     }
 
-    TOTAL_DP_CELLS.fetch_add(total_cells_so, Ordering::Relaxed);
-    SCORE_ONLY_CELLS.fetch_add(total_cells_so, Ordering::Relaxed);
+    crate::diag_count!(TOTAL_DP_CELLS, total_cells_so);
+    crate::diag_count!(SCORE_ONLY_CELLS, total_cells_so);
     let reset_end = b_size.min(dp.len());
     for cell in dp[..reset_end].iter_mut() {
         *cell = DpCell { best: MININT, best_gap: MININT };
@@ -655,7 +659,7 @@ fn align_ex_inner<const REVERSE: bool>(
 
     }
 
-    TOTAL_DP_CELLS.fetch_add(total_cells, Ordering::Relaxed);
+    crate::diag_count!(TOTAL_DP_CELLS, total_cells);
 
     // Commit the bytes written through flat_ptr — all of [0, flat_len) are initialised.
     unsafe { ws.flat_edit.set_len(flat_len); }
@@ -875,7 +879,9 @@ T -4  -4  -4   5
         }
         // Guard the guard: confirm these inputs really do drive the band into the
         // degenerate state, so the test cannot silently stop covering the bug.
-        assert!(REVERSE_FBI_CLAMPED.load(Ordering::Relaxed) > 0,
+        // The counter only exists with the diagnostics feature.
+        #[cfg(feature = "diagnostics")]
+        assert!(REVERSE_FBI_CLAMPED.load(std::sync::atomic::Ordering::Relaxed) > 0,
                 "no reverse-band clamp observed — test inputs no longer reach the bug");
     }
 
