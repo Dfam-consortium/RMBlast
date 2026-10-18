@@ -678,36 +678,97 @@ fn main() -> Result<()> {
             }
         }
         MtMode::SplitByQueries => {
+            // Queries are handed out in input order from a shared counter and
+            // searched on the rayon pool (each search is itself parallel over
+            // subjects).  This thread writes a query's results as soon as all
+            // earlier queries' are written, so output order is unchanged.  A
+            // worker does not start a query more than `window` ahead of the
+            // next one to write; memory then holds about `window` queries'
+            // results instead of every query's.  While held back, a worker
+            // runs other pool jobs (rayon::yield_now), so it helps finish the
+            // slow query it is waiting on.
+            use std::collections::BTreeMap;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::mpsc;
+
             let all_queries: Vec<_> = query_reader
                 .collect::<Result<Vec<_>, _>>()
                 .context("reading query FASTA")?;
-            let all_results: Vec<Vec<AlignResult>> = all_queries
-                .par_iter()
-                .map(|q| {
-                    let mut qr = search_db_parallel(
-                        &q.seq, &q.id, &subject_names, &db, &params, &matrix,
-                        avg_subj_length, None, prelim_cull,
-                        reap_for_query(q.len() as i32),
-                    );
-                    sort_hit_list_order(&mut qr, &subject_names);
-                    qr
-                })
-                .collect();
-            for (q, results) in all_queries.iter().zip(all_results.into_iter()) {
-                match &output_format {
-                    OutputFormat::Pairwise => {
-                        let qlen = q.len() as u32;
-                        write_pairwise_results(&mut out, &results, &q.defline, qlen)
-                            .context("writing pairwise results")?;
+            let n = all_queries.len();
+            let workers = rayon::current_num_threads();
+            let window = 4 * workers.max(4);
+            let next = AtomicUsize::new(0);
+            let written = AtomicUsize::new(0);
+            let stop = AtomicBool::new(false);
+            let (tx, rx) = mpsc::channel::<(usize, Vec<AlignResult>)>();
+            let (queries, subjects, db, params, matrix, reap) =
+                (&all_queries, &subject_names, &db, &params, &matrix, &reap_for_query);
+            let (next, written, stop) = (&next, &written, &stop);
+            std::thread::scope(|ts| -> Result<()> {
+                ts.spawn(move || {
+                    rayon::scope(|s| {
+                        for _ in 0..workers {
+                            let tx = tx.clone();
+                            s.spawn(move |_| loop {
+                                let i = next.fetch_add(1, Ordering::Relaxed);
+                                if i >= n || stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                while i >= written.load(Ordering::Acquire) + window
+                                    && !stop.load(Ordering::Relaxed)
+                                {
+                                    if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
+                                    }
+                                }
+                                let q = &queries[i];
+                                let mut qr = search_db_parallel(
+                                    &q.seq, &q.id, subjects, db, params, matrix,
+                                    avg_subj_length, None, prelim_cull,
+                                    reap(q.len() as i32),
+                                );
+                                sort_hit_list_order(&mut qr, subjects);
+                                if tx.send((i, qr)).is_err() {
+                                    break;
+                                }
+                            });
+                        }
+                        drop(tx);
+                    });
+                });
+                let mut pending: BTreeMap<usize, Vec<AlignResult>> = BTreeMap::new();
+                let mut k = 0usize;
+                let mut write_ready = |pending: &mut BTreeMap<usize, Vec<AlignResult>>| -> Result<()> {
+                    while let Some(results) = pending.remove(&k) {
+                        let q = &queries[k];
+                        match &output_format {
+                            OutputFormat::Pairwise => {
+                                let qlen = q.len() as u32;
+                                write_pairwise_results(&mut out, &results, &q.defline, qlen)
+                                    .context("writing pairwise results")?;
+                            }
+                            OutputFormat::Tabular(fields) => {
+                                let qstats = stats_requested.then(|| {
+                                    ka_ctx.for_query(q.len() as i32, total_db_letters as i64, n_db_seqs as i32)
+                                });
+                                write_all(&mut out, &results, fields, qstats.as_ref())?;
+                            }
+                        }
+                        k += 1;
+                        written.store(k, Ordering::Release);
                     }
-                    OutputFormat::Tabular(fields) => {
-                        let qstats = stats_requested.then(|| {
-                            ka_ctx.for_query(q.len() as i32, total_db_letters as i64, n_db_seqs as i32)
-                        });
-                        write_all(&mut out, &results, fields, qstats.as_ref())?;
+                    Ok(())
+                };
+                for (i, results) in rx.iter() {
+                    pending.insert(i, results);
+                    if let Err(e) = write_ready(&mut pending) {
+                        // let the workers wind down, then report the write error
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(e);
                     }
                 }
-            }
+                Ok(())
+            })?;
         }
     }
 
