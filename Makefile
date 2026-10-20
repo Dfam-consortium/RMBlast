@@ -13,7 +13,7 @@
 #   make install PREFIX=/opt      # -> /opt/rmblast-0.1.0/...
 #   make install PREFIX=/opt MATRIX_SRC=../   # also install ../*.matrix
 #   make dist PREFIX=/tmp/stage   # build a versioned tarball
-#   make version                  # print the version from Cargo.toml
+#   make version                  # print the workspace version from Cargo.toml
 
 PREFIX     ?= /usr/local
 DESTDIR    ?=
@@ -25,7 +25,7 @@ BIN         = rmblastn
 # replacement for the NCBI application of the same name (FASTA in, text out);
 # installing it shadows NCBI's copy for anything that finds it on PATH first.
 EXTRA_BINS  = dustmasker
-MANIFEST    = rmblastn/Cargo.toml
+MANIFEST    = Cargo.toml
 # Documentation shipped in a binary release.  Listed by name rather than globbed
 # as *.md, so that a maintainer note dropped at the top level does not silently
 # end up in a release tarball.
@@ -34,9 +34,10 @@ DOCS        = README.md LICENSE
 # canonical matrices live outside the source tree; set on the command line.
 MATRIX_SRC ?=
 
-# Read the package version from Cargo.toml at parse time (the only top-level
-# `version =` in the binary crate's manifest; deps use workspace/path).
-VERSION := $(shell sed -n 's/^version *= *"\([^"]*\)".*/\1/p' $(MANIFEST) | head -1)
+# Read the workspace version from the root Cargo.toml at parse time.  It lives
+# in [workspace.package] and every crate inherits it, so rmblastn and dustmasker
+# always report the same version.  The sed range confines the match to that table.
+VERSION := $(shell sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' $(MANIFEST) | head -1)
 $(if $(VERSION),,$(error could not read version from $(MANIFEST)))
 
 # Versioned package root (DESTDIR-aware for staged packaging).

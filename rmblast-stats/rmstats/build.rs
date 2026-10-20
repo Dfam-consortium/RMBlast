@@ -38,6 +38,11 @@ fn build_alp() {
 
     let mut build = cc::Build::new();
     build.cpp(true).opt_level(3).include(&alp_dir);
+    // The vendored ALP headers trip GCC's -Woverloaded-virtual (derived-class
+    // copy()/operator= hide base overloads).  Harmless, and ALP is kept
+    // verbatim, so silence it here rather than patch the sources -- otherwise
+    // cargo replays the cached warnings on every build.
+    build.flag_if_supported("-Wno-overloaded-virtual");
     for s in &sources {
         let p = alp_dir.join(s);
         assert!(

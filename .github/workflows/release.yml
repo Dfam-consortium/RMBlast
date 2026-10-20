@@ -45,7 +45,8 @@ jobs:
             exit 1
           fi
 
-      # The version of record lives in rmblastn/Cargo.toml and is what the
+      # The version of record lives in the root Cargo.toml ([workspace.package],
+      # inherited by every crate) and is what the
       # Makefile stamps into the package directory name.  A tag that disagrees
       # with it would publish an archive whose name contradicts its contents.
       - name: Check tag against Cargo.toml version
@@ -56,7 +57,7 @@ jobs:
           MAKE_VERSION="$(make version)"
           if [ "${TAG_VERSION}" != "${MAKE_VERSION}" ]; then
             echo "tag ${GITHUB_REF_NAME} implies version ${TAG_VERSION}," >&2
-            echo "but rmblastn/Cargo.toml says ${MAKE_VERSION}." >&2
+            echo "but Cargo.toml [workspace.package] says ${MAKE_VERSION}." >&2
             echo "Bump Cargo.toml and re-tag, or tag the right commit." >&2
             exit 1
           fi
@@ -79,9 +80,18 @@ jobs:
       - name: Smoke-test the packaged binaries
         shell: bash
         run: |
-          BIN="stage/staging/rmblast-$(make version)/bin"
-          "${BIN}/rmblastn" -version
-          "${BIN}/dustmasker" -version
+          VERSION="$(make version)"
+          BIN="stage/staging/rmblast-${VERSION}/bin"
+          # Each shipped binary must run and report the package version; a
+          # crate that stopped inheriting the workspace version fails here.
+          for prog in rmblastn dustmasker; do
+            OUT="$("${BIN}/${prog}" -version)"
+            echo "${OUT}"
+            if [ "${OUT}" != "${prog} ${VERSION}" ]; then
+              echo "${prog} reports '${OUT}', expected '${prog} ${VERSION}'" >&2
+              exit 1
+            fi
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
