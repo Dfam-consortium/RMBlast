@@ -678,18 +678,23 @@ fn main() -> Result<()> {
             }
         }
         MtMode::SplitByQueries => {
-            // Queries are handed out in input order from a shared counter and
-            // searched on the rayon pool (each search is itself parallel over
-            // subjects).  This thread writes a query's results as soon as all
-            // earlier queries' are written, so output order is unchanged.  A
-            // worker does not start a query more than `window` ahead of the
+            // Each query is one job on the rayon pool (each search is itself
+            // parallel over subjects).  This thread writes a query's results
+            // as soon as all earlier queries' are written, so output order is
+            // unchanged.  A dispatcher thread hands the queries out in input
+            // order and does not hand out one more than `window` ahead of the
             // next one to write; memory then holds about `window` queries'
-            // results instead of every query's.  While held back, a worker
-            // runs other pool jobs (rayon::yield_now), so it helps finish the
-            // slow query it is waiting on.
+            // results instead of every query's.
+            //
+            // The holding back happens on the dispatcher, outside the pool,
+            // and a query job never waits on anything.  A pool worker that
+            // waits inside a job can be handed another job while it sits in a
+            // join (work stealing), so a job that waited for the writer could
+            // end up stacked on top of the unfinished search the writer needs
+            // next -- a deadlock (3.0.10 did that).
             use std::collections::BTreeMap;
-            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-            use std::sync::mpsc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{mpsc, Condvar, Mutex};
 
             let all_queries: Vec<_> = query_reader
                 .collect::<Result<Vec<_>, _>>()
@@ -697,29 +702,32 @@ fn main() -> Result<()> {
             let n = all_queries.len();
             let workers = rayon::current_num_threads();
             let window = 4 * workers.max(4);
-            let next = AtomicUsize::new(0);
-            let written = AtomicUsize::new(0);
+            // queries written so far, and the dispatcher's wake-up
+            let written = (Mutex::new(0usize), Condvar::new());
             let stop = AtomicBool::new(false);
             let (tx, rx) = mpsc::channel::<(usize, Vec<AlignResult>)>();
             let (queries, subjects, db, params, matrix, reap) =
                 (&all_queries, &subject_names, &db, &params, &matrix, &reap_for_query);
-            let (next, written, stop) = (&next, &written, &stop);
+            let (written, stop) = (&written, &stop);
             std::thread::scope(|ts| -> Result<()> {
                 ts.spawn(move || {
-                    rayon::scope(|s| {
-                        for _ in 0..workers {
-                            let tx = tx.clone();
-                            s.spawn(move |_| loop {
-                                let i = next.fetch_add(1, Ordering::Relaxed);
-                                if i >= n || stop.load(Ordering::Relaxed) {
-                                    break;
+                    // in_place_scope: this loop runs here, outside the pool
+                    rayon::in_place_scope(|s| {
+                        for i in 0..n {
+                            {
+                                let (lock, cvar) = written;
+                                let mut w = lock.lock().unwrap_or_else(|e| e.into_inner());
+                                while i >= *w + window && !stop.load(Ordering::Relaxed) {
+                                    w = cvar.wait(w).unwrap_or_else(|e| e.into_inner());
                                 }
-                                while i >= written.load(Ordering::Acquire) + window
-                                    && !stop.load(Ordering::Relaxed)
-                                {
-                                    if rayon::yield_now() != Some(rayon::Yield::Executed) {
-                                        std::thread::sleep(std::time::Duration::from_millis(1));
-                                    }
+                            }
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let tx = tx.clone();
+                            s.spawn(move |_| {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
                                 }
                                 let q = &queries[i];
                                 let mut qr = search_db_parallel(
@@ -728,9 +736,7 @@ fn main() -> Result<()> {
                                     reap(q.len() as i32),
                                 );
                                 sort_hit_list_order(&mut qr, subjects);
-                                if tx.send((i, qr)).is_err() {
-                                    break;
-                                }
+                                let _ = tx.send((i, qr));
                             });
                         }
                         drop(tx);
@@ -755,15 +761,20 @@ fn main() -> Result<()> {
                             }
                         }
                         k += 1;
-                        written.store(k, Ordering::Release);
+                        *written.0.lock().unwrap_or_else(|e| e.into_inner()) = k;
+                        written.1.notify_all();
                     }
                     Ok(())
                 };
                 for (i, results) in rx.iter() {
                     pending.insert(i, results);
                     if let Err(e) = write_ready(&mut pending) {
-                        // let the workers wind down, then report the write error
+                        // let the dispatcher and the jobs wind down, then report
+                        // the write error (the lock orders the store before the
+                        // dispatcher's next check)
+                        let _w = written.0.lock().unwrap_or_else(|e| e.into_inner());
                         stop.store(true, Ordering::Relaxed);
+                        written.1.notify_all();
                         return Err(e);
                     }
                 }
