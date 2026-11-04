@@ -3505,6 +3505,61 @@ fn cut_end_secondary(primary: &AlignResult, sec: &mut AlignResult) -> bool {
 /// `purge=false` caller can re-trace the cut remainders in array order.  Returns
 /// the survivor count.
 fn purge_hsps_with_common_endpoints(arr: &mut [Option<AlignResult>], purge: bool) -> usize {
+    let hsp_count = arr.len();
+    if hsp_count < 2 { return hsp_count; }
+
+    // Pass 1: common START.  qsort s_QueryOffsetCompareHSPs over arr[0..hsp_count).
+    arr[..hsp_count].sort_by(|a, b| cmp_query_offset(a.as_ref().unwrap(), b.as_ref().unwrap()));
+    let hsp_count = collapse_common_endpoint_groups(
+        arr, hsp_count, purge, same_group_start, cut_start_secondary,
+    );
+
+    // Pass 2: common END.  qsort s_QueryEndCompareHSPs over the survivors.
+    arr[..hsp_count].sort_by(|a, b| cmp_query_end(a.as_ref().unwrap(), b.as_ref().unwrap()));
+    collapse_common_endpoint_groups(
+        arr, hsp_count, purge, same_group_end, cut_end_secondary,
+    )
+}
+
+/// One collapse pass over `arr[..count]`, which is sorted so that the members of
+/// a group are adjacent.  Returns the new survivor count.
+///
+/// NCBI's loop removes a secondary by shifting the rest of the array down one
+/// slot and storing the secondary at the new end, which is O(n) per removal.
+/// With millions of HSPs that is hours of memory moves, so this does it in one
+/// linear pass with the same result: survivors keep their relative order in
+/// `arr[..returned]`, and `arr[returned..count]` holds what was removed, last
+/// removed first (`None` where NCBI frees the HSP).
+fn collapse_common_endpoint_groups(
+    arr: &mut [Option<AlignResult>],
+    count: usize,
+    purge: bool,
+    same_group: fn(&AlignResult, &AlignResult) -> bool,
+    cut_secondary: fn(&AlignResult, &mut AlignResult) -> bool,
+) -> usize {
+    let mut removed: Vec<Option<AlignResult>> = Vec::new();
+    let mut survivors = 0;
+    for r in 0..count {
+        let joins_group = survivors > 0
+            && same_group(arr[survivors - 1].as_ref().unwrap(), arr[r].as_ref().unwrap());
+        if joins_group {
+            let mut sec = arr[r].take().unwrap();
+            let keep = !purge && cut_secondary(arr[survivors - 1].as_ref().unwrap(), &mut sec);
+            removed.push(if keep { Some(sec) } else { None });
+        } else {
+            // every slot in survivors..r has already been taken
+            arr.swap(survivors, r);
+            survivors += 1;
+        }
+    }
+    for (slot, hsp) in arr[survivors..count].iter_mut().zip(removed.into_iter().rev()) {
+        *slot = hsp;
+    }
+    survivors
+}
+
+#[cfg(test)]
+fn purge_hsps_shift_reference(arr: &mut [Option<AlignResult>], purge: bool) -> usize {
     let mut hsp_count = arr.len();
     if hsp_count < 2 { return hsp_count; }
 
@@ -3816,6 +3871,52 @@ mod tests {
 
     fn make_prelim(score: i32, q_start: u32, q_end: u32, s_start: u32, s_end: u32) -> PrelimHsp {
         PrelimHsp { q_seed: q_start, s_seed: s_start, q_start, q_end, s_start, s_end, score, strand: Strand::Plus }
+    }
+
+    /// The linear collapse must leave `arr` exactly as NCBI's shift-to-end loop
+    /// does, tail order included, because the cut remainders are re-traced in
+    /// array order.
+    #[test]
+    fn purge_common_endpoints_matches_shift_to_end_layout() {
+        fn fingerprint(arr: &[Option<AlignResult>]) -> Vec<Option<(i32, u32, u32, u32, u32, Strand, Vec<(EditOp, u32)>)>> {
+            arr.iter().map(|o| o.as_ref().map(|r| (
+                r.hsp.score, r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end,
+                r.hsp.strand, r.hsp.edit_script.ops.clone(),
+            ))).collect()
+        }
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let mut rnd = move |m: u32| -> u32 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x >> 16) % m as u64) as u32
+        };
+        let mut removed = 0usize;
+        for _ in 0..3000 {
+            // a small coordinate range, so that common endpoints are frequent
+            let n = rnd(60) as usize;
+            let range = 3 + rnd(12);
+            let v: Vec<AlignResult> = (0..n).map(|_| {
+                let (qs, ss) = (rnd(range), rnd(range));
+                let (m, g, m2) = (1 + rnd(6), rnd(3), 1 + rnd(6));
+                let op = if rnd(2) == 0 { EditOp::GapInQuery } else { EditOp::GapInSubject };
+                let (dq, ds) = match op {
+                    EditOp::GapInQuery => (m + m2, m + g + m2),
+                    _ => (m + g + m2, m + m2),
+                };
+                let mut r = make_result(100 + rnd(5) as i32, qs, qs + dq, ss, ss + ds);
+                r.hsp.strand = if rnd(2) == 0 { Strand::Plus } else { Strand::Minus };
+                r.hsp.edit_script.ops = vec![(EditOp::Sub, m), (op, g), (EditOp::Sub, m2)];
+                r
+            }).collect();
+            for purge in [false, true] {
+                let mut a: Vec<Option<AlignResult>> = v.iter().cloned().map(Some).collect();
+                let mut b = a.clone();
+                let ca = purge_hsps_with_common_endpoints(&mut a, purge);
+                let cb = purge_hsps_shift_reference(&mut b, purge);
+                assert_eq!(ca, cb);
+                assert_eq!(fingerprint(&a), fingerprint(&b));
+                removed += n - ca;
+            }
+        }
+        assert!(removed > 10_000, "test collapsed only {} HSPs", removed);
     }
 
     fn make_result(score: i32, q_start: u32, q_end: u32, s_start: u32, s_end: u32) -> AlignResult {
