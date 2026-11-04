@@ -3,6 +3,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## 3.0.12 - 2026-11-04
+### Fixed
+- rmblastn could take many hours on a search producing millions of HSPs per
+  query, such as a low-complexity library family with -dust no, in the step
+  that purges HSPs with common endpoints; this step is now linear and its
+  results are unchanged
+
 ## 3.0.11 - 2026-10-21
 ### Fixed
 - rmblastn -mt_mode 1 could deadlock (all threads idle, no output) when a
