@@ -6,9 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## 3.0.12 - 2026-11-04
 ### Fixed
 - rmblastn could take many hours on a search producing millions of HSPs per
-  query, such as a low-complexity library family with -dust no, in the step
-  that purges HSPs with common endpoints; this step is now linear and its
-  results are unchanged
+  query, such as a low-complexity library family with -dust no. The step that
+  purges HSPs with common endpoints moved whole HSP records once per removal,
+  which is quadratic; it is now one linear pass with the same results. A Xenopus
+  laevis search that was killed after 5.5 hours with no output now finishes in
+  about 2 hours 10 minutes on 20 threads
+- Long queries could give different hits from NCBI 2.17.1 next to the 1 Mb
+  query chunk boundaries: 15 of about 3 million hits at 7 sites on Xenopus
+  laevis, while the existing comparison suites showed no differences. The merge
+  of HSPs across chunks now matches NCBI in three ways:
+  - HSPs are paired in NCBI's order, best score first, and one HSP can absorb
+    several others
+  - The merged score is the score density over the merged length, or the better
+    of the two scores if that is higher
+  - Only plus-strand HSPs merge; NCBI never merges minus-strand HSPs across chunks
+  This search now gives output identical to NCBI 2.17.1 on a FASTA database.
+  Results near chunk boundaries can differ from 3.0.11
+- Prelim HSPs now use a stable sort before traceback, so equal HSPs keep their
+  order
 
 ## 3.0.11 - 2026-10-21
 ### Fixed

@@ -1762,7 +1762,7 @@ pub fn run_phase2b(
     //   plus:  query.offset = FWD_qs,        query.end = FWD_qe
     //   minus: query.offset = qlen - FWD_qe, query.end = qlen - FWD_qs
     // Using NCBI-space values gives a valid total order for both pure and mixed-strand lists.
-    prelim_hsps.sort_unstable_by(|a, b| {
+    prelim_hsps.sort_by(|a, b| {
         let fwd_sa = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
         let fwd_sb = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
         let fwd_ea = match a.strand { Strand::Plus => a.s_end, Strand::Minus => s_len - a.s_start };
@@ -2448,7 +2448,7 @@ fn run_gapped_phase<U: UngapOut>(
     // NCBI coordinate transform per strand:
     //   plus:  query.offset = FWD_qs,        query.end = FWD_qe
     //   minus: query.offset = qlen - FWD_qe, query.end = qlen - FWD_qs
-    prelim_hsps.sort_unstable_by(|a, b| {
+    prelim_hsps.sort_by(|a, b| {
         let fwd_sa = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
         let fwd_sb = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
         let fwd_ea = match a.strand { Strand::Plus => a.s_end, Strand::Minus => s_len - a.s_start };

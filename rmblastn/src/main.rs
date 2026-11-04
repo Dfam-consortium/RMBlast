@@ -846,13 +846,18 @@ fn diagnostics_report() {
 }
 
 /// Cross-chunk HSP merge, mirroring NCBI BlastHSPStreamMerge → Blast_HSPListsMerge
-/// → s_BlastMergeTwoHSPs.
+/// → s_BlastMergeTwoHSPs (blast_hits.c), called once per chunk in chunk order.
 ///
-/// When chunk k+1 (starting at `split_point` in global coords) has been processed,
-/// boundary candidates from `accumulated` (those extending past the split) are merged
-/// with boundary candidates from `new_prelims` (those starting within the 100-base
-/// overlap).  Merged results update `accumulated` in-place; unmerged new entries are
-/// appended.
+/// The loop order matters: each `accumulated` candidate, best score first, tries every
+/// remaining `new` candidate, best score first.  One candidate can absorb several new
+/// HSPs, and its box and score grow as it does, so later tests see the updated values.
+/// Both lists are in ScoreCompareHSPs order in NCBI when this runs.
+///
+/// Only the plus strand merges.  NCBI's split point for a minus-strand context is
+/// `L - chunk_end` (x_ComputeContextOffsets_NonTranslatedQueries), so its test for an
+/// earlier chunk's HSP, `query.offset < split + overlap`, reduces to
+/// `q_end > chunk_end - overlap`.  An earlier chunk ends at `chunk_start + overlap`, so
+/// that can't hold, and NCBI never merges minus-strand HSPs across chunks.
 fn merge_chunk_prelims(
     accumulated: &mut Vec<PrelimHsp>,
     new_prelims: Vec<PrelimHsp>,
@@ -861,55 +866,65 @@ fn merge_chunk_prelims(
     const OVERLAP: u32 = 100;
     const OVERLAP_DIAG_CLOSE: i64 = 10;
 
-    let mut to_add: Vec<PrelimHsp> = Vec::new();
-
-    'new: for new in new_prelims {
-        // New-chunk HSPs are boundary candidates iff they start within the overlap region.
-        // (q_start >= split_point is guaranteed by chunk construction.)
-        if new.q_start >= split_point + OVERLAP {
-            to_add.push(new);
-            continue;
-        }
-
-        for acc in accumulated.iter_mut() {
-            if acc.strand != new.strand { continue; }
-            // Accumulated boundary candidate: extends into the overlap.
-            if acc.q_end <= split_point { continue; }
-
-            // Diagonal proximity (same formula for both strands in Rust FWD-q + strand-s space):
-            // |(acc.q_end - acc.s_end) - (new.q_start - new.s_start)| < OVERLAP_DIAG_CLOSE
-            let diag_acc_end   = acc.q_end as i64 - acc.s_end as i64;
-            let diag_new_start = new.q_start as i64 - new.s_start as i64;
-            if (diag_acc_end - diag_new_start).abs() >= OVERLAP_DIAG_CLOSE { continue; }
-
-            // CONTAINED_IN_HSP: at least one endpoint of `new` falls inside `acc`'s bbox.
-            let start_in = new.q_start >= acc.q_start && new.q_start <= acc.q_end
-                        && new.s_start >= acc.s_start && new.s_start <= acc.s_end;
-            let end_in   = new.q_end   >= acc.q_start && new.q_end   <= acc.q_end
-                        && new.s_end   >= acc.s_start && new.s_end   <= acc.s_end;
-            if !start_in && !end_in { continue; }
-
-            // Merge: expand bounding box; keep higher-scoring HSP's seed.
-            let (q_seed, s_seed) = if new.score > acc.score {
-                (new.q_seed, new.s_seed)
-            } else {
-                (acc.q_seed, acc.s_seed)
-            };
-            acc.q_start = acc.q_start.min(new.q_start);
-            acc.q_end   = acc.q_end.max(new.q_end);
-            acc.s_start = acc.s_start.min(new.s_start);
-            acc.s_end   = acc.s_end.max(new.s_end);
-            acc.score   = acc.score.max(new.score);
-            acc.q_seed  = q_seed;
-            acc.s_seed  = s_seed;
-            continue 'new;
-        }
-
-        // No accumulated candidate matched: add as a standalone entry.
-        to_add.push(new);
+    // ScoreCompareHSPs, for plus-strand HSPs.
+    fn score_order(a: &PrelimHsp, b: &PrelimHsp) -> std::cmp::Ordering {
+        b.score.cmp(&a.score)
+            .then_with(|| a.s_start.cmp(&b.s_start))
+            .then_with(|| b.s_end.cmp(&a.s_end))
+            .then_with(|| a.q_start.cmp(&b.q_start))
+            .then_with(|| b.q_end.cmp(&a.q_end))
     }
 
-    accumulated.extend(to_add);
+    let mut absorbed = vec![false; new_prelims.len()];
+    let mut acc_candidates: Vec<usize> = (0..accumulated.len())
+        .filter(|&i| accumulated[i].strand == Strand::Plus && accumulated[i].q_end > split_point)
+        .collect();
+    acc_candidates.sort_by(|&a, &b| score_order(&accumulated[a], &accumulated[b]));
+
+    let mut new_candidates: Vec<usize> = (0..new_prelims.len())
+        .filter(|&j| new_prelims[j].strand == Strand::Plus
+            && new_prelims[j].q_start < split_point + OVERLAP)
+        .collect();
+    new_candidates.sort_by(|&a, &b| score_order(&new_prelims[a], &new_prelims[b]));
+
+    for &i in &acc_candidates {
+        let h1 = &mut accumulated[i];
+        for &j in &new_candidates {
+            if absorbed[j] { continue; }
+            let h2 = &new_prelims[j];
+
+            let end_diag = h1.q_end as i64 - h1.s_end as i64;
+            let start_diag = h2.q_start as i64 - h2.s_start as i64;
+            if (end_diag - start_diag).abs() >= OVERLAP_DIAG_CLOSE { continue; }
+
+            // CONTAINED_IN_HSP: either endpoint of h2 falls inside h1's box.
+            let start_in = h2.q_start >= h1.q_start && h2.q_start <= h1.q_end
+                        && h2.s_start >= h1.s_start && h2.s_start <= h1.s_end;
+            let end_in   = h2.q_end   >= h1.q_start && h2.q_end   <= h1.q_end
+                        && h2.s_end   >= h1.s_start && h2.s_end   <= h1.s_end;
+            if !start_in && !end_in { continue; }
+
+            // The merged score is the two HSPs' score density over the merged length,
+            // measured before the box grows, or the better score if that is higher.
+            let score_density = (h1.score + h2.score) as f64
+                / ((h1.q_end - h1.q_start) + (h2.q_end - h2.q_start)) as f64;
+            h1.q_start = h1.q_start.min(h2.q_start);
+            h1.s_start = h1.s_start.min(h2.s_start);
+            h1.q_end   = h1.q_end.max(h2.q_end);
+            h1.s_end   = h1.s_end.max(h2.s_end);
+            if h2.score > h1.score {
+                h1.q_seed = h2.q_seed;
+                h1.s_seed = h2.s_seed;
+                h1.score  = h2.score;
+            }
+            h1.score = h1.score.max((score_density * (h1.q_end - h1.q_start) as f64) as i32);
+            absorbed[j] = true;
+        }
+    }
+
+    accumulated.extend(new_prelims.into_iter().zip(absorbed)
+        .filter(|(_, was_absorbed)| !was_absorbed)
+        .map(|(h, _)| h));
 }
 
 /// Search one query against all subjects, chunking the query to match NCBI's
@@ -1290,6 +1305,85 @@ fn load_gilist(path: Option<&str>) -> Result<Option<HashSet<String>>> {
         set.insert(entry);
     }
     Ok(Some(set))
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_chunk_prelims;
+    use rmblast_lib::hits::Strand;
+    use rmblast_lib::search::PrelimHsp;
+
+    fn hsp(strand: Strand, score: i32, q: (u32, u32), s: (u32, u32), seed: (u32, u32)) -> PrelimHsp {
+        PrelimHsp { q_seed: seed.0, s_seed: seed.1, q_start: q.0, q_end: q.1, s_start: s.0, s_end: s.1, score, strand }
+    }
+
+    // Two pieces of one alignment across a split at 1000, overlapping by 50.
+    fn pieces(strand: Strand) -> (PrelimHsp, PrelimHsp) {
+        (hsp(strand, 300, (800, 1050), (100, 350), (900, 200)),
+         hsp(strand, 200, (1000, 1200), (300, 500), (1100, 400)))
+    }
+
+    #[test]
+    fn merged_score_is_density_over_merged_length() {
+        let (a, b) = pieces(Strand::Plus);
+        let mut acc = vec![a];
+        merge_chunk_prelims(&mut acc, vec![b], 1000);
+        assert_eq!(acc.len(), 1);
+        let m = &acc[0];
+        assert_eq!((m.q_start, m.q_end, m.s_start, m.s_end), (800, 1200, 100, 500));
+        // (300 + 200) / (250 + 200) * 400 = 444.44, truncated as NCBI's (int) cast does.
+        assert_eq!(m.score, 444);
+        assert_eq!((m.q_seed, m.s_seed), (900, 200), "the higher-scoring HSP keeps its seed");
+    }
+
+    #[test]
+    fn higher_scoring_new_hsp_supplies_the_seed() {
+        let (mut a, mut b) = pieces(Strand::Plus);
+        a.score = 200;
+        b.score = 300;
+        let mut acc = vec![a];
+        merge_chunk_prelims(&mut acc, vec![b], 1000);
+        assert_eq!((acc[0].q_seed, acc[0].s_seed), (1100, 400));
+    }
+
+    #[test]
+    fn one_hsp_absorbs_several_and_tests_see_its_growth() {
+        let (a, b) = pieces(Strand::Plus);
+        // Past a's original end, reachable only once a has absorbed b.
+        let c = hsp(Strand::Plus, 100, (1090, 1300), (390, 600), (1200, 500));
+        let mut acc = vec![a];
+        merge_chunk_prelims(&mut acc, vec![c, b], 1000);
+        assert_eq!(acc.len(), 1, "c must merge into a after b has grown it");
+        assert_eq!(acc[0].q_end, 1300);
+    }
+
+    #[test]
+    fn best_scoring_accumulated_hsp_gets_first_refusal() {
+        let (a, b) = pieces(Strand::Plus);
+        let weaker = hsp(Strand::Plus, 250, (810, 1040), (110, 340), (850, 150));
+        let mut acc = vec![weaker, a];
+        merge_chunk_prelims(&mut acc, vec![b], 1000);
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc[0].q_end, 1040, "the weaker HSP is listed first but must not take the merge");
+        assert_eq!(acc[1].q_end, 1200);
+    }
+
+    #[test]
+    fn minus_strand_never_merges() {
+        let (a, b) = pieces(Strand::Minus);
+        let mut acc = vec![a];
+        merge_chunk_prelims(&mut acc, vec![b], 1000);
+        assert_eq!(acc.len(), 2);
+    }
+
+    #[test]
+    fn strands_do_not_merge_with_each_other() {
+        let (a, _) = pieces(Strand::Plus);
+        let (_, b) = pieces(Strand::Minus);
+        let mut acc = vec![a];
+        merge_chunk_prelims(&mut acc, vec![b], 1000);
+        assert_eq!(acc.len(), 2);
+    }
 }
 
 #[cfg(test)]
