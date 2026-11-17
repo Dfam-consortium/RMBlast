@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - The merged score is the score density over the merged length, or the better
     of the two scores if that is higher
   - Only plus-strand HSPs merge; NCBI never merges minus-strand HSPs across chunks
+
   This search now gives output identical to NCBI 2.17.1 on a FASTA database.
   Results near chunk boundaries can differ from 3.0.11
 - Prelim HSPs now use a stable sort before traceback, so equal HSPs keep their
