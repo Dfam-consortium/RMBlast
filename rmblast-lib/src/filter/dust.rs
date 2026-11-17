@@ -655,6 +655,16 @@ fn merge_intervals(mut ivs: Vec<(usize, usize)>, linker: usize) -> Vec<(usize, u
 mod tests {
     use super::*;
 
+    /// `tests/data/chr22.fa` at the workspace root (tracked in git).
+    fn repo_chr22() -> String {
+        format!("{}/../tests/data/chr22.fa", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// A fixture file under `rmblast-lib/tests/data/`.
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/data/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
+
     fn encode_fasta_region(fa_path: &str, start: usize, end: usize) -> Vec<u8> {
         use std::io::BufRead;
         let f = std::fs::File::open(fa_path).expect("fasta not found");
@@ -683,8 +693,7 @@ mod tests {
     /// NCBI dustmasker output (0-based, inclusive): 10510356-10510364, 10510518-10510527
     #[test]
     fn test_chr22_dust_region_10510228() {
-        let chr22 = "/home/rhubley/projects/Claude/rmblast-port/attic/rmblast-rs/chr22.fa";
-        if !std::path::Path::new(chr22).exists() { return; }
+        let chr22 = &repo_chr22();
         let region_start = 10510100usize;
         let region_end = 10510600usize;
         let mut seq = encode_fasta_region(chr22, region_start, region_end);
@@ -709,8 +718,7 @@ mod tests {
     /// are the same as when computed on a smaller window.
     #[test]
     fn test_chr22_dust_full_prefix_10510228() {
-        let chr22 = "/home/rhubley/projects/Claude/rmblast-port/attic/rmblast-rs/chr22.fa";
-        if !std::path::Path::new(chr22).exists() { return; }
+        let chr22 = &repo_chr22();
         let region_end = 10511000usize;
         let mut seq = encode_fasta_region(chr22, 0, region_end);
         let masked = dust_mask(&mut seq, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
@@ -772,11 +780,11 @@ mod tests {
     ///   region2 (chr22:40060802-40061701): [580,592], [800,891]
     #[test]
     fn test_chr22_dust_vs_ncbi() {
-        // Read the two region files extracted from chr22.
-        let r1_seq = std::fs::read_to_string("/tmp/region1_dust.fa")
-            .expect("region1 file missing — run samtools faidx chr22_full.fa chr22:39030802-39031701");
-        let r2_seq = std::fs::read_to_string("/tmp/region2_dust.fa")
-            .expect("region2 file missing — run samtools faidx chr22_full.fa chr22:40060802-40061701");
+        // The two regions, extracted from tests/data/chr22.fa (1-based inclusive).
+        let read = |name: &str| std::fs::read_to_string(fixture(name))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+        let r1_seq = read("chr22_39030802-39031701.fa");
+        let r2_seq = read("chr22_40060802-40061701.fa");
 
         let r1_bases: Vec<u8> = r1_seq.lines()
             .filter(|l| !l.starts_with('>'))
