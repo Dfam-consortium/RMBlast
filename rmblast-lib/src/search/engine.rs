@@ -1075,7 +1075,7 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
         } else {
             let pos = accepted.partition_point(|a| a.0 < qs_i);
             accepted.insert(pos, (qs_i, qe_i, sc_i));
-            let span = (qe_i - qs_i) as u32;
+            let span = qe_i - qs_i;
             if span > max_accepted_span {
                 max_accepted_span = span;
             }
@@ -1188,7 +1188,7 @@ fn collect_ungapped<S: SeedOut>(
     //     and apply the same FWD-ascending dedup + ungapped extension.
     // This is O(n) vs the old O(n log n) sort while giving identical results.
     // -----------------------------------------------------------------------
-    let mut minus_seeds: Vec<(u32, u32)> = if strand == Strand::Minus { Vec::new() } else { Vec::new() };
+    let mut minus_seeds: Vec<(u32, u32)> = Vec::new();
 
     let mut diag_hash = BlastDiagHash::new();
 
@@ -1632,7 +1632,7 @@ fn run_phase2a_inner(
                 (pre_q, pre_s, tb_q, tb_s)
             }
             Strand::Minus => {
-                let lw_u32 = lut_word_length as u32;
+                let lw_u32 = lut_word_length;
                 // NCBI gapped_start = rc_q_off + 3 (DynProg path adds 3).
                 // In FWD-genome: q_seed = q0 + ext_right, so q_seed + lw - 4 = rc_q_off + 3 - ext_right.
                 // Using q_seed (not q0_raw) correctly accounts for the extension shift.
@@ -1826,7 +1826,7 @@ pub fn run_phase2b(
         let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
             let tq = qa_len - 1 - new_q_seed;
             let ts = sa_len - 1 - new_s_seed;
-            (&query_rc[..], subject_plus, tq, ts)
+            (query_rc, subject_plus, tq, ts)
         } else {
             (query, subject_plus, new_q_seed, new_s_seed)
         };
@@ -2312,7 +2312,7 @@ fn run_gapped_phase<U: UngapOut>(
                 (pre_q, pre_s, tb_q, tb_s)
             }
             Strand::Minus => {
-                let lw_u32 = lut_word_length as u32;
+                let lw_u32 = lut_word_length;
                 // NCBI's +3 gapped_start shift (blast_gapalign.c:4109) applies iff the ungapped
                 // alignment extends ≥8 bases to the RIGHT of the saved seed in FORWARD-subject
                 // space: `s_end >= init_hsp->s_off + 8`, where init_hsp->s_off is the saved seed
@@ -2518,9 +2518,9 @@ fn run_gapped_phase<U: UngapOut>(
         let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
             let tq = qa_len - 1 - new_q_seed;
             let ts = sa_len - 1 - new_s_seed;
-            (&query_rc[..], &subject_align[..], tq, ts)
+            (&query_rc[..], subject_align, tq, ts)
         } else {
-            (query, &subject_align[..], new_q_seed, new_s_seed)
+            (query, subject_align, new_q_seed, new_s_seed)
         };
 
         crate::diag_count!(COUNT_FINAL_GAPPED);
@@ -2653,7 +2653,7 @@ fn run_gapped_phase<U: UngapOut>(
                 r.hsp.s_start as usize
             };
             let b_core = if is_minus { rc_core } else { src_core };
-            let b_mask_2b = if is_minus { &n_mask_rc_2b[..] } else { n_mask };
+            let b_mask_2b = if is_minus { n_mask_rc_2b } else { n_mask };
             let (q_seq, s_seq) = extract_aligned(q_core, b_core, a_start, b_start, &r.hsp.edit_script, b_mask_2b);
 
             let delete = reevaluate_gapped(
@@ -3878,7 +3878,8 @@ mod tests {
     /// array order.
     #[test]
     fn purge_common_endpoints_matches_shift_to_end_layout() {
-        fn fingerprint(arr: &[Option<AlignResult>]) -> Vec<Option<(i32, u32, u32, u32, u32, Strand, Vec<(EditOp, u32)>)>> {
+        type Fingerprint = (i32, u32, u32, u32, u32, Strand, Vec<(EditOp, u32)>);
+        fn fingerprint(arr: &[Option<AlignResult>]) -> Vec<Option<Fingerprint>> {
             arr.iter().map(|o| o.as_ref().map(|r| (
                 r.hsp.score, r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end,
                 r.hsp.strand, r.hsp.edit_script.ops.clone(),
@@ -4017,7 +4018,7 @@ mod tests {
         let mut got: Vec<(i32, u32, u32, u32, u32)> = hsps.iter()
             .map(|h| (h.score, h.q_start, h.q_end, h.s_start, h.s_end))
             .collect();
-        got.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        got.sort_unstable_by_key(|g| std::cmp::Reverse(g.0));
         assert_eq!(got[0], (1044, 2,   322, 7,   292));
         assert_eq!(got[1], (160,  88,  182, 2,   96));
         assert_eq!(got[2], (110,  278, 341, 197, 260));
@@ -4044,7 +4045,7 @@ mod tests {
         let mut got: Vec<(i32, u32, u32, u32, u32)> = results.iter()
             .map(|r| (r.hsp.score, r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end))
             .collect();
-        got.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        got.sort_unstable_by_key(|g| std::cmp::Reverse(g.0));
         assert_eq!(got[0], (1044, 2,   322, 7,   292));
         assert_eq!(got[1], (160,  88,  182, 2,   96));
         assert_eq!(got[2], (110,  278, 341, 197, 260));

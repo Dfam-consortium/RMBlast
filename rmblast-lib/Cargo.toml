@@ -22,3 +22,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 memmap2 = { workspace = true }
 rmstats = { path = "../rmblast-stats/rmstats" }
+
+[lints]
+workspace = true

@@ -67,7 +67,7 @@ pub enum OutField {
 }
 
 impl OutField {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "score"          => Some(Self::Score),
             "perc_sub"       => Some(Self::PercSub),
@@ -108,7 +108,7 @@ pub fn outfmt_needs_stats(fields: &[OutField]) -> bool {
 pub fn parse_outfmt(s: &str) -> Vec<OutField> {
     s.split_whitespace()
         .filter(|t| t.parse::<u32>().is_err())
-        .filter_map(|t| OutField::from_str(t))
+        .filter_map(OutField::parse)
         .collect()
 }
 
@@ -231,7 +231,7 @@ pub fn write_tabular<W: Write>(
             }
         }
     }
-    write!(w, "\n")?;
+    writeln!(w)?;
     Ok(())
 }
 
@@ -308,17 +308,17 @@ pub fn write_pairwise_program_header<W: Write>(
     total_letters: u64,
 ) -> std::io::Result<()> {
     write!(w, "{}\n\n\n", RMBLASTN_VERSION)?;
-    write!(w, "Reference: Robert M. Hubley, Arian Smit\n")?;
-    write!(w, "RMBlast - RepeatMasker Search Engine\n")?;
-    write!(w, "2010 <http://www.repeatmasker.org>\n")?;
-    write!(w, "\n")?;
-    write!(w, "Reference: Stephen F. Altschul, Thomas L. Madden, Alejandro A.\n")?;
-    write!(w, "Schaffer, Jinghui Zhang, Zheng Zhang, Webb Miller, and David J.\n")?;
-    write!(w, "Lipman (1997), \"Gapped BLAST and PSI-BLAST: a new generation of\n")?;
-    write!(w, "protein database search programs\", Nucleic Acids Res. 25:3389-3402.\n")?;
+    writeln!(w, "Reference: Robert M. Hubley, Arian Smit")?;
+    writeln!(w, "RMBlast - RepeatMasker Search Engine")?;
+    writeln!(w, "2010 <http://www.repeatmasker.org>")?;
+    writeln!(w)?;
+    writeln!(w, "Reference: Stephen F. Altschul, Thomas L. Madden, Alejandro A.")?;
+    writeln!(w, "Schaffer, Jinghui Zhang, Zheng Zhang, Webb Miller, and David J.")?;
+    writeln!(w, "Lipman (1997), \"Gapped BLAST and PSI-BLAST: a new generation of")?;
+    writeln!(w, "protein database search programs\", Nucleic Acids Res. 25:3389-3402.")?;
     write!(w, "\n\n\n")?;
-    write!(w, "Database: {}\n", db_name)?;
-    write!(w, "           {} sequences; {} total letters\n", n_seqs, total_letters)?;
+    writeln!(w, "Database: {}", db_name)?;
+    writeln!(w, "           {} sequences; {} total letters", n_seqs, total_letters)?;
     write!(w, "\n\n\n")?;
     Ok(())
 }
@@ -377,14 +377,14 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
         Strand::Minus => "Plus/Minus",
     };
 
-    write!(w, " Score = {}\n", h.score)?;
-    write!(w, " Substitutions = {:.2}%, Query Gaps = {:.2}%, DB Gaps = {:.2}%\n",
+    writeln!(w, " Score = {}", h.score)?;
+    writeln!(w, " Substitutions = {:.2}%, Query Gaps = {:.2}%, DB Gaps = {:.2}%",
         st.perc_sub, st.perc_query_gap, st.perc_db_gap)?;
-    write!(w, " TransI/TransV = {}/{},  CpG_sites = {}\n",
+    writeln!(w, " TransI/TransV = {}/{},  CpG_sites = {}",
         st.transitions, st.transversions, st.cpg_sites)?;
-    write!(w, " Kimura Div = {:.2}%, Kimura Div CpG Adjusted = {:.2}%\n",
+    writeln!(w, " Kimura Div = {:.2}%, Kimura Div CpG Adjusted = {:.2}%",
         st.kdiv, st.cpg_kdiv)?;
-    write!(w, " Identities = {}/{} ({}%), Gaps = {}/{} ({}%)\n",
+    writeln!(w, " Identities = {}/{} ({}%), Gaps = {}/{} ({}%)",
         n_ident, aln_len, pct_ident, n_gaps, aln_len, pct_gaps)?;
     write!(w, " Strand={}\n\n", strand_str)?;
 
@@ -432,7 +432,7 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
         // Build the match indicator line.
         let match_line: Vec<u8> = q_row.iter().zip(s_row.iter()).map(|(&q, &s)| {
             if q == b'-' || s == b'-' { b' ' }
-            else if q.to_ascii_uppercase() == s.to_ascii_uppercase() { b'|' }
+            else if q.eq_ignore_ascii_case(&s) { b'|' }
             else { b' ' }
         }).collect();
 
@@ -441,17 +441,17 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
 
         write!(w, "Query  {:<width$}  ", q_row_start, width = pos_w)?;
         w.write_all(q_row)?;
-        write!(w, "  {}\n", q_row_end)?;
+        writeln!(w, "  {}", q_row_end)?;
 
         for _ in 0..prefix_spaces { w.write_all(b" ")?; }
         w.write_all(&match_line)?;
-        write!(w, "\n")?;
+        writeln!(w)?;
 
         write!(w, "Sbjct  {:<width$}  ", s_row_start, width = pos_w)?;
         w.write_all(s_row)?;
-        write!(w, "  {}\n", s_row_end)?;
+        writeln!(w, "  {}", s_row_end)?;
 
-        write!(w, "\n")?;   // blank line after each chunk
+        writeln!(w)?;   // blank line after each chunk
 
         q_pos += q_nongap;
         match h.strand {
@@ -463,7 +463,7 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
     }
 
     // One extra blank line → total 2 blank lines after last chunk.
-    write!(w, "\n")?;
+    writeln!(w)?;
 
     Ok(())
 }
@@ -494,15 +494,15 @@ pub fn write_pairwise_footer<W: Write>(
 ) -> std::io::Result<()> {
     // Two extra blank lines (the last HSP already contributed 2, giving 4 total).
     write!(w, "\n\n")?;
-    write!(w, "  Database: {}\n", db_name)?;
+    writeln!(w, "  Database: {}", db_name)?;
     if let Some(secs) = db_mtime_unix {
-        write!(w, "    Posted date:  {}\n", format_ncbi_date(secs))?;
+        writeln!(w, "    Posted date:  {}", format_ncbi_date(secs))?;
     }
-    write!(w, "  Number of letters in database: {}\n", total_letters)?;
-    write!(w, "  Number of sequences in database:  {}\n", n_seqs)?;
+    writeln!(w, "  Number of letters in database: {}", total_letters)?;
+    writeln!(w, "  Number of sequences in database:  {}", n_seqs)?;
     write!(w, "\n\n\n")?;
-    write!(w, "Matrix: blastn matrix 0 0\n")?;
-    write!(w, "Gap Penalties: Existence: {}, Extension: {:.2}\n",
+    writeln!(w, "Matrix: blastn matrix 0 0")?;
+    writeln!(w, "Gap Penalties: Existence: {}, Extension: {:.2}",
         gap_open, gap_extend as f64)?;
     Ok(())
 }

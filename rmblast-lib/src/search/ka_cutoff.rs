@@ -181,10 +181,10 @@ mod tests {
         let (c, info) = ungapped_cutoff("18p43g.matrix", 28, 5, 300, 49802, 919);
         let info = info.expect("KA should apply for 18p43g {28,5}");
         // closed form check
-        let searchsp = 919u64.min(2 * 49802).saturating_mul(919);
+        let searchsp = 919u64.saturating_mul(919);
         let es = ((0.1957371364 * searchsp as f64 / 0.05).ln() / 0.1179924113).ceil() as i32;
         assert_eq!(info.es, es);
-        assert_eq!(c, es.max(1).min(150));
+        assert_eq!(c, es.clamp(1, 150));
         assert!(c < 150, "KA cutoff {} must be below the fixed 150", c);
         assert!(c <= 140, "KA cutoff {} must let the ungapped-140 anchor seed through", c);
     }

@@ -4,9 +4,9 @@
 //!   - 16-byte file header: signature(4) version(4) seqCount(4) reserved(4)
 //!   - seqCount × (name_size(1) + name(name_size) + offset(4)) index entries
 //!   - Per-sequence records at the offsets:
-//!       dnaSize(4)  nBlockCount(4)  nBlockStarts[](4)  nBlockSizes[](4)
-//!       maskBlockCount(4)  maskBlockStarts[](4)  maskBlockSizes[](4)
-//!       reserved(4)  packed_dna(ceil(dnaSize/4) bytes)
+//!     dnaSize(4)  nBlockCount(4)  nBlockStarts[](4)  nBlockSizes[](4)
+//!     maskBlockCount(4)  maskBlockStarts[](4)  maskBlockSizes[](4)
+//!     reserved(4)  packed_dna(ceil(dnaSize/4) bytes)
 //!
 //! Bases are packed 4 per byte, MSB-first: T=00 C=01 A=10 G=11.
 //! N-blocks overlay the packed sequence with ambiguous bases.
@@ -286,7 +286,7 @@ impl TwoBitFile {
         let end = start + len;
         let dna_size = seq.dna_size;
         let actual_end = end.min(dna_size);
-        let actual_len = if actual_end > start { actual_end - start } else { 0 };
+        let actual_len = actual_end.saturating_sub(start);
 
         let mut out = vec![NUCL_SENTINEL; actual_len as usize + 2];
 

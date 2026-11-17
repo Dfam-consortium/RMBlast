@@ -8,8 +8,8 @@
 //!   the backbone at 4^12×4 = 67 MB rather than 4^14×24 = 6.4 GB.
 //!
 //! - The table uses a compact linked-list layout matching NCBI's MBLookupTable:
-//!     backbone[hash] = 1 + first_query_position  (0 → empty)
-//!     next_pos[i]    = previous backbone value for the same hash
+//!   backbone[hash] = 1 + first_query_position  (0 → empty);
+//!   next_pos[i]    = previous backbone value for the same hash
 //!   so traversal is: q_off = backbone[hash]-1; while q_off valid: next = next_pos[q_off+1]-1
 //!
 //! - Subject is scanned at stride `scan_step = word_size − lut_width + 1`.
@@ -146,7 +146,7 @@ impl NaLookupTable {
     /// Core table builder.  `approx_entries` overrides the default n-derived estimate
     /// so callers can pass 2×fwd_len for the combined case.
     fn build_from_slice(query: &[u8], approx_entries: usize, word_size: usize) -> Self {
-        assert!(word_size >= 4 && word_size <= 14, "word_size must be 4-14");
+        assert!((4..=14).contains(&word_size), "word_size must be 4-14");
 
         let n = query.len().saturating_sub(2); // real base count (may span two contexts)
         let lut_width = choose_lut_width(word_size, approx_entries);

@@ -140,6 +140,7 @@ pub fn res_freq_string(query: &[u8]) -> [f64; BLASTNA_SIZE] {
 
 /// BlastScoreFreqCalc (blast_stat.c): score frequencies given the matrix and
 /// the residue frequencies of the two sequences (rfp1 = query, rfp2 = db).
+#[allow(clippy::result_unit_err)] // NCBI's int status: the only failure carries no detail
 pub fn score_freq_calc(
     matrix: &[[i32; BLASTNA_SIZE]; BLASTNA_SIZE],
     rfp1: &[f64; BLASTNA_SIZE],

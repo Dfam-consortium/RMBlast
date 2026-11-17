@@ -511,7 +511,7 @@ fn main() -> Result<()> {
     let gilist = load_gilist(args.gilist.as_deref())?;
     let subject_names: Vec<String> = db.sequences().iter()
         .map(|s| s.name.clone())
-        .filter(|n| gilist.as_ref().map_or(true, |gl| gl.contains(n.as_str())))
+        .filter(|n| gilist.as_ref().is_none_or(|gl| gl.contains(n.as_str())))
         .collect();
 
     if subject_names.is_empty() {
@@ -1127,11 +1127,11 @@ fn search_db_parallel(
 
         let split_point = chunk_start as u32;
         if k == 0 {
-            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims.into_iter()) {
+            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims) {
                 *acc = new;
             }
         } else {
-            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims.into_iter()) {
+            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims) {
                 merge_chunk_prelims(acc, new, split_point);
             }
         }

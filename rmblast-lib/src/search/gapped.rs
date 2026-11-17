@@ -90,6 +90,12 @@ impl AlignWorkspace {
 
 }
 
+impl Default for AlignWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Score-only gapped alignment — no traceback storage (mirrors score_only=TRUE path).
 ///
 /// Returns (score, a_len, b_len). Much faster than `align_ex` when traceback not needed.
@@ -691,7 +697,7 @@ fn traceback_flat(
     while a > 0 || b > 0 {
         if a >= row_info.len() {
             push_rev(&mut ops_rev, EditOp::GapInQuery);
-            if b > 0 { b -= 1; }
+            b = b.saturating_sub(1);
             continue;
         }
 
@@ -720,11 +726,11 @@ fn traceback_flat(
         prev_op = op;
 
         match op {
-            SCRIPT_GAP_IN_A => { push_rev(&mut ops_rev, EditOp::GapInQuery);   if b > 0 { b -= 1; } }
-            SCRIPT_GAP_IN_B => { push_rev(&mut ops_rev, EditOp::GapInSubject); if a > 0 { a -= 1; } }
+            SCRIPT_GAP_IN_A => { push_rev(&mut ops_rev, EditOp::GapInQuery);   b = b.saturating_sub(1); }
+            SCRIPT_GAP_IN_B => { push_rev(&mut ops_rev, EditOp::GapInSubject); a = a.saturating_sub(1); }
             _ =>               { push_rev(&mut ops_rev, EditOp::Sub);
-                                  if a > 0 { a -= 1; }
-                                  if b > 0 { b -= 1; } }
+                                  a = a.saturating_sub(1);
+                                  b = b.saturating_sub(1); }
         }
 
         if a == 0 && b == 0 { break; }

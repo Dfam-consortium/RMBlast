@@ -217,6 +217,7 @@ impl Triplets {
 
     /// Mirror of NCBI `find_perfect`.
     /// `perfect` is ordered with index-0 = largest `start`, last = smallest `start`.
+    #[allow(clippy::explicit_counter_loop)] // `count` mirrors symdust.cpp's counter
     pub fn find_perfect(&self, perfect: &mut Vec<Perfect>, thresholds: &[u32]) {
         let mut counts = [0u32; 64];
         counts.copy_from_slice(&self.c_v);
@@ -232,7 +233,7 @@ impl Triplets {
 
         // deque[stop-l .. list.len()-1] are the pre-suffix triplets (oldest = back)
         // deque[k] = absolute position (stop - k)
-        let start_idx = (self.stop - self.l) as usize; // = count as usize
+        let start_idx = self.stop - self.l; // = count as usize
 
         for idx in start_idx..self.list.len() {
             let ti = self.list[idx];
@@ -295,7 +296,7 @@ fn save_masked(
         let b0 = back_start;
         let b1 = back_stop;
 
-        let should_merge = res.last().map_or(false, |l| l.1 + linker >= b0);
+        let should_merge = res.last().is_some_and(|l| l.1 + linker >= b0);
         if should_merge {
             let last = res.last_mut().unwrap();
             if b1 > last.1 { last.1 = b1; }
@@ -724,7 +725,7 @@ mod tests {
         let masked = dust_mask(&mut seq, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
         println!("Masked intervals in chr22:10510300-10510540 (full prefix test):");
         for &(s, e) in &masked {
-            if s >= 10510300 && s <= 10510540 {
+            if (10510300..=10510540).contains(&s) {
                 println!("  chr22:{}-{}", s, e);
             }
         }
@@ -733,7 +734,7 @@ mod tests {
             let found = masked.iter().any(|&(s, e)| s == exp_s && e == exp_e);
             assert!(found, "Expected masked chr22:{}-{} not found. Near-region intervals: {:?}",
                 exp_s, exp_e,
-                masked.iter().filter(|&&(s, _)| s >= 10510300 && s <= 10510540)
+                masked.iter().filter(|&&(s, _)| (10510300..=10510540).contains(&s))
                     .collect::<Vec<_>>());
         }
     }

@@ -71,6 +71,7 @@ fn adjust_gap_parameters_by_gcd(
 
 /// s_GetNuclValuesArray (blast_stat.c). Err(()) for an unsupported
 /// reward/penalty pair ("Substitution scores %d and %d are not supported").
+#[allow(clippy::result_unit_err)] // NCBI's int status: the only failure carries no detail
 pub fn get_nucl_values_array(reward: i32, penalty: i32) -> Result<NuclValues, ()> {
     let divisor = blast_gcd(reward, penalty);
     let (mut reward, mut penalty) = (reward, penalty);
@@ -187,6 +188,7 @@ fn get_ungapped_beta(reward: i32, penalty: i32) -> f64 {
 /// used for the fallback alpha = Lambda/H. Err(()) mirrors the status return
 /// for an unsupported reward/penalty pair (in which case the C caller's
 /// alpha/beta retain their previous values).
+#[allow(clippy::result_unit_err)] // NCBI's int status: the only failure carries no detail
 pub fn get_nucl_alpha_beta(
     reward: i32,
     penalty: i32,

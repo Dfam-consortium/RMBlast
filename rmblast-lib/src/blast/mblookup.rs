@@ -194,7 +194,7 @@ pub fn blast_mb_lookup_table_new(
     lut_width:      i32,
     approx_entries: usize,
 ) -> BlastMBLookupTable {
-    debug_assert!(lut_width >= 9 && lut_width <= 12,
+    debug_assert!((9..=12).contains(&lut_width),
         "BlastMBLookupTable requires lut_width 9–12, got {}", lut_width);
 
     let hashsize = 1i64 << (BITS_PER_NUC * lut_width);
@@ -205,7 +205,7 @@ pub fn blast_mb_lookup_table_new(
     //   else:                             pv_size = kTargetPVSize / PV_ARRAY_BYTES
     // Then halve if query is very small (≤15000) or very large (≥800000).
     let mut pv_size = if hashsize <= 8 * K_TARGET_PV_SIZE {
-        (hashsize >> PV_ARRAY_BTS) as i64
+        hashsize >> PV_ARRAY_BTS
     } else {
         K_TARGET_PV_SIZE / PV_ARRAY_BYTES as i64
     };
@@ -218,7 +218,7 @@ pub fn blast_mb_lookup_table_new(
     let query_length = query_sequence.len();
 
     let mut lookup = BlastMBLookupTable {
-        word_length:     word_length,
+        word_length,
         lut_word_length: lut_width,
         hashsize,
         scan_step:       word_length - lut_width + 1,

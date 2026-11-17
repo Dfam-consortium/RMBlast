@@ -109,3 +109,9 @@ impl BlastDiagHash {
         self.occupancy += 1;
     }
 }
+
+impl Default for BlastDiagHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}

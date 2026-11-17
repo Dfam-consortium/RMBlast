@@ -166,7 +166,7 @@ fn classify_pair_ascii(a: u8, b: u8) -> PairType {
     // NCBI checks literal equality FIRST (tabular.cpp x_fillAlignStatsRMBlast: `if(anc==der)
     // match++`), so any identical pair — including ambiguity-vs-same-ambiguity (R/R) or N/N —
     // is an exact match, never a substitution.
-    if a.to_ascii_uppercase() == b.to_ascii_uppercase() {
+    if a.eq_ignore_ascii_case(&b) {
         return PairType::Identity;
     }
     if !is_unambig(a) || !is_unambig(b) {

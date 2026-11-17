@@ -16,3 +16,6 @@ cc = { version = "1", optional = true }
 [lib]
 name = "rmstats"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

@@ -81,7 +81,7 @@ impl FastaDb {
         // Iterate only the bases (skip sentinels at index 0 and last).
         for slot in &mut out[1..last] {
             let code = *slot;
-            if code >= 4 && code <= 14 {
+            if (4..=14).contains(&code) {
                 *slot = rng.next_base_iupac(code);
             }
         }
@@ -99,12 +99,12 @@ impl FastaDb {
         };
         let raw = &self.raw_seqs[idx];
         let bases = &raw[1..raw.len() - 1];
-        if !bases.iter().any(|&c| c >= 4 && c <= 14) {
+        if !bases.iter().any(|&c| (4..=14).contains(&c)) {
             return Vec::new();
         }
         let mut mask = vec![0u8; bases.len()];
         for (i, &c) in bases.iter().enumerate() {
-            if c >= 4 && c <= 14 {
+            if (4..=14).contains(&c) {
                 mask[i] = c;
             }
         }

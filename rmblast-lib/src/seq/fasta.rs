@@ -85,8 +85,8 @@ impl<R: BufRead> FastaReader<R> {
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed.starts_with('>') {
-                let defline = trimmed[1..].to_owned();
+            if let Some(rest) = trimmed.strip_prefix('>') {
+                let defline = rest.to_owned();
                 if header.is_none() {
                     header = Some(defline);
                 } else {

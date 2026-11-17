@@ -30,7 +30,6 @@
 /// a **subject** range for subject-axis (midpoint-tree) nodes.  An internal query
 /// node's `midptr` points at the root of its subject midpoint tree; a subject node's
 /// `midptr` is the head of a LIFO linked list of leaves straddling the subject center.
-
 use std::collections::HashMap;
 
 const INTERNAL: u32 = u32::MAX; // sentinel: this node is an internal (non-leaf) node

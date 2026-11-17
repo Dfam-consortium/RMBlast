@@ -97,7 +97,7 @@ impl ScoreMatrix {
                 // Heuristic: if the first token is a single letter and the
                 // second token is also a single letter (or the line has many
                 // single letters), it's the header row.
-                let all_letters = tokens.iter().all(|t| t.len() == 1 && t.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || *t == "-"));
+                let all_letters = tokens.iter().all(|t| t.len() == 1 && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || *t == "-"));
                 if all_letters {
                     for tok in &tokens {
                         let ch = tok.chars().next().unwrap() as u8;
@@ -195,6 +195,7 @@ impl ScoreMatrix {
 /// encoding for two symbols:
 ///   - '-'  -> 15 (gap slot)
 ///   - 'X'  -> 15 (gap slot)   [sequence encoding sends 'X' -> 14 (N)]
+///
 /// Sending 'X' to 15 here is essential: matrices like 20p43g/18p43g carry BOTH
 /// an 'N' column (-1) and an 'X' column (-30).  If 'X' shared N's index 14 the
 /// X row/column would clobber N (bug #33).  At 15 the X entries land in the gap

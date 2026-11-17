@@ -1,7 +1,9 @@
 //! Ports of helpers from ncbi_math.c used by the statistics code.
 
 /// ln(2) as defined in ncbi_math.h (NCBIMATH_LN2).
-pub const NCBIMATH_LN2: f64 = 0.69314718055994530941723212145818;
+// NCBI writes this as 0.69314718055994530941723212145818 (ncbi_math.h); it rounds
+// to the same f64.
+pub const NCBIMATH_LN2: f64 = std::f64::consts::LN_2;
 
 /// BLAST_Gcd (ncbi_math.c): greatest common divisor.
 pub fn blast_gcd(a: i32, b: i32) -> i32 {
