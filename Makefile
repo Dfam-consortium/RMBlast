@@ -43,7 +43,7 @@ $(if $(VERSION),,$(error could not read version from $(MANIFEST)))
 # Versioned package root (DESTDIR-aware for staged packaging).
 PKGDIR = $(DESTDIR)$(PREFIX)/$(NAME)-$(VERSION)
 
-.PHONY: all build test version install uninstall dist clean
+.PHONY: all build test test-full version install uninstall dist clean
 
 all: build
 
@@ -55,6 +55,12 @@ build:
 
 test:
 	$(CARGO) test --release
+
+# Also runs the #[ignore]d chr22 seed and ungapped-hit regression tests
+# (rmblast-lib/tests/), which compare against NCBI-derived references and add
+# about 40 s.
+test-full:
+	$(CARGO) test --release -- --include-ignored
 
 # Install into a top-level <prefix>/<name>-<version>/ hierarchy.
 #

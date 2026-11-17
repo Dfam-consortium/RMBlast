@@ -22,7 +22,7 @@ fn data_dir() -> PathBuf {
 fn workspace_test_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("oxyblast-lib has a parent workspace dir")
+        .expect("rmblast-lib has a parent workspace dir")
         .join("tests/data")
 }
 
@@ -63,11 +63,10 @@ fn ungapped_regression_chr22() {
     let matrix_path = data_dir().join("comparison.matrix");
     let reference   = data_dir().join("chr22_ungapped_hits.txt");
 
+    // All four files are tracked in git: a missing one is a broken checkout,
+    // not a reason to pass.
     for p in &[&chr22, &alu_2bit, &matrix_path, &reference] {
-        if !p.exists() {
-            eprintln!("skipping: {} not found", p.display());
-            return;
-        }
+        assert!(p.exists(), "test data missing: {}", p.display());
     }
 
     let matrix = ScoreMatrix::from_file(matrix_path.to_str().unwrap()).expect("load matrix");
