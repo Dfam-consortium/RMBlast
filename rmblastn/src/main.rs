@@ -18,7 +18,7 @@ use rmblast_lib::output::{
     outfmt_needs_stats, parse_outfmt, write_tabular, write_pairwise_program_header,
     write_pairwise_results, write_pairwise_footer, AlignResult, OutField,
 };
-use rmblast_lib::search::{apply_mask_level, sort_hit_list_order, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
+use rmblast_lib::search::{apply_mask_level, sort_hit_list_order_by_oid, subject_oids, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
 use rmblast_lib::seq::{FastaReader, SubjectDb};
 
@@ -584,21 +584,23 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening database '{}'", db_path))?;
 
     let gilist = load_gilist(args.gilist.as_deref())?;
-    let subject_names: Vec<String> = db.sequences().iter()
-        .map(|s| s.name.clone())
-        .filter(|n| gilist.as_ref().is_none_or(|gl| gl.contains(n.as_str())))
-        .collect();
+    // The subjects to search, and the database statistics for the pairwise
+    // header/footer, in one pass (3.0.12 summed the letters with a
+    // Vec::contains per sequence: 28 s of startup at 100k sequences).
+    let mut subject_names: Vec<String> = Vec::new();
+    let mut total_db_letters: u64 = 0;
+    for s in db.sequences() {
+        if gilist.as_ref().is_none_or(|gl| gl.contains(s.name.as_str())) {
+            total_db_letters += s.dna_size as u64;
+            subject_names.push(s.name.clone());
+        }
+    }
 
     if subject_names.is_empty() {
         return Ok(());
     }
-
-    // Compute database statistics for pairwise header/footer.
     let n_db_seqs = subject_names.len();
-    let total_db_letters: u64 = db.sequences().iter()
-        .filter(|s| subject_names.contains(&s.name))
-        .map(|s| s.dna_size as u64)
-        .sum();
+    let subject_oid = subject_oids(&subject_names);
 
     // Average DB sequence length (NCBI BlastSeqSrcGetAvgSeqLen: integer-truncated
     // total residues / number of sequences).  Feeds the Karlin-Altschul ungapped
@@ -737,7 +739,7 @@ fn main() -> Result<()> {
                     avg_subj_length, args.dump_prelims.as_deref(), prelim_cull,
                     reap_for_query(full_q_len as i32),
                 );
-                sort_hit_list_order(&mut results, &subject_names);
+                sort_hit_list_order_by_oid(&mut results, &subject_oid);
                 match &output_format {
                     OutputFormat::Pairwise => {
                         write_pairwise_results(&mut out, &results, &qrec.defline, full_q_len)
@@ -787,8 +789,8 @@ fn main() -> Result<()> {
             let (tx, rx) = mpsc::channel::<(usize, std::thread::Result<Vec<AlignResult>>)>();
             #[cfg(feature = "diagnostics")]
             let panic_at = test_panic_at_query();
-            let (queries, subjects, db, params, matrix, reap) =
-                (&all_queries, &subject_names, &db, &params, &matrix, &reap_for_query);
+            let (queries, subjects, oids, db, params, matrix, reap) =
+                (&all_queries, &subject_names, &subject_oid, &db, &params, &matrix, &reap_for_query);
             let (written, stop) = (&written, &stop);
             std::thread::scope(|ts| -> Result<()> {
                 ts.spawn(move || {
@@ -821,7 +823,7 @@ fn main() -> Result<()> {
                                         avg_subj_length, None, prelim_cull,
                                         reap(q.len() as i32),
                                     );
-                                    sort_hit_list_order(&mut qr, subjects);
+                                    sort_hit_list_order_by_oid(&mut qr, oids);
                                     qr
                                 }));
                                 let _ = tx.send((i, qr));

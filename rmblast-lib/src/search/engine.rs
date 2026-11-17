@@ -1098,10 +1098,20 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
 /// function sorts on the score keys only.  `oid` is the index in `subject_names`; unknown names get
 /// oid 0, as in `apply_mask_level`.
 pub fn sort_hit_list_order(results: &mut [AlignResult], subject_names: &[String]) {
-    let oid_map: std::collections::HashMap<&str, usize> = subject_names.iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
+    sort_hit_list_order_by_oid(results, &subject_oids(subject_names));
+}
+
+/// Subject name -> position in the database (its OID), for
+/// [`sort_hit_list_order_by_oid`].  Build it once per run, not per query.
+pub fn subject_oids(subject_names: &[String]) -> std::collections::HashMap<&str, usize> {
+    subject_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect()
+}
+
+/// [`sort_hit_list_order`] with the name -> OID map built in advance.
+pub fn sort_hit_list_order_by_oid(
+    results: &mut [AlignResult],
+    oid_map: &std::collections::HashMap<&str, usize>,
+) {
     // (top score, oid) per subject, keyed by owned name so the map does not
     // borrow `results` while we sort it.
     let mut rank: std::collections::HashMap<String, (i32, usize)> = std::collections::HashMap::new();
