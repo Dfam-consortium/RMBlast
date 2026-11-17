@@ -279,12 +279,14 @@ pub fn choose_lut_width(word_size: usize, approx_entries: usize) -> usize {
             else if approx_entries < 900_000 { 11 }
             else                             { 12 }
         }
-        _ => {
-            // word_size ≥ 13
+        13.. => {
             if      approx_entries < 8_500   { 8 }
             else if approx_entries < 300_000 { 11 }
             else                             { 12 }
         }
+        // NCBI's switch has no case below 4 either: its CLI rejects them, and
+        // so does ours.  A width above the word size would make scan_step <= 0.
+        _ => panic!("word_size {word_size} is below the minimum of 4"),
     }
 }
 

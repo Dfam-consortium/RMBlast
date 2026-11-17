@@ -19,6 +19,9 @@
 //!     rm_defaults:    -mask_level 80 -complexity_adjust -dust yes
 //!     nomask_nodust:  -mask_level 101 -dust no
 //!   ```
+//!
+//!   `expected_defaults` is the same but with only `-gapopen 20 -gapextend 5
+//!   -num_threads 1 -outfmt "6 <RM_FIELDS>"`: every other option at NCBI's default.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -162,12 +165,98 @@ fn ncbi_spelling_matches_native_spelling() {
     assert_same_output(&r, &expected("expected_rm_defaults.ncbi-2.17.1.tsv"));
 }
 
+/// With only the (required) gap costs given, every other option takes NCBI's
+/// default.  3.0.12 defaulted --word-size to 8 where NCBI uses 11.
+#[test]
+fn defaults_match_ncbi() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    let r = rmblastn(&[
+        "--db", &db, "--query", &q, "--matrix", &m,
+        "--gapopen", "20", "--gapextend", "5", "--outfmt", RM_FIELDS,
+    ]);
+    assert_same_output(&r, &expected("expected_defaults.ncbi-2.17.1.tsv"));
+}
+
 // ── errors ──────────────────────────────────────────────────────────────────
+
+/// Each bad option value is a usage error that names the option, and nothing
+/// is searched.  3.0.12 panicked (word size 0-2), hung (word size 3, negative
+/// or huge gap costs) or silently substituted a value for most of these.
+#[test]
+fn bad_option_values_are_rejected() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    let cases: &[(&[&str], &str)] = &[
+        (&["--word-size", "0"], "--word-size"),
+        (&["--word-size", "3"], "--word-size"),
+        (&["--word-size", "4.5"], "--word-size"),
+        (&["--gapopen", "-60"], "--gapopen"),
+        (&["--gapopen", "2000000000"], "--gapopen"),
+        (&["--gapextend", "0"], "--gapextend"),
+        (&["--gapextend", "-1"], "--gapextend"),
+        (&["--num-threads", "0"], "--num-threads"),
+        (&["--mt-mode", "2"], "--mt-mode"),
+        (&["--seed-mode", "junk"], "--seed-mode"),
+        (&["--evalue", "0"], "--evalue"),
+        (&["--evalue", "-1"], "--evalue"),
+        (&["--evalue", "nan"], "--evalue"),
+        (&["--dust", "junk"], "--dust"),
+        (&["--dust", "YES"], "--dust"),
+        (&["--dust", "20 64 1"], "level window linker"),
+        (&["--xdrop-gap", "-1"], "--xdrop-gap"),
+        (&["--min-raw-gapped-score", "-5"], "--min-raw-gapped-score"),
+        (&["--matrix-lambda", "-1"], "--matrix-lambda"),
+        (&["-num_threads", "0"], "--num-threads"),
+    ];
+    for (bad, needle) in cases {
+        // the bad value last, so it overrides nothing and duplicates nothing
+        let mut args = vec!["--db", &db, "--query", &q, "--matrix", &m, "--outfmt", "6 score"];
+        if !bad[0].contains("gap") || bad[0].contains("xdrop") {
+            args.extend(["--gapopen", "20", "--gapextend", "5"]);
+        } else if bad[0] == "--gapopen" {
+            args.extend(["--gapextend", "5"]);
+        } else {
+            args.extend(["--gapopen", "20"]);
+        }
+        args.extend_from_slice(bad);
+        let r = rmblastn(&args);
+        assert!(matches!(r.code, Some(1) | Some(2)), "{bad:?}: exit {:?}, stderr:\n{}", r.code, r.stderr);
+        assert!(r.stderr.contains(needle), "{bad:?}: stderr lacks {needle:?}:\n{}", r.stderr);
+        assert!(r.stdout.is_empty(), "{bad:?}: printed output");
+    }
+}
+
+/// Gap costs have no usable default (NCBI rmblastn's 0/0 is rejected).
+#[test]
+fn gap_costs_are_required() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    let r = rmblastn(&["--db", &db, "--query", &q, "--matrix", &m, "--gapopen", "20"]);
+    assert_eq!(r.code, Some(2));
+    assert!(r.stderr.contains("--gapextend"), "stderr:\n{}", r.stderr);
+}
+
+/// The edge values that are allowed still run.
+#[test]
+fn boundary_option_values_are_accepted() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    for extra in [
+        &["--gapopen", "0", "--gapextend", "1"][..],
+        &["--gapopen", "20", "--gapextend", "5", "--word-size", "4"][..],
+        &["--gapopen", "1000000", "--gapextend", "1000000"][..],
+        &["--gapopen", "20", "--gapextend", "5", "--dust", "false", "--evalue", "1e-5",
+          "-matrix_beta", "-4.9", "-mask_level", "-1"][..],
+    ] {
+        let mut args = vec!["--db", &db, "--query", &q, "--matrix", &m, "--outfmt", "6 score"];
+        args.extend_from_slice(extra);
+        let r = rmblastn(&args);
+        assert_eq!(r.code, Some(0), "{extra:?}: stderr:\n{}", r.stderr);
+    }
+}
 
 #[test]
 fn missing_database_is_an_error() {
     let (q, m) = (data("query.fa"), data("comparison.matrix"));
-    let r = rmblastn(&["--db", "/nonexistent/db", "--query", &q, "--matrix", &m]);
+    let r = rmblastn(&["--db", "/nonexistent/db", "--query", &q, "--matrix", &m,
+                       "--gapopen", "20", "--gapextend", "5"]);
     assert_ne!(r.code, Some(0));
     assert!(r.stderr.contains("database not found"), "stderr: {}", r.stderr);
     assert!(r.stdout.is_empty());
@@ -176,9 +265,10 @@ fn missing_database_is_an_error() {
 #[test]
 fn missing_matrix_is_an_error() {
     let (db, q) = (data("db.fa"), data("query.fa"));
-    let r = rmblastn(&["--db", &db, "--query", &q, "--matrix", "no-such.matrix"]);
+    let r = rmblastn(&["--db", &db, "--query", &q, "--matrix", "no-such.matrix",
+                       "--gapopen", "20", "--gapextend", "5"]);
     assert_ne!(r.code, Some(0));
-    assert!(!r.stderr.is_empty());
+    assert!(r.stderr.contains("Cannot find substitution matrix"), "stderr: {}", r.stderr);
     assert!(r.stdout.is_empty());
 }
 
@@ -239,6 +329,7 @@ fn mt_mode_1_panic_exits(n_queries: usize, panic_at: usize) {
     let at = panic_at.to_string();
     let r = rmblastn_env(
         &["--db", &db, "--query", q.path(), "--matrix", &m,
+          "--gapopen", "20", "--gapextend", "5",
           "--mt-mode", "1", "--num-threads", "2", "--outfmt", RM_FIELDS],
         &[("RMBLAST_TEST_PANIC_AT_QUERY", &at)],
     );

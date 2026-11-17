@@ -138,53 +138,62 @@ struct Args {
     #[arg(long, default_value = "")]
     matrix: String,
 
-    /// Gap open penalty
-    #[arg(long, default_value_t = 4)]
+    /// Gap open penalty, 0 to 1000000 (required: NCBI rmblastn's default of 0
+    /// is rejected; NCBI also accepts negative values, we don't)
+    #[arg(long, allow_hyphen_values = true, value_parser = gap_cost::<0>)]
     gapopen: i32,
 
-    /// Gap extend penalty
-    #[arg(long, default_value_t = 4)]
+    /// Gap extend penalty, 1 to 1000000 (required, as for --gapopen; NCBI
+    /// rejects 0 and accepts negative values)
+    #[arg(long, allow_hyphen_values = true, value_parser = gap_cost::<1>)]
     gapextend: i32,
 
-    /// Word size for seeding
-    #[arg(long, default_value_t = 8)]
+    /// Word size for seeding (>= 4; default 11, as in NCBI)
+    #[arg(long, default_value_t = 11, allow_hyphen_values = true,
+          value_parser = at_least::<usize, 4>)]
     word_size: usize,
 
-    /// X-dropoff for ungapped extension
-    #[arg(long, default_value_t = 20)]
+    /// X-dropoff for ungapped extension (>= 0)
+    #[arg(long, default_value_t = 20, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     xdrop_ungap: i32,
 
-    /// X-dropoff for gapped extension
-    #[arg(long, default_value_t = 30)]
+    /// X-dropoff for gapped extension (>= 0)
+    #[arg(long, default_value_t = 30, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     xdrop_gap: i32,
 
-    /// X-dropoff for final gapped extension
-    #[arg(long, default_value_t = 100)]
+    /// X-dropoff for final gapped extension (>= 0)
+    #[arg(long, default_value_t = 100, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     xdrop_gap_final: i32,
 
     /// Cutoff for the preliminary gapped stage. NOT a floor on the reported
     /// score: traceback re-aligns under --xdrop-gap-final and may score lower,
     /// and that lower score is reported (matches NCBI rmblastn). Post-filter if
     /// you need a hard floor.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     min_raw_gapped_score: i32,
 
     /// Use complexity adjusted scoring (bare flag, no value required)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     complexity_adjust: bool,
 
-    /// Filter query with DUST: 'yes' to enable, 'no' to disable.
-    /// NCBI also accepts 'level window linker' (e.g. '20 64 1'); custom
-    /// parameters are accepted but ignored — only yes/no is acted on.
+    /// Filter query with DUST: yes|true to enable, no|false to disable.
+    /// NCBI also accepts 'level window linker' (e.g. '20 64 1'); custom DUST
+    /// parameters are not supported here and are rejected.
     #[arg(long, default_value = "yes")]
     dust: String,
 
-    /// Number of threads
-    #[arg(long, default_value_t = 1)]
+    /// Number of threads (>= 1)
+    #[arg(long, default_value_t = 1, allow_hyphen_values = true,
+          value_parser = at_least::<usize, 1>)]
     num_threads: usize,
 
     /// Threading mode: 0 = split by DB, 1 = split by queries
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true,
+          value_parser = clap::value_parser!(u8).range(0..=1))]
     mt_mode: u8,
 
     /// Output format: 0 = pairwise (default, matches NCBI rmblastn), 6 [fields...] = tabular.
@@ -236,19 +245,23 @@ struct Args {
 
     /// Karlin-Altschul lambda override for E-value statistics of a matrix
     /// absent from the baked table (NCBI -matrix_lambda; needs _k and _alpha too)
-    #[arg(long, alias = "matrix_lambda", default_value_t = 0.0)]
+    #[arg(long, alias = "matrix_lambda", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_nonnegative)]
     matrix_lambda: f64,
 
     /// Karlin-Altschul K override (NCBI -matrix_k)
-    #[arg(long, alias = "matrix_k", default_value_t = 0.0)]
+    #[arg(long, alias = "matrix_k", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_nonnegative)]
     matrix_k: f64,
 
     /// Karlin-Altschul alpha override (NCBI -matrix_alpha; H = lambda/alpha)
-    #[arg(long, alias = "matrix_alpha", default_value_t = 0.0)]
+    #[arg(long, alias = "matrix_alpha", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_nonnegative)]
     matrix_alpha: f64,
 
     /// Karlin-Altschul beta override for the length adjustment (NCBI -matrix_beta)
-    #[arg(long, alias = "matrix_beta", default_value_t = 0.0, allow_hyphen_values = true)]
+    #[arg(long, alias = "matrix_beta", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_finite)]
     matrix_beta: f64,
 
     /// Expect-value threshold: drop HSPs with E-value above this.  By
@@ -256,7 +269,7 @@ struct Args {
     /// statistics then come from the full source hierarchy: baked table,
     /// -matrix_* overrides, # KARLIN comment, or ALP fit).  Under
     /// --ncbi-compat this defaults to 10, matching NCBI.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_evalue)]
     evalue: Option<f64>,
 
     /// Emulate NCBI rmblastn 2.17.1 E-value behavior exactly: statistics
@@ -268,6 +281,67 @@ struct Args {
     /// benchmarks and legacy pipelines.
     #[arg(long, alias = "ncbi_compat", action = clap::ArgAction::SetTrue)]
     ncbi_compat: bool,
+}
+
+/// An integer option with a lower bound, e.g. `--word-size` (>= 4).
+fn at_least<T: TryFrom<i64>, const MIN: i64>(s: &str) -> Result<T, String> {
+    let v: i64 = s.parse().map_err(|_| format!("'{s}' is not an integer"))?;
+    if v < MIN {
+        return Err(format!("must be at least {MIN}"));
+    }
+    T::try_from(v).map_err(|_| format!("'{s}' is too large"))
+}
+
+/// Gap costs are capped so the DP stays far from overflow: scores run down to
+/// MININT (INT4_MIN/2, as in NCBI) minus a gap cost, and gap costs near 2^30
+/// made 3.0.12 loop forever.  Real gap costs are tens.
+const MAX_GAP_COST: i64 = 1_000_000;
+
+fn gap_cost<const MIN: i64>(s: &str) -> Result<i32, String> {
+    let v: i32 = at_least::<i32, MIN>(s)?;
+    if v as i64 > MAX_GAP_COST {
+        return Err(format!("must be at most {MAX_GAP_COST}"));
+    }
+    Ok(v)
+}
+
+fn parse_finite(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        _ => Err(format!("'{s}' is not a finite number")),
+    }
+}
+
+/// 0 means "not given" for the -matrix_* overrides; negative is an error.
+fn parse_nonnegative(s: &str) -> Result<f64, String> {
+    let v = parse_finite(s)?;
+    if v < 0.0 {
+        return Err(format!("'{s}' must not be negative"));
+    }
+    Ok(v)
+}
+
+fn parse_evalue(s: &str) -> Result<f64, String> {
+    let v = parse_finite(s)?;
+    if v <= 0.0 {
+        // NCBI: "expect value or cutoff score must be greater than zero"
+        return Err(format!("'{s}': the expect value must be greater than zero"));
+    }
+    Ok(v)
+}
+
+/// `--dust`: yes/no (NCBI's spelling) or true/false (this port's).  NCBI's
+/// 'level window linker' form is rejected rather than silently run with the
+/// default parameters, which is what earlier versions did.
+fn parse_dust(s: &str) -> Result<bool> {
+    match s {
+        "yes" | "true" => Ok(true),
+        "no" | "false" => Ok(false),
+        _ if s.split_whitespace().count() == 3 => anyhow::bail!(
+            "--dust '{s}': custom DUST parameters (level window linker) are not supported; \
+             use yes or no"),
+        _ => anyhow::bail!("--dust '{s}': expected yes, no, true or false"),
+    }
 }
 
 /// Resolve a `--db` argument to an existing file path.
@@ -470,11 +544,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading matrix '{}'", matrix_path))?;
 
     let seed_mode = match args.seed_mode.as_str() {
+        "combined" => SeedMode::Combined,
         "separate" | "separate-strands" | "SeparateStrands" => SeedMode::SeparateStrands,
-        _ => SeedMode::Combined,
+        other => anyhow::bail!("--seed-mode '{}': expected combined or separate", other),
     };
 
-    let dust = !matches!(args.dust.to_lowercase().as_str(), "no" | "false" | "0");
+    let dust = parse_dust(&args.dust)?;
 
     let params = SearchParams {
         gap_open: args.gapopen,
@@ -493,7 +568,7 @@ fn main() -> Result<()> {
         // treats >= 100 as a no-op, so fold every disabling spelling onto 101.
         mask_level: if args.mask_level < 0 { 101 } else { args.mask_level as u32 },
         num_threads: args.num_threads,
-        mt_mode: if args.mt_mode == 1 { MtMode::SplitByQueries } else { MtMode::SplitByDb },
+        mt_mode: if args.mt_mode == 1 { MtMode::SplitByQueries } else { MtMode::SplitByDb }, // 0 or 1 (checked)
         seed_mode,
     };
 
@@ -1515,7 +1590,7 @@ mod cli_tests {
     // masks every other HSP and only the self-hits survive.
 
     fn parse(argv: &[&str]) -> Args {
-        let mut full = vec!["rmblastn", "--db", "d", "--query", "q"];
+        let mut full = vec!["rmblastn", "--db", "d", "--query", "q", "--gapopen", "20", "--gapextend", "5"];
         full.extend_from_slice(argv);
         Args::parse_from(normalize_arg_iter(
             full.iter().map(|s| std::ffi::OsString::from(*s)),
@@ -1542,7 +1617,8 @@ mod cli_tests {
 
         // NCBI caps the option at 101; anything higher is a usage error.
         assert!(Args::try_parse_from(normalize_arg_iter(
-            ["rmblastn", "--db", "d", "--query", "q", "-mask_level", "102"]
+            ["rmblastn", "--db", "d", "--query", "q", "--gapopen", "20", "--gapextend", "5",
+             "-mask_level", "102"]
                 .iter()
                 .map(|s| std::ffi::OsString::from(*s))
         ))
