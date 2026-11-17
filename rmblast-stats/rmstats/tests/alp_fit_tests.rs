@@ -16,7 +16,7 @@ fn ffi_fits() {
 /// Fitting the 4x4 A/C/G/T core of 14p35g.matrix at 29/6 with the same
 /// settings used for the baked table (ALP defaults, seed 1) must reproduce
 /// rmblast_14p35g_values exactly — the fit is deterministic for a fixed
-/// seed.
+/// seed once it converges before the time budget runs out.
 fn ffi_fit_reproduces_14p35g() {
     // 4x4 core of /usr/local/RepeatMasker/Matrices/ncbi/nt/14p35g.matrix
     // in A,C,G,T order; # FREQS A 0.325 C 0.175 G 0.175 T 0.325.
@@ -28,7 +28,12 @@ fn ffi_fit_reproduces_14p35g() {
     ];
     let freqs = [0.325, 0.175, 0.175, 0.325];
 
-    let fit = fit_gumbel_gapped(&scores, &freqs, &freqs, 29, 6, 29, 6, &AlpFitOptions::default())
+    // The baked fit reached ALP's precision targets well inside its 10 s
+    // budget; the values depend only on the seed as long as that happens.  A
+    // loaded machine could run out of the 10 s first and stop on a different
+    // realization count, so give the test a budget it can't run out of.
+    let opts = AlpFitOptions { max_time: 600.0, ..Default::default() };
+    let fit = fit_gumbel_gapped(&scores, &freqs, &freqs, 29, 6, 29, 6, &opts)
         .expect("ALP fit failed");
 
     let baked = karlin_blk_gapped_load_from_tables(29, 6, "14p35g.matrix").unwrap();
