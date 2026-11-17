@@ -551,6 +551,12 @@ pub struct QueryLookup {
     /// For Combined mode: offset of context-1 (RC query) in the combined buffer (= fwd_n + 1).
     /// For SeparateStrands: 0 (unused).
     c1_start: u32,
+    /// The DUST-masked query this table was built from, when
+    /// [`build_query_lookup`] masked it.  The search functions use it instead
+    /// of re-masking the query for every subject (3.0.12 did, which was 90%
+    /// of the time for short queries against many subjects).  `None` with
+    /// dust off, or for [`build_query_lookup_premask`].
+    masked_query: Option<Vec<u8>>,
 }
 
 /// Build the lookup table from the query sequence.
@@ -620,7 +626,8 @@ pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, 
         }
     };
 
-    (QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start }, fwd_query_scan)
+    let masked_query = params.dust.then(|| fwd_query_scan.clone());
+    (QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start, masked_query }, fwd_query_scan)
 }
 
 /// Build a lookup table from a *pre-masked* query (DUST already applied).
@@ -674,12 +681,29 @@ pub fn build_query_lookup_premask(masked_query: &[u8], params: &SearchParams) ->
         }
     };
 
-    QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start }
+    QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start, masked_query: None }
 }
 
 impl QueryLookup {
     pub fn lut_word_length(&self) -> u32 {
         self.lookup.lut_word_length() as u32
+    }
+
+    /// The query used for word extension: DUST-masked when dust is on.  Takes
+    /// the copy made by [`build_query_lookup`] when there is one (the caller
+    /// must pass the query the table was built from), else masks `query` here.
+    fn masked<'a>(&'a self, query: &'a [u8], params: &SearchParams) -> std::borrow::Cow<'a, [u8]> {
+        use std::borrow::Cow;
+        if !params.dust {
+            return Cow::Borrowed(query);
+        }
+        if let Some(m) = &self.masked_query {
+            debug_assert_eq!(m.len(), query.len(), "lookup built from a different query");
+            return Cow::Borrowed(m);
+        }
+        let mut v = query.to_vec();
+        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
+        Cow::Owned(v)
     }
 }
 
@@ -737,17 +761,10 @@ pub fn search_with_query_lookup(
     let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
         (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
-    // Generate masked query for DUST: used for exact extension, ungapped scoring, Phase 2a, Phase 2b.
-    // When dust=false, masked_query == query (no allocation).
-    let masked_query_buf;
-    let masked_query: &[u8] = if params.dust {
-        let mut v = query.to_vec();
-        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
-        masked_query_buf = v;
-        &masked_query_buf
-    } else {
-        query
-    };
+    // DUST-masked query (the query itself with dust off), used for exact word
+    // extension.
+    let masked_query_cow = ql.masked(query, params);
+    let masked_query: &[u8] = &masked_query_cow;
 
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
@@ -817,15 +834,8 @@ pub fn search_with_query_lookup_seeds(
     let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
         (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
-    let masked_query_buf_s;
-    let masked_query_s: &[u8] = if params.dust {
-        let mut v = query.to_vec();
-        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
-        masked_query_buf_s = v;
-        &masked_query_buf_s
-    } else {
-        query
-    };
+    let masked_query_s_cow = ql.masked(query, params);
+    let masked_query_s: &[u8] = &masked_query_s_cow;
 
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
@@ -894,15 +904,8 @@ pub fn search_with_query_lookup_ungapped(
     let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
         (&prep.rc, &prep.packed_plus, &prep.packed_minus);
 
-    let masked_query_buf_u;
-    let masked_query_u: &[u8] = if params.dust {
-        let mut v = query.to_vec();
-        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
-        masked_query_buf_u = v;
-        &masked_query_buf_u
-    } else {
-        query
-    };
+    let masked_query_u_cow = ql.masked(query, params);
+    let masked_query_u: &[u8] = &masked_query_u_cow;
 
     let mut ungapped = Vec::new();
     if ql.c1_start > 0 {
