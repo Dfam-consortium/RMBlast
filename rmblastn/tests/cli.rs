@@ -43,8 +43,13 @@ struct Run {
 
 /// Run rmblastn with `args`; panic if it is still running after TIME_LIMIT.
 fn rmblastn(args: &[&str]) -> Run {
+    rmblastn_env(args, &[])
+}
+
+fn rmblastn_env(args: &[&str], env: &[(&str, &str)]) -> Run {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rmblastn"))
         .args(args)
+        .envs(env.iter().copied())
         .env_remove("BLASTMAT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -189,4 +194,69 @@ fn version_prints_crate_version() {
     let r = rmblastn(&["--version"]);
     assert_eq!(r.code, Some(0));
     assert_eq!(r.stdout.trim(), format!("rmblastn {}", env!("CARGO_PKG_VERSION")));
+}
+
+// ── mt-mode 1 failure handling (needs `--features diagnostics`) ─────────────
+
+/// A query file with `n` records: the three fixture queries, repeated.
+#[cfg(feature = "diagnostics")]
+fn repeated_queries(n: usize) -> tempfile_path::TempFile {
+    let text = std::fs::read_to_string(data("query.fa")).unwrap();
+    let records: Vec<&str> = text.split('>').filter(|r| !r.is_empty()).collect();
+    let mut out = String::new();
+    for i in 0..n {
+        // ">q1 desc\nACGT..." -> ">q1_<i> desc\nACGT...": unique ids, same sequences
+        let (id, rest) = records[i % records.len()].split_once(' ').unwrap();
+        out.push_str(&format!(">{id}_{i} {rest}"));
+    }
+    tempfile_path::TempFile::with_contents(&out)
+}
+
+#[cfg(feature = "diagnostics")]
+mod tempfile_path {
+    pub struct TempFile(pub std::path::PathBuf);
+    impl TempFile {
+        pub fn with_contents(s: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "rmblastn-cli-test-{}-{:?}.fa", std::process::id(), std::thread::current().id()));
+            std::fs::write(&p, s).unwrap();
+            TempFile(p)
+        }
+        pub fn path(&self) -> &str { self.0.to_str().unwrap() }
+    }
+    impl Drop for TempFile {
+        fn drop(&mut self) { std::fs::remove_file(&self.0).ok(); }
+    }
+}
+
+/// A query search that panics in `--mt-mode 1` must end the run with an error,
+/// whether the panic comes before the writer's window fills or after.  3.0.12
+/// hung forever: the writer waited for the panicked query's results.
+#[cfg(feature = "diagnostics")]
+fn mt_mode_1_panic_exits(n_queries: usize, panic_at: usize) {
+    let q = repeated_queries(n_queries);
+    let (db, m) = (data("db.fa"), data("comparison.matrix"));
+    let at = panic_at.to_string();
+    let r = rmblastn_env(
+        &["--db", &db, "--query", q.path(), "--matrix", &m,
+          "--mt-mode", "1", "--num-threads", "2", "--outfmt", RM_FIELDS],
+        &[("RMBLAST_TEST_PANIC_AT_QUERY", &at)],
+    );
+    assert_eq!(r.code, Some(1), "stderr:\n{}", r.stderr);
+    assert!(r.stderr.contains(&format!("failed: RMBLAST_TEST_PANIC_AT_QUERY={panic_at}")),
+        "stderr:\n{}", r.stderr);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn mt_mode_1_panic_past_window_exits() {
+    // 2 threads -> window 16: query 30 is handed out only after the writer
+    // has written 14 queries, so a hang would leave the dispatcher parked.
+    mt_mode_1_panic_exits(60, 30);
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
+fn mt_mode_1_panic_within_window_exits() {
+    mt_mode_1_panic_exits(3, 0);
 }

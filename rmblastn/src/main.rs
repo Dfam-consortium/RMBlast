@@ -705,7 +705,13 @@ fn main() -> Result<()> {
             // queries written so far, and the dispatcher's wake-up
             let written = (Mutex::new(0usize), Condvar::new());
             let stop = AtomicBool::new(false);
-            let (tx, rx) = mpsc::channel::<(usize, Vec<AlignResult>)>();
+            // A job sends Err if its search panicked.  Rayon would hold that
+            // panic until the scope ends, and the writer would wait forever
+            // for the missing query, so the job catches it and the writer
+            // turns it into an error exit.
+            let (tx, rx) = mpsc::channel::<(usize, std::thread::Result<Vec<AlignResult>>)>();
+            #[cfg(feature = "diagnostics")]
+            let panic_at = test_panic_at_query();
             let (queries, subjects, db, params, matrix, reap) =
                 (&all_queries, &subject_names, &db, &params, &matrix, &reap_for_query);
             let (written, stop) = (&written, &stop);
@@ -730,18 +736,38 @@ fn main() -> Result<()> {
                                     return;
                                 }
                                 let q = &queries[i];
-                                let mut qr = search_db_parallel(
-                                    &q.seq, &q.id, subjects, db, params, matrix,
-                                    avg_subj_length, None, prelim_cull,
-                                    reap(q.len() as i32),
-                                );
-                                sort_hit_list_order(&mut qr, subjects);
+                                let qr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    #[cfg(feature = "diagnostics")]
+                                    if panic_at == Some(i) {
+                                        panic!("RMBLAST_TEST_PANIC_AT_QUERY={i}");
+                                    }
+                                    let mut qr = search_db_parallel(
+                                        &q.seq, &q.id, subjects, db, params, matrix,
+                                        avg_subj_length, None, prelim_cull,
+                                        reap(q.len() as i32),
+                                    );
+                                    sort_hit_list_order(&mut qr, subjects);
+                                    qr
+                                }));
                                 let _ = tx.send((i, qr));
                             });
                         }
                         drop(tx);
                     });
                 });
+                // However this thread leaves -- a write error, a failed
+                // search, or a panic in here -- tell the dispatcher to stop, or
+                // the scope would wait on it forever.  The lock orders the
+                // store before the dispatcher's next check.
+                struct StopOnExit<'a>(&'a AtomicBool, &'a (Mutex<usize>, Condvar));
+                impl Drop for StopOnExit<'_> {
+                    fn drop(&mut self) {
+                        let _w = self.1 .0.lock().unwrap_or_else(|e| e.into_inner());
+                        self.0.store(true, Ordering::Relaxed);
+                        self.1 .1.notify_all();
+                    }
+                }
+                let _stop_on_exit = StopOnExit(stop, written);
                 let mut pending: BTreeMap<usize, Vec<AlignResult>> = BTreeMap::new();
                 let mut k = 0usize;
                 let mut write_ready = |pending: &mut BTreeMap<usize, Vec<AlignResult>>| -> Result<()> {
@@ -767,16 +793,19 @@ fn main() -> Result<()> {
                     Ok(())
                 };
                 for (i, results) in rx.iter() {
-                    pending.insert(i, results);
-                    if let Err(e) = write_ready(&mut pending) {
-                        // let the dispatcher and the jobs wind down, then report
-                        // the write error (the lock orders the store before the
-                        // dispatcher's next check)
-                        let _w = written.0.lock().unwrap_or_else(|e| e.into_inner());
-                        stop.store(true, Ordering::Relaxed);
-                        written.1.notify_all();
-                        return Err(e);
+                    match results {
+                        Ok(results) => {
+                            pending.insert(i, results);
+                        }
+                        Err(payload) => {
+                            let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".to_string());
+                            anyhow::bail!("search of query '{}' failed: {}", queries[i].id, msg);
+                        }
                     }
+                    // on a write error, _stop_on_exit winds the dispatcher down
+                    write_ready(&mut pending)?;
                 }
                 Ok(())
             })?;
@@ -806,6 +835,14 @@ fn main() -> Result<()> {
 /// Print the stage counters when RMBLAST_DP_STATS or RMBLAST_DEBUG_COUNTERS is
 /// set. Without the `diagnostics` feature there are no counters, and this
 /// prints a note instead so the variables are not silently ignored.
+/// Test hook: `RMBLAST_TEST_PANIC_AT_QUERY=<n>` makes the search of the n-th
+/// query (0-based) panic in `--mt-mode 1`, to test that a failed job ends the
+/// run instead of hanging it.  Only in a `diagnostics` build.
+#[cfg(feature = "diagnostics")]
+fn test_panic_at_query() -> Option<usize> {
+    std::env::var("RMBLAST_TEST_PANIC_AT_QUERY").ok().and_then(|v| v.parse().ok())
+}
+
 #[cfg(feature = "diagnostics")]
 fn diagnostics_report() {
     use std::sync::atomic::Ordering;
