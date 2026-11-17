@@ -26,6 +26,10 @@ pub enum FastaDbError {
     Fasta(String),
     #[error("sequence '{0}' not found in FASTA database")]
     NotFound(String),
+    /// Two records share an id.  Subjects are looked up by id, so one of them
+    /// would never be searched; reject the database instead.
+    #[error("duplicate sequence id '{id}' (records {first} and {second})")]
+    DuplicateId { id: String, first: usize, second: usize },
 }
 
 /// An in-memory FASTA subject database with full IUB/IUPAC support.
@@ -56,6 +60,9 @@ impl FastaDb {
         {
             let dna_size = rec.len() as u32;
             let idx = sequences.len();
+            if let Some(&first) = name_to_index.get(&rec.id) {
+                return Err(FastaDbError::DuplicateId { id: rec.id, first: first + 1, second: idx + 1 });
+            }
             name_to_index.insert(rec.id.clone(), idx);
             sequences.push(SeqInfo { name: rec.id, file_offset: 0, dna_size });
             raw_seqs.push(rec.seq);
@@ -109,5 +116,40 @@ impl FastaDb {
             }
         }
         mask
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_fasta(tag: &str, text: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("rmblast-fastadb-{}-{tag}.fa", std::process::id()));
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// Subjects are looked up by id, so a duplicate would leave the first
+    /// record unsearched and the last searched twice: reject it at load.
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let p = temp_fasta("dup", ">dup first\nACGTACGT\n>other\nACGT\n>dup second\nTTTT\n");
+        let r = FastaDb::open(&p);
+        std::fs::remove_file(&p).ok();
+        match r {
+            Err(FastaDbError::DuplicateId { id, first: 1, second: 3 }) => assert_eq!(id, "dup"),
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("duplicate accepted"),
+        }
+    }
+
+    #[test]
+    fn distinct_ids_load() {
+        let p = temp_fasta("ok", ">a\nACGT\n>b\nAC\n");
+        let db = FastaDb::open(&p);
+        std::fs::remove_file(&p).ok();
+        let db = db.unwrap();
+        assert_eq!(db.sequences.len(), 2);
+        assert_eq!(db.get_full_sequence_blastna("b").unwrap(), vec![15, 0, 1, 15]);
     }
 }

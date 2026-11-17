@@ -201,7 +201,9 @@ impl SubjectDb {
         // across the decode calls.
         let names: Vec<String> = backend.sequences().iter().map(|s| s.name.clone()).collect();
         for (i, name) in names.iter().enumerate() {
-            name_to_index.insert(name.clone(), i);
+            // both backends reject duplicate names at load
+            let dup = name_to_index.insert(name.clone(), i);
+            debug_assert!(dup.is_none(), "duplicate subject name '{name}'");
             decoded.push(Arc::from(backend.decode(name)?));
             n_masks.push(Arc::from(backend.nmask(name)));
         }

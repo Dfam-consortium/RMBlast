@@ -179,6 +179,23 @@ fn defaults_match_ncbi() {
 
 // ── errors ──────────────────────────────────────────────────────────────────
 
+/// A database with two records of the same id is rejected.  3.0.12 searched
+/// the last one twice and the first never: with an Alu first and random
+/// sequence second it printed nothing, where NCBI reports the Alu hit.
+#[test]
+fn duplicate_subject_ids_are_rejected() {
+    let text = std::fs::read_to_string(data("db.fa")).unwrap();
+    let first = &text[..text[1..].find('>').unwrap() + 1]; // first record
+    let db = tempfile_path::TempFile::with_contents(&format!("{text}{first}"));
+    let (q, m) = (data("query.fa"), data("comparison.matrix"));
+    let r = rmblastn(&["--db", db.path(), "--query", &q, "--matrix", &m,
+                       "--gapopen", "20", "--gapextend", "5", "--outfmt", "6 score"]);
+    assert_eq!(r.code, Some(1), "stderr:\n{}", r.stderr);
+    assert!(r.stderr.contains("duplicate sequence id 'AluJb_short_#SINE/Alu' (records 1 and 18)"),
+        "stderr:\n{}", r.stderr);
+    assert!(r.stdout.is_empty());
+}
+
 /// Each bad option value is a usage error that names the option, and nothing
 /// is searched.  3.0.12 panicked (word size 0-2), hung (word size 3, negative
 /// or huge gap costs) or silently substituted a value for most of these.
@@ -302,13 +319,16 @@ fn repeated_queries(n: usize) -> tempfile_path::TempFile {
     tempfile_path::TempFile::with_contents(&out)
 }
 
-#[cfg(feature = "diagnostics")]
 mod tempfile_path {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A file in the temp dir, removed on drop.
     pub struct TempFile(pub std::path::PathBuf);
     impl TempFile {
         pub fn with_contents(s: &str) -> Self {
             let p = std::env::temp_dir().join(format!(
-                "rmblastn-cli-test-{}-{:?}.fa", std::process::id(), std::thread::current().id()));
+                "rmblastn-cli-test-{}-{}.fa", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             std::fs::write(&p, s).unwrap();
             TempFile(p)
         }

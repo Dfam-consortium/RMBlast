@@ -125,6 +125,9 @@ pub enum TwoBitError {
     BadVersion(u32),
     #[error("sequence '{0}' not found in 2bit file")]
     NotFound(String),
+    /// Two index entries share a name; see `FastaDbError::DuplicateId`.
+    #[error("duplicate sequence name '{name}' (index entries {first} and {second})")]
+    DuplicateName { name: String, first: usize, second: usize },
 }
 
 /// Metadata for one sequence stored in the 2bit file.
@@ -193,6 +196,9 @@ impl TwoBitFile {
             pos += name_len;
             let offset = r32(pos) as u64;
             pos += 4;
+            if let Some(&first) = name_to_index.get(&name) {
+                return Err(TwoBitError::DuplicateName { name, first: first + 1, second: i + 1 });
+            }
             name_to_index.insert(name.clone(), i);
             sequences.push(SeqInfo { name, file_offset: offset, dna_size: 0 });
         }
@@ -384,6 +390,59 @@ mod tests {
         v.push(0x9C); // packed ACGT
 
         v
+    }
+
+    /// A valid 2bit byte stream holding `records` (name, ACGT-only sequence),
+    /// with no N or mask blocks.
+    pub(crate) fn twobit_bytes(records: &[(&str, &str)]) -> Vec<u8> {
+        let code = |b: u8| match b { b'T' => 0u8, b'C' => 1, b'A' => 2, b'G' => 3, _ => panic!("ACGT only") };
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&TWOBIT_MAGIC.to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        v.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        let index_len: usize = records.iter().map(|(n, _)| 1 + n.len() + 4).sum();
+        let mut offset = 16 + index_len;
+        let mut bodies = Vec::new();
+        for (name, seq) in records {
+            v.push(name.len() as u8);
+            v.extend_from_slice(name.as_bytes());
+            v.extend_from_slice(&(offset as u32).to_le_bytes());
+            let mut body = Vec::new();
+            body.extend_from_slice(&(seq.len() as u32).to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // nBlockCount
+            body.extend_from_slice(&0u32.to_le_bytes()); // maskBlockCount
+            body.extend_from_slice(&0u32.to_le_bytes()); // reserved
+            for chunk in seq.as_bytes().chunks(4) {
+                let mut byte = 0u8;
+                for (k, &b) in chunk.iter().enumerate() {
+                    byte |= code(b) << (6 - 2 * k);
+                }
+                body.push(byte);
+            }
+            offset += body.len();
+            bodies.push(body);
+        }
+        for b in bodies {
+            v.extend_from_slice(&b);
+        }
+        v
+    }
+
+    #[test]
+    fn twobit_bytes_round_trips() {
+        let tb = TwoBitFile::from_bytes(twobit_bytes(&[("a", "ACGTA"), ("b", "TTGCA")])).unwrap();
+        assert_eq!(tb.get_full_sequence_blastna("a").unwrap(), vec![15, 0, 1, 2, 3, 0, 15]);
+        assert_eq!(tb.get_full_sequence_blastna("b").unwrap(), vec![15, 3, 3, 2, 1, 0, 15]);
+    }
+
+    /// Subjects are looked up by name, so a duplicate would leave one record
+    /// unsearched and the other searched twice: reject it at load.
+    #[test]
+    fn duplicate_names_are_rejected() {
+        let e = TwoBitFile::from_bytes(twobit_bytes(&[("x", "ACGT"), ("y", "ACGT"), ("x", "TTTT")]))
+            .err().expect("duplicate accepted");
+        assert!(matches!(e, TwoBitError::DuplicateName { ref name, first: 1, second: 3 } if name == "x"), "{e}");
     }
 
     #[test]
