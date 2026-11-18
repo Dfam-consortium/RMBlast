@@ -2066,7 +2066,7 @@ fn run_gapped_phase<U: UngapOut>(
         // Minus strand: use NCBI orientation (RC-query, FWD-TE) so seed lands in LEFT.
         // NCBI: mask_at_hash=TRUE — DUST only affects lookup table, not gapped alignment.
         let (pq_seq, ps_seq, pq_seed, ps_seed) = if ung.strand == Strand::Minus {
-            (&query_rc[..], subject_plus, q_pivot, s_pivot)
+            (query_rc, subject_plus, q_pivot, s_pivot)
         } else {
             (query, subject_plus, q_pivot, s_pivot)
         };
@@ -2208,7 +2208,7 @@ fn run_gapped_phase<U: UngapOut>(
         let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
             let tq = qa_len - 1 - new_q_seed;
             let ts = sa_len - 1 - new_s_seed;
-            (&query_rc[..], subject_align, tq, ts)
+            (query_rc, subject_align, tq, ts)
         } else {
             (query, subject_align, new_q_seed, new_s_seed)
         };

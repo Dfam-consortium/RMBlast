@@ -16,7 +16,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::seq::fasta::FastaReader;
-use crate::seq::twobit::{NcbiRandom, SeqInfo};
+use crate::seq::twobit::{LazyRandom, SeqInfo};
 
 #[derive(Debug, Error)]
 pub enum FastaDbError {
@@ -91,12 +91,12 @@ impl FastaDb {
         let dna_size = self.sequences[idx].dna_size;
         let mut out = self.raw_seqs[idx].clone();
         let last = out.len().saturating_sub(1);
-        let mut rng = NcbiRandom::new(dna_size);
+        let mut rng = LazyRandom::new(dna_size);
         // Iterate only the bases (skip sentinels at index 0 and last).
         for slot in &mut out[1..last] {
             let code = *slot;
             if (4..=14).contains(&code) {
-                *slot = rng.next_base_iupac(code);
+                *slot = rng.get().next_base_iupac(code);
             }
         }
         Ok(out)

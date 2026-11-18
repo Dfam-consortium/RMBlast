@@ -53,6 +53,26 @@ pub(crate) struct NcbiRandom {
     rk: i32,
 }
 
+/// An [`NcbiRandom`] seeded on first use.  Seeding costs about 6,000
+/// instructions, and most sequences have no ambiguous base to draw for; the
+/// draws are the same as with an eagerly seeded generator.
+pub(crate) struct LazyRandom {
+    seed: u32,
+    rng: Option<NcbiRandom>,
+}
+
+impl LazyRandom {
+    pub(crate) fn new(seed: u32) -> Self {
+        LazyRandom { seed, rng: None }
+    }
+
+    #[inline]
+    pub(crate) fn get(&mut self) -> &mut NcbiRandom {
+        let seed = self.seed;
+        self.rng.get_or_insert_with(|| NcbiRandom::new(seed))
+    }
+}
+
 impl NcbiRandom {
     pub(crate) fn new(seed: u32) -> Self {
         let mut state = [0u32; CRANDOM_STATE_SIZE];
@@ -85,7 +105,7 @@ impl NcbiRandom {
     }
 
     #[inline(always)]
-    fn get_rand(&mut self) -> u32 {
+    pub(crate) fn get_rand(&mut self) -> u32 {
         self.x_get_rand32() >> 1
     }
 

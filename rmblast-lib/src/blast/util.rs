@@ -22,55 +22,8 @@ pub fn ncbi2na_unpack_base(x: u8, n: u32) -> u8 {
     (x >> (2 * n)) & NCBI2NA_MASK
 }
 
-// ── NCBI LFG random number generator ─────────────────────────────────────────
-//
-// Mirrors CRandom (util/random_gen.hpp + util/random_gen.cpp) from NCBI C++ Toolkit.
-// Lagged Fibonacci generator with lags 33 and 13 (STATE_SIZE - STATE_OFFSET - 1 = 20
-// from the initial rk/rj gap of 32-12=20).
-
-struct NcbiRandom {
-    state: [u32; 33],
-    rk:    i32,
-    rj:    i32,
-}
-
-impl NcbiRandom {
-    const STATE_SIZE:   usize = 33;
-    const STATE_OFFSET: i32   = 12;
-
-    fn new(seed: u32) -> Self {
-        let mut rng = NcbiRandom { state: [0u32; 33], rk: 32, rj: Self::STATE_OFFSET };
-        rng.state[0] = seed;
-        for i in 1..Self::STATE_SIZE {
-            rng.state[i] = 1103515245u32.wrapping_mul(rng.state[i - 1]).wrapping_add(12345);
-        }
-        rng.rk = (Self::STATE_SIZE - 1) as i32;
-        rng.rj = Self::STATE_OFFSET;
-        for _ in 0..10 * Self::STATE_SIZE {
-            rng.x_get_rand32bits();
-        }
-        rng
-    }
-
-    #[inline]
-    fn x_get_rand32bits(&mut self) -> u32 {
-        let r = self.state[self.rk as usize].wrapping_add(self.state[self.rj as usize]);
-        self.state[self.rk as usize] = r;
-        self.rk -= 1;
-        self.rj -= 1;
-        if self.rk < 0 {
-            self.rk = (Self::STATE_SIZE - 1) as i32;
-        } else if self.rj < 0 {
-            self.rj = (Self::STATE_SIZE - 1) as i32;
-        }
-        r
-    }
-
-    #[inline]
-    fn get_rand(&mut self) -> u32 {
-        self.x_get_rand32bits() >> 1
-    }
-}
+// The RNG is CRandom (seq::twobit::NcbiRandom), seeded on first use.
+use crate::seq::twobit::LazyRandom;
 
 // ── BLASTNA → NCBI4NA table ───────────────────────────────────────────────────
 //
@@ -85,8 +38,9 @@ const BLASTNA_TO_NCBI4NA: [u8; 16] = [1, 2, 4, 8, 5, 10, 3, 12, 6, 9, 11, 14, 7,
 ///   - N (NCBI4NA=15) or gap (NCBI4NA=0): returns `rng.GetRand() & 0x3`.
 ///   - Other ambiguous (2–3 bits set): returns `rng.GetRand() % bitcount`-th set-bit index.
 #[inline]
-fn blastna_to_ncbi2na(b: u8, rng: &mut NcbiRandom) -> u8 {
+fn blastna_to_ncbi2na(b: u8, rng: &mut LazyRandom) -> u8 {
     if b < 4 { return b; }  // A=0, C=1, G=2, T=3: BLASTNA == NCBI2NA
+    let rng = rng.get();
     let ncbi4na = BLASTNA_TO_NCBI4NA[b as usize];
     if ncbi4na == 0 || ncbi4na == 15 {
         return (rng.get_rand() & 0x3) as u8;
@@ -124,7 +78,7 @@ pub fn blast_compress_blastna_sequence(seq_blk: &mut SeqBlk) {
     let old_seq = &seq_blk.blastna[1..1 + len];
 
     // Seed RNG with sequence length to match s_Ncbi4naToNcbi2na(ncbi4na, base_length, ...).
-    let mut rng = NcbiRandom::new(len as u32);
+    let mut rng = LazyRandom::new(len as u32);
 
     // Full 4-base chunks.
     for j in 0..(len / 4) {
