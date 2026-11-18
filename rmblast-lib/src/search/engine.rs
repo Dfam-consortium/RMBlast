@@ -603,7 +603,6 @@ pub struct QueryLookup {
 /// `search_phase2a` so that word extension uses the same masked sequence that was
 /// indexed in the lookup table.
 pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, Vec<u8>) {
-    let fwd_n = query.len().saturating_sub(2);
     let fwd_query_scan = if params.dust {
         let mut v = query.to_vec();
         dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
@@ -611,13 +610,8 @@ pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, 
     } else {
         query.to_vec()
     };
-    let query_bases = &fwd_query_scan[1..1 + fwd_n];
-
-    let lookup = combined_lookup(query_bases, params);
-
     let masked_query = params.dust.then(|| fwd_query_scan.clone());
-    (QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1, masked_query,
-                   query_rc: std::sync::OnceLock::new() }, fwd_query_scan)
+    (QueryLookup::from_masked(&fwd_query_scan, masked_query, params), fwd_query_scan)
 }
 
 /// Build a lookup table from a *pre-masked* query (DUST already applied).
@@ -625,13 +619,7 @@ pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, 
 /// Use this when the caller has already applied full-query DUST masking and
 /// extracted a chunk from it, to avoid double-masking artifacts at chunk boundaries.
 pub fn build_query_lookup_premask(masked_query: &[u8], params: &SearchParams) -> QueryLookup {
-    let fwd_n = masked_query.len().saturating_sub(2);
-    let query_bases = &masked_query[1..1 + fwd_n];
-
-    let lookup = combined_lookup(query_bases, params);
-
-    QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1, masked_query: None,
-                  query_rc: std::sync::OnceLock::new() }
+    QueryLookup::from_masked(masked_query, None, params)
 }
 
 /// The lookup table over both strands of the query, as NCBI's
@@ -660,6 +648,15 @@ fn combined_lookup(query_bases: &[u8], params: &SearchParams) -> NaLookup {
 }
 
 impl QueryLookup {
+    /// The table over `scan_query` (sentinel-wrapped, already DUST-masked if
+    /// dust is on).  `masked_copy` is kept for [`Self::masked`].
+    fn from_masked(scan_query: &[u8], masked_copy: Option<Vec<u8>>, params: &SearchParams) -> Self {
+        let fwd_n = scan_query.len().saturating_sub(2);
+        let lookup = combined_lookup(&scan_query[1..1 + fwd_n], params);
+        QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1,
+                      masked_query: masked_copy, query_rc: std::sync::OnceLock::new() }
+    }
+
     pub fn lut_word_length(&self) -> u32 {
         self.lookup.lut_word_length() as u32
     }
@@ -725,6 +722,27 @@ pub fn search_with_query_lookup(
     n_mask: &[u8],
     prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
+    search_one_subject(ql, query, query_id, subject_plus, subject_id, params, matrix,
+                       chunk_offset, n_mask, prepared, &mut DiscardSeeds, &mut DiscardUngap)
+}
+
+/// The body of the search_with_query_lookup family, generic over where
+/// seeds and ungapped hits go (discarded in production).
+#[allow(clippy::too_many_arguments)]
+fn search_one_subject<S: SeedOut, U: UngapOut>(
+    ql: &QueryLookup,
+    query: &[u8],
+    query_id: &str,
+    subject_plus: &[u8],
+    subject_id: &str,
+    params: &SearchParams,
+    matrix: &ScoreMatrix,
+    chunk_offset: u32,
+    n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
+    seed_out: &mut S,
+    ungap_out: &mut U,
+) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
 
@@ -753,11 +771,11 @@ pub fn search_with_query_lookup(
     // Combined LUT: single scan of FWD subject, interleaved plus/minus hits.
     collect_ungapped_combined(
         query, ql.query_rc(query), masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-        ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
+        ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
     );
     let mut results = run_gapped_phase(
         query, ql.query_rc(query), query_id, subject_plus, subject_id,
-        q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
+        q_len, s_len, ungapped, params, matrix, ungap_out,
         ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
@@ -786,45 +804,8 @@ pub fn search_with_query_lookup_seeds(
     n_mask: &[u8],
     prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
-    let q_len = query.len().saturating_sub(2) as u32;
-    let s_len = subject_plus.len().saturating_sub(2) as u32;
-
-    if q_len < params.word_size as u32 || s_len < params.word_size as u32 {
-        return Vec::new();
-    }
-
-    // Subject RC and the NCBI2NA-packed plus strand: borrow from the shared
-    // per-subject cache when supplied, else compute locally (identical bytes).
-    let local_prep;
-    let prep: &PreparedSubject = match prepared {
-        Some(p) => p,
-        None => {
-            local_prep = prepare_subject_strands(subject_plus, n_mask);
-            &local_prep
-        }
-    };
-    let (subj_rc, packed_plus): (&[u8], &[u8]) = (&prep.rc, &prep.packed_plus);
-
-    let masked_query_s_cow = ql.masked(query, params);
-    let masked_query_s: &[u8] = &masked_query_s_cow;
-
-    let mut ungapped = Vec::new();
-    collect_ungapped_combined(
-        query, ql.query_rc(query), masked_query_s, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-        ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
-    );
-    let mut results = run_gapped_phase(
-        query, ql.query_rc(query), query_id, subject_plus, subject_id,
-        q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
-        ql.lut_word_length(), n_mask, prep,
-    );
-    if chunk_offset > 0 {
-        for r in &mut results {
-            r.hsp.q_start += chunk_offset;
-            r.hsp.q_end   += chunk_offset;
-        }
-    }
-    results
+    search_one_subject(ql, query, query_id, subject_plus, subject_id, params, matrix,
+                       chunk_offset, n_mask, prepared, seed_out, &mut DiscardUngap)
 }
 
 /// Like [`search_with_query_lookup`] but also collects post-sort ungapped hits.
@@ -844,45 +825,8 @@ pub fn search_with_query_lookup_ungapped(
     n_mask: &[u8],
     prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
-    let q_len = query.len().saturating_sub(2) as u32;
-    let s_len = subject_plus.len().saturating_sub(2) as u32;
-
-    if q_len < params.word_size as u32 || s_len < params.word_size as u32 {
-        return Vec::new();
-    }
-
-    // Subject RC and the NCBI2NA-packed plus strand: borrow from the shared
-    // per-subject cache when supplied, else compute locally (identical bytes).
-    let local_prep;
-    let prep: &PreparedSubject = match prepared {
-        Some(p) => p,
-        None => {
-            local_prep = prepare_subject_strands(subject_plus, n_mask);
-            &local_prep
-        }
-    };
-    let (subj_rc, packed_plus): (&[u8], &[u8]) = (&prep.rc, &prep.packed_plus);
-
-    let masked_query_u_cow = ql.masked(query, params);
-    let masked_query_u: &[u8] = &masked_query_u_cow;
-
-    let mut ungapped = Vec::new();
-    collect_ungapped_combined(
-        query, ql.query_rc(query), masked_query_u, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-        ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-    );
-    let mut results = run_gapped_phase(
-        query, ql.query_rc(query), query_id, subject_plus, subject_id,
-        q_len, s_len, ungapped, params, matrix, ungap_out,
-        ql.lut_word_length(), n_mask, prep,
-    );
-    if chunk_offset > 0 {
-        for r in &mut results {
-            r.hsp.q_start += chunk_offset;
-            r.hsp.q_end   += chunk_offset;
-        }
-    }
-    results
+    search_one_subject(ql, query, query_id, subject_plus, subject_id, params, matrix,
+                       chunk_offset, n_mask, prepared, &mut DiscardSeeds, ungap_out)
 }
 
 /// Search one query against one subject sequence (plus and minus strands).
