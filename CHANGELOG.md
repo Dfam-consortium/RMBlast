@@ -3,7 +3,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## Unreleased
+## 3.1.0 - Unreleased
+A minor release rather than 3.0.13: rmblast-lib drops public items that
+library users may have called (see Removed). For rmblastn itself, the
+breaking changes are refusals of input that used to give wrong or incomplete
+output, listed first.
+
 ### Behaviour changes
 Input that used to run is now refused with an error that names the problem.
 Each case below either gave wrong or incomplete output, or hung or crashed
@@ -117,7 +122,23 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   no output and no message. Both now warn on stderr (the empty query with
   NCBI's own warning) and give the normal empty output
 
+### Added
+- --version names the commit the binary was built from, e.g.
+  `rmblastn 3.1.0 (01cc4cc)`, with `-dirty` when the source tree had
+  uncommitted changes; dustmasker does the same. Without git (a source
+  tarball) it prints the version alone. The wrappers keep NCBI's
+  `rmblastn: 3.1.0+` first line, which RepeatMasker and RepeatModeler parse,
+  and add the commit to the ` Package:` line
+- `make check-release TAG=X.Y.Z` checks a release build before tagging: a
+  clean tree, matching versions, a CHANGELOG section, and binaries that report
+  the commit being released
+
 ### Removed
+- rmblast-lib: SeedMode and SearchParams::seed_mode (the separate-strands
+  seeding behind --seed-mode). A caller setting `seed_mode` must drop the
+  field. On a test of four TE consensi against 10 Mb of chr22, combined
+  seeding gave the same 10,574 hits with 1% fewer instructions; the separate
+  mode had two known minus-strand bugs
 - rmblast-lib: library code with no caller in rmblastn or dustmasker
   (about 2,000 lines): the modules blast::gapalign, blast::extend and lookup,
   most of blast::types, the mirror-frame minus branch of extend_ungapped (its
@@ -128,6 +149,12 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   seqblk_from_blastna_with_compress and BlastIntervalTree::reset. The
   search_phase2a parameter subject_id is gone too. Code that used any of
   these from the library must change
+
+### Changed
+- `make dist` installs into a staging directory (`./stage`, or DESTDIR) and
+  tars that. It used to install into PREFIX first, `/usr/local` by default
+- `make install` installs the wrapper scripts by name, so a stray file in
+  wrappers/ is not shipped, and prints the installed binaries' versions
 
 ### Performance
 - Startup took 28 s on a database of 100,000 sequences; it takes 0.4 s
@@ -195,5 +222,5 @@ Each case below either gave wrong or incomplete output, or hung or crashed
 ### Known Issues
 - None
 
-## 3.0.0 - 2020-09-02
+## 3.0.0 - 2026-06-26
 - Initial release of standalone Rust port

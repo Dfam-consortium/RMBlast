@@ -75,7 +75,13 @@ rmblast-<version>/
 
 Both wrapper directories find the binaries relative to themselves, so nothing
 needs editing after unpacking. `make dist` packages that same tree as a
-versioned tarball, which is what the tagged GitHub Actions release publishes.
+versioned tarball, which is what the tagged GitHub Actions release publishes;
+it stages the install under `./stage` and never writes to `PREFIX`.
+
+`rmblastn --version` names the commit it was built from, for example
+`rmblastn 3.1.0 (01cc4cc)`, with `-dirty` added when the tree had uncommitted
+changes. The wrappers print NCBI's `rmblastn: 3.1.0+`, which is what
+RepeatMasker and RepeatModeler parse.
 
 To bundle scoring matrices alongside the binaries, point `MATRIX_SRC` at a
 directory of `*.matrix` files: `make install PREFIX=/opt MATRIX_SRC=../matrices`.
@@ -133,8 +139,9 @@ usually takes care of itself.
 
 An absolute path also works, which stock `rmblastn` rejects. That is the one
 place the lookup diverges, and the port tries it last, after every directory
-NCBI would have searched, so it can never shadow one of them. `PORTING_NOTES.md`
-§15.1 has the full order and the NCBI quirks inside it.
+NCBI would have searched, so it can never shadow one of them.
+`find_matrix_path` in `rmblastn/src/main.rs` has the full order and the NCBI
+quirks inside it.
 
 ## Using it with RepeatMasker and RepeatModeler
 
@@ -205,11 +212,25 @@ exceptions, and the places where the tools around it stop short of NCBI's:
 - NCBI 2.17.1 rejects `-xdrop_ungap` ("Attempt to cast to a wrong (Integer)
   type") unless `-min_raw_gapped_score` is also given; the port accepts it on
   its own.
-- Two small fidelity gaps remain, both far from RepeatMasker's parameters. At
-  `-mask_level 0`, which HSPs a touching neighbour masks can differ, because
-  NCBI's choice depends on its interval-tree layout. With `identity.matrix` and
-  no `--min-raw-gapped-score`, a few minus-strand seeds differ (see
-  FIX_PLAN 5.9).
+- Three small fidelity gaps remain, all far from RepeatMasker's parameters
+  (which always set a minimum score of 200 or more):
+  - At `-mask_level 0`, which HSPs a touching neighbour masks can differ,
+    because NCBI's choice depends on its interval-tree layout.
+  - With `identity.matrix` and no `--min-raw-gapped-score`, the port keeps a
+    minus-strand seed that NCBI's exact extension drops, so a few hits end a
+    little differently.
+  - With no minimum score at all, both programs report single-base HSPs; at
+    `-word_size 4`, one of those can carry the other strand label (1 line in
+    about 679,000 on the test fixtures).
+- Not ported, with no known effect on results:
+  - NCBI's small lookup table (`eSmallNaLookupTable`) and its specialised
+    megablast scanners: the port uses the standard table and the general
+    scanner for every width. Results match on every comparison suite; the
+    `identity.matrix` seed difference above may come from here.
+  - `AdjustSubjectRange`, which narrows the subject range NCBI extends over.
+- Not supported: `-searchsp` (the effective search space is always computed),
+  gzip-compressed input, and these NCBI spellings, all refused with an error:
+  negative gap costs, `-mt_mode 2`, and `-dust 'level window linker'`.
 - The built-in Karlin-Altschul table is looked up by the matrix file's name
   and gap costs, as NCBI does; the matrix contents are not checked against it.
   The same matrix under another name falls back to a startup ALP fit, whose
@@ -256,6 +277,7 @@ exceptions, and the places where the tools around it stop short of NCBI's:
 | `rmblastn/` | The `rmblastn` command-line front end |
 | `dustmasker/` | The `dustmasker` command-line front end |
 | `rmblast-stats/` | E-value and bit-score statistics, the vendored ALP sources, and the fitting tools that generated the baked tables |
+| `build-support/` | Shared build-script code: puts the git commit in `--version` |
 | `wrappers/`, `verify_wrappers/` | Caller-facing shims described above |
 
 ## Credits
