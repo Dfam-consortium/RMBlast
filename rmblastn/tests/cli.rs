@@ -264,6 +264,48 @@ fn bad_option_values_are_rejected() {
     }
 }
 
+/// An empty database is an error, FASTA or 2bit (3.0.12 exited 0 silently).
+#[test]
+fn empty_database_is_an_error() {
+    let mut zero_2bit = Vec::new();
+    for w in [0x1A41_2743u32, 0, 0, 0] {
+        zero_2bit.extend_from_slice(&w.to_le_bytes()); // magic, version, seqCount 0, reserved
+    }
+    let (q, m) = (data("query.fa"), data("comparison.matrix"));
+    for db in [tempfile_path::TempFile::with_contents(""), tempfile_path::TempFile::with_bytes(&zero_2bit, "2bit")] {
+        let r = rmblastn(&["--db", db.path(), "--query", &q, "--matrix", &m,
+                           "--gapopen", "20", "--gapextend", "5", "--outfmt", "6 score"]);
+        assert_eq!(r.code, Some(1), "{}: stderr:\n{}", db.path(), r.stderr);
+        assert!(r.stderr.contains("contains no sequences"), "stderr:\n{}", r.stderr);
+    }
+}
+
+/// An empty query file warns as NCBI does and exits 0, in both mt-modes.
+#[test]
+fn empty_query_warns_like_ncbi() {
+    let q = tempfile_path::TempFile::with_contents("");
+    let (db, m) = (data("db.fa"), data("comparison.matrix"));
+    for mode in ["0", "1"] {
+        let r = rmblastn(&["--db", &db, "--query", q.path(), "--matrix", &m, "--gapopen", "20",
+                           "--gapextend", "5", "--outfmt", "6 score", "--mt-mode", mode, "--num-threads", "2"]);
+        assert_eq!(r.code, Some(0), "mt-mode {mode}: stderr:\n{}", r.stderr);
+        assert!(r.stderr.contains("Warning: [rmblastn] Query is Empty!"), "stderr:\n{}", r.stderr);
+        assert!(r.stdout.is_empty());
+    }
+}
+
+/// A gilist that selects nothing is a valid search with no hits, with a warning.
+#[test]
+fn gilist_matching_nothing_warns() {
+    let gl = tempfile_path::TempFile::with_contents("no-such-id\n");
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    let r = rmblastn(&["--db", &db, "--query", &q, "--matrix", &m, "--gapopen", "20",
+                       "--gapextend", "5", "--outfmt", "6 score", "--gilist", gl.path()]);
+    assert_eq!(r.code, Some(0), "stderr:\n{}", r.stderr);
+    assert!(r.stderr.contains("matches no sequence"), "stderr:\n{}", r.stderr);
+    assert!(r.stdout.is_empty());
+}
+
 /// Gap costs have no usable default (NCBI rmblastn's 0/0 is rejected).
 #[test]
 fn gap_costs_are_required() {
@@ -349,9 +391,12 @@ mod tempfile_path {
     pub struct TempFile(pub std::path::PathBuf);
     impl TempFile {
         pub fn with_contents(s: &str) -> Self {
+            Self::with_bytes(s.as_bytes(), "fa")
+        }
+        pub fn with_bytes(b: &[u8], ext: &str) -> Self {
             let p = std::env::temp_dir().join(format!(
-                "rmblastn-cli-test-{}-{}.fa", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-            std::fs::write(&p, s).unwrap();
+                "rmblastn-cli-test-{}-{}.{ext}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::write(&p, b).unwrap();
             TempFile(p)
         }
         pub fn path(&self) -> &str { self.0.to_str().unwrap() }

@@ -596,8 +596,15 @@ fn main() -> Result<()> {
         }
     }
 
+    // An empty database is an error (NCBI's makeblastdb refuses to build
+    // one); 3.0.12 exited 0 without a word.  A gilist that selects nothing is
+    // a valid search with no hits, but say so.
+    if db.sequences().is_empty() {
+        anyhow::bail!("database '{}' contains no sequences", db_path);
+    }
     if subject_names.is_empty() {
-        return Ok(());
+        eprintln!("Warning: [rmblastn] the gilist '{}' matches no sequence in the database; \
+                   nothing to search", args.gilist.as_deref().unwrap_or(""));
     }
     let n_db_seqs = subject_names.len();
     let subject_oid = subject_oids(&subject_names);
@@ -729,10 +736,12 @@ fn main() -> Result<()> {
             .context("writing pairwise header")?;
     }
 
+    let mut n_queries = 0usize;
     match params.mt_mode {
         MtMode::SplitByDb => {
             for qrec in query_reader {
                 let qrec = qrec.context("reading query FASTA")?;
+                n_queries += 1;
                 check_seq_len(&qrec.id, qrec.len()).map_err(anyhow::Error::msg)?;
                 let full_q_len = qrec.len() as u32;
                 let mut results = search_db_parallel(
@@ -780,6 +789,7 @@ fn main() -> Result<()> {
             for q in &all_queries {
                 check_seq_len(&q.id, q.len()).map_err(anyhow::Error::msg)?;
             }
+            n_queries = all_queries.len();
             let n = all_queries.len();
             let workers = rayon::current_num_threads();
             let window = 4 * workers.max(4);
@@ -891,6 +901,11 @@ fn main() -> Result<()> {
                 Ok(())
             })?;
         }
+    }
+
+    // NCBI prints the same warning (and exits 0) for a query file with no records.
+    if n_queries == 0 {
+        eprintln!("Warning: [rmblastn] Query is Empty!");
     }
 
     // Print the pairwise footer once (after all queries).
