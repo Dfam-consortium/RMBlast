@@ -35,6 +35,9 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   as N, or aborted with "stream did not contain valid UTF-8"
 - dustmasker refuses an empty record (NCBI also aborts), and its usage errors
   exit 1 as NCBI's do
+- -outfmt accepts only 0 and "6 <fields>" with the 22 implemented fields. Other
+  formats were treated as 6, and unknown field names were dropped, shifting the
+  columns after them. Now both are refused, as is a bare "6"
 - The makeblastdb wrapper refuses options it does not implement, -dbtype prot
   and -mask_data. All three used to "succeed": prot wrote nucleotide dummy files
 - The blastdbcmd wrapper exits 1 for an unknown -entry, for a batch with
@@ -66,6 +69,12 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   byte-identical to NCBI on 13,000 random deflines
 - When E-values come from the built-in table, stderr says the entry was chosen
   by the matrix file name
+- Pairwise output (-outfmt 0) now matches NCBI 2.17.1 line for line, apart from
+  "Posted date" and the database title (see README). It now prints the
+  2.17.1 version line, thousands separators in database sizes, the full
+  subject defline wrapped as NCBI wraps it, DUST-masked query bases in lower
+  case, a "No hits found" block for queries without hits, and NCBI's blank
+  lines between queries. Tabular output is unchanged
 - The rmblastn wrappers mangled negative option values: `-matrix_beta -4.9`
   became `--4.9` and failed. Values now pass through unchanged
 - The makeblastdb wrapper needed faToTwoBit at a fixed path, so it failed on any

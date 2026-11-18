@@ -45,6 +45,8 @@ pub struct FastaDb {
     /// Raw BLASTNA sequences (sentinel | bases | sentinel).
     /// IUPAC codes 4–14 are preserved; they are resolved at decode time.
     raw_seqs: Vec<Vec<u8>>,
+    /// Full defline of each record (everything after '>'), for pairwise output.
+    deflines: Vec<String>,
 }
 
 impl FastaDb {
@@ -55,6 +57,7 @@ impl FastaDb {
         let mut sequences: Vec<SeqInfo> = Vec::new();
         let mut name_to_index: HashMap<String, usize> = HashMap::new();
         let mut raw_seqs: Vec<Vec<u8>> = Vec::new();
+        let mut deflines: Vec<String> = Vec::new();
 
         while let Some(rec) = reader
             .next_record()
@@ -69,9 +72,10 @@ impl FastaDb {
             name_to_index.insert(rec.id.clone(), idx);
             sequences.push(SeqInfo { name: rec.id, file_offset: 0, dna_size });
             raw_seqs.push(rec.seq);
+            deflines.push(rec.defline);
         }
 
-        Ok(FastaDb { sequences, name_to_index, raw_seqs })
+        Ok(FastaDb { sequences, name_to_index, raw_seqs, deflines })
     }
 
     /// Decode a sequence to BLASTNA, resolving every IUB ambiguity (codes 4–14)
@@ -103,6 +107,11 @@ impl FastaDb {
     /// Returns a `Vec<u8>` of length `dna_size` where 0 = unambiguous (A/C/G/T)
     /// and 4–14 = original BLASTNA code at that position.  Returns an empty Vec
     /// if the sequence contains no ambiguous positions.
+    /// The full defline of `name` (everything after '>').
+    pub fn defline(&self, name: &str) -> Option<&str> {
+        self.name_to_index.get(name).map(|&i| self.deflines[i].as_str())
+    }
+
     pub fn get_n_mask(&self, name: &str) -> Vec<u8> {
         let Some(&idx) = self.name_to_index.get(name) else {
             return Vec::new();

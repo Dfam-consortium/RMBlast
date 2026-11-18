@@ -756,7 +756,9 @@ fn main() -> Result<()> {
                 sort_hit_list_order_by_oid(&mut results, &subject_oid);
                 match &output_format {
                     OutputFormat::Pairwise => {
-                        write_pairwise_results(&mut out, &results, &qrec.defline, full_q_len)
+                        let mask = pairwise_query_mask(&qrec.seq, &params);
+                        write_pairwise_results(&mut out, &results, &qrec.defline, full_q_len,
+                            &|id| db.defline(id), &mask)
                             .context("writing pairwise results")?;
                     }
                     OutputFormat::Tabular(fields) => {
@@ -871,7 +873,9 @@ fn main() -> Result<()> {
                         match &output_format {
                             OutputFormat::Pairwise => {
                                 let qlen = q.len() as u32;
-                                write_pairwise_results(&mut out, &results, &q.defline, qlen)
+                                let mask = pairwise_query_mask(&q.seq, params);
+                                write_pairwise_results(&mut out, &results, &q.defline, qlen,
+                                    &|id| db.defline(id), &mask)
                                     .context("writing pairwise results")?;
                             }
                             OutputFormat::Tabular(fields) => {
@@ -935,6 +939,18 @@ fn main() -> Result<()> {
 /// Print the stage counters when RMBLAST_DP_STATS or RMBLAST_DEBUG_COUNTERS is
 /// set. Without the `diagnostics` feature there are no counters, and this
 /// prints a note instead so the variables are not silently ignored.
+/// The query's DUST intervals (0-based, inclusive), which pairwise output
+/// prints in lower case as NCBI does; empty with dust off.
+fn pairwise_query_mask(query: &[u8], params: &SearchParams) -> Vec<(u32, u32)> {
+    if !params.dust {
+        return Vec::new();
+    }
+    let mut q = query.to_vec();
+    rmblast_lib::filter::dust::dust_mask(&mut q, rmblast_lib::filter::dust::DUST_WINDOW,
+        rmblast_lib::filter::dust::DUST_LEVEL, rmblast_lib::filter::dust::DUST_LINKER, 14)
+        .into_iter().map(|(s, e)| (s as u32, e as u32)).collect()
+}
+
 /// Test hook: `RMBLAST_TEST_PANIC_AT_QUERY=<n>` makes the search of the n-th
 /// query (0-based) panic in `--mt-mode 1`, to test that a failed job ends the
 /// run instead of hanging it.  Only in a `diagnostics` build.

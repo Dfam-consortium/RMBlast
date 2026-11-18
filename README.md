@@ -99,7 +99,7 @@ rmblastn --query genome.fa --db library.fa \
 | `--mask-level` | Defaults to `-1` (off), matching NCBI. RepeatMasker passes `80` explicitly; RepeatModeler does not pass it at all. |
 | `--min-raw-gapped-score` | A cutoff for the preliminary gapped stage, not a floor on the reported score. Traceback can score lower, and that lower score is what gets reported, as in NCBI. Post-filter if you need a hard floor. |
 | `--evalue` / `--ncbi-compat` | By default nothing is culled on E-value. NCBI 2.17.1 silently drops hits with E > 10 whenever the matrix is in its baked table, and `--ncbi-compat` reproduces that. Pass it for parity benchmarks. |
-| `--outfmt` | `0` for pairwise, or `6` followed by field names. |
+| `--outfmt` | `0` for pairwise, or `6` followed by field names. Other formats (`7`, `10`, ...), a bare `6` (NCBI's default 12 columns) and field names not listed below are refused. |
 | `--mt-mode` | Which axis `--num-threads` splits on. See below. |
 
 Tabular fields: `score`, `perc_sub`, `perc_query_gap`, `perc_db_gap`, `qseqid`,
@@ -194,6 +194,14 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   with E > 10 whenever the matrix is in its baked table; the port keeps them
   unless you pass `--evalue` or `--ncbi-compat`. On a matrix absent from that
   table, such as `comparison.matrix`, both engines cull nothing.
+- Pairwise output (`-outfmt 0`) is NCBI's line for line, for a database built
+  with `-parse_seqids` (as RepeatMasker and RepeatModeler build theirs), with
+  two exceptions. The "Database:" title is the `-db` path given to rmblastn,
+  where NCBI prints the `-in` path given to makeblastdb. "Posted date" is the
+  database file's modification time in UTC, where NCBI prints the build time
+  in local time. Without `-parse_seqids`, NCBI wraps a long subject defline
+  slightly differently, and an id-only defline has no trailing space.
+- The bare binary rejects `-num_alignments`; `wrappers/rmblastn` drops it.
 - The built-in Karlin-Altschul table is looked up by the matrix file's name
   and gap costs, as NCBI does; the matrix contents are not checked against it.
   The same matrix under another name falls back to a startup ALP fit, whose

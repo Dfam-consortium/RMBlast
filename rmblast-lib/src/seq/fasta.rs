@@ -31,7 +31,8 @@ pub enum FastaError {
 pub struct FastaRecord {
     /// Sequence identifier (everything after '>' up to first whitespace).
     pub id: String,
-    /// Full defline (everything after '>').
+    /// Full defline (everything after '>', line ending removed; trailing
+    /// spaces are kept).
     pub defline: String,
     /// BLASTNA-encoded sequence with leading/trailing sentinel (15).
     /// Sequence bases start at index 1.
@@ -97,9 +98,12 @@ impl<R: BufRead> FastaReader<R> {
             }
             self.line_no += 1;
             if let Some(rest) = buf.strip_prefix(b">") {
+                // Only the line ending is removed: makeblastdb keeps a title's
+                // trailing spaces and NCBI prints them in pairwise subject
+                // headers (query deflines are trimmed where they are printed).
                 let defline = std::str::from_utf8(rest)
                     .map_err(|_| self.format_err("the defline is not UTF-8 text".into()))?
-                    .trim_end()
+                    .trim_end_matches(['\n', '\r'])
                     .to_owned();
                 if defline.split_whitespace().next().is_none() {
                     return Err(self.format_err("'>' with no sequence id".into()));

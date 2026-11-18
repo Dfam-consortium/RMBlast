@@ -24,6 +24,13 @@
 //!   `query_dash.fa` (q1 with '-' at 8 positions) against `db.fa`, and
 //!   `query.fa` against `db_dash.fa` (4 records with '-' at 4 positions).
 //!
+//!   `expected_pairwise_{defaults,rm}` are NCBI's pairwise output (no -outfmt)
+//!   from a database built in this directory with `makeblastdb -in db.fa
+//!   -dbtype nucl -parse_seqids -out db`, so its title is "db.fa"; the
+//!   "Posted date" line is removed.  defaults: `-gapopen 20 -gapextend 5
+//!   -num_threads 1`; rm: the rm_defaults options plus -xdrop_* as above,
+//!   with dust on (the default).
+//!
 //!   `expected_defaults` is the same but with only `-gapopen 20 -gapextend 5
 //!   -num_threads 1 -outfmt "6 <RM_FIELDS>"`: every other option at NCBI's default.
 
@@ -54,7 +61,15 @@ fn rmblastn(args: &[&str]) -> Run {
 }
 
 fn rmblastn_env(args: &[&str], env: &[(&str, &str)]) -> Run {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rmblastn"))
+    rmblastn_in(args, env, None)
+}
+
+fn rmblastn_in(args: &[&str], env: &[(&str, &str)], dir: Option<&str>) -> Run {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rmblastn"));
+    if let Some(d) = dir {
+        cmd.current_dir(d);
+    }
+    let mut child = cmd
         .args(args)
         .envs(env.iter().copied())
         .env_remove("BLASTMAT")
@@ -170,6 +185,29 @@ fn dash_in_sequence_is_n_like_ncbi() {
             .iter().map(|s| s.to_string()));
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         assert_same_output(&rmblastn(&refs), &expected(want));
+    }
+}
+
+/// Pairwise output is NCBI's, line for line, apart from "Posted date": the
+/// version line, thousands separators, the full subject defline, DUST-masked
+/// query bases in lower case, the no-hits block and the blank lines between
+/// queries all differed in 3.0.12.  Run from the fixture directory with
+/// --db db.fa so the database title matches NCBI's ("db.fa").
+#[test]
+fn pairwise_matches_ncbi() {
+    let dir = data("");
+    let rm: &[&str] = &["--word-size", "14", "--mask-level", "80", "--complexity-adjust",
+        "--min-raw-gapped-score", "200", "--xdrop-ungap", "400", "--xdrop-gap-final", "200",
+        "--xdrop-gap", "100"];
+    for (extra, want) in [(&[][..], "expected_pairwise_defaults.ncbi-2.17.1.txt"),
+                          (rm, "expected_pairwise_rm.ncbi-2.17.1.txt")] {
+        let mut args = vec!["--db", "db.fa", "--query", "query.fa", "--matrix", "comparison.matrix",
+                            "--gapopen", "20", "--gapextend", "5", "--num-threads", "2"];
+        args.extend_from_slice(extra);
+        let mut r = rmblastn_in(&args, &[], Some(&dir));
+        r.stdout = r.stdout.lines().filter(|l| !l.starts_with("    Posted date:"))
+            .map(|l| format!("{l}\n")).collect();
+        assert_same_output(&r, &expected(want));
     }
 }
 

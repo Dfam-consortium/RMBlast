@@ -254,6 +254,15 @@ impl SubjectDb {
         self.backend.sequences()
     }
 
+    /// A subject's full defline (everything after '>'); None for a 2bit
+    /// database, which stores only names.
+    pub fn defline(&self, name: &str) -> Option<&str> {
+        match &self.backend {
+            SubjectBackend::Fasta(db) => db.defline(name),
+            SubjectBackend::TwoBit(_) => None,
+        }
+    }
+
     /// Cheap `Arc` clone of the cached, already-decoded BLASTNA sequence
     /// (sentinels included, ambiguities resolved).
     pub fn get_full_sequence_blastna(&self, name: &str) -> Result<Arc<[u8]>> {
