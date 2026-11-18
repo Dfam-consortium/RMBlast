@@ -1312,56 +1312,15 @@ fn run_phase2a_inner(
             continue;
         }
 
-        let (q_seed_prelim, s_seed_prelim, q_seed_tb, s_seed_tb) = match ung.strand {
-            Strand::Plus => {
-                let (tb_q, tb_s) = if ung.s_end >= ung.s_seed + 8 {
-                    (ung.q_seed + 3, ung.s_seed + 3)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                let offset_adj = 4 - (tb_s % 4);
-                let mut pre_s = tb_s + offset_adj;
-                let mut pre_q = tb_q + offset_adj;
-                if pre_s >= sa_len || pre_q >= qa_len {
-                    pre_s -= 4;
-                    pre_q -= 4;
-                }
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-            Strand::Minus => {
-                let lw_u32 = lut_word_length;
-                // NCBI gapped_start = rc_q_off + 3 (DynProg path adds 3).
-                // In FWD-genome: q_seed = q0 + ext_right, so q_seed + lw - 4 = rc_q_off + 3 - ext_right.
-                // Using q_seed (not q0_raw) correctly accounts for the extension shift.
-                //
-                // The +3 shift applies iff the ungapped alignment extends ≥8 bases to the RIGHT
-                // of the saved seed in FORWARD-subject space (NCBI blast_gapalign.c:4109
-                // `s_end >= init_hsp->s_off + 8`).  Mapping the (FWD_query, RC_subject) ungapped
-                // record to FWD-subject: saved seed = sa_len - ung.s_seed - lw, ungapped end =
-                // sa_len - ung.s_start.  The old condition `ung.s_end >= ung.s_seed + 8` tested
-                // the RC-subject end against the RC-subject anchor (wrong frame/direction) — see
-                // the matching fix and rationale in run_gapped_phase (bug #38).
-                let s_off_saved_fwd = sa_len - ung.s_seed - lw_u32;
-                let s_end_fwd       = sa_len - ung.s_start;
-                let (tb_q, tb_s) = if s_end_fwd >= s_off_saved_fwd + 8 {
-                    (ung.q_seed + lw_u32 - 4, ung.s_seed + lw_u32 - 4)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                let fwd_te_seed = sa_len - 1 - tb_s;
-                let offset_adj = 4 - (fwd_te_seed % 4);
-                let pre_s = tb_s.saturating_sub(offset_adj);
-                let pre_q = tb_q.saturating_sub(offset_adj);
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-        };
+        let (q_pivot, s_pivot, q_seed_tb, s_seed_tb) =
+            prelim_pivot(ung, qa_len, sa_len, lut_word_length);
 
         // NCBI: mask_at_hash=TRUE for blastn/rmblastn — DUST only affects lookup table,
         // not gapped alignment. Use unmasked query for Phase 2a.
         let (pq_seq, ps_seq, pq_seed, ps_seed) = if ung.strand == Strand::Minus {
-            (query_rc, subject_plus, qa_len - 1 - q_seed_prelim, sa_len - 1 - s_seed_prelim)
+            (query_rc, subject_plus, q_pivot, s_pivot)
         } else {
-            (query, subject_plus, q_seed_prelim, s_seed_prelim)
+            (query, subject_plus, q_pivot, s_pivot)
         };
         let phase2a_xdrop = params.xdrop_gap.min(ung.score);
         crate::diag_count!(COUNT_PRELIM_GAPPED);
@@ -1855,6 +1814,70 @@ pub fn search_phase2a(
     prelims
 }
 
+/// The Phase 2a pivot and the Phase 2b traceback seed for an ungapped hit,
+/// as NCBI computes them (blast_gapalign.c):
+/// - the +3 gapped_start shift when the ungapped alignment reaches at least 8
+///   bases right of the saved seed in forward-subject space
+///   (`s_end >= init_hsp->s_off + 8`), and
+/// - offset_adjustment, which rounds the start up to the next 4-base subject
+///   boundary, pulled back by 4 if that passes the end of either sequence
+///   (s_BlastDynProgNtGappedAlignment, `q_length > length` guard).
+///
+/// Returns (pivot_q, pivot_s, tb_q, tb_s).  The pivot is the q_length /
+/// s_length that gapped_extend_score_only takes, in the frame it runs in:
+/// forward for plus, NCBI's (RC query, forward subject) frame for minus.
+/// tb_* are in the record frame (forward query; RC subject for minus).
+///
+/// The single-chunk and the chunked pipelines used to carry a copy each, and
+/// the chunked copy still had the earlier minus formula, which differs when
+/// the +3 shift does not apply (review 3.1; e.g. identity.matrix).
+fn prelim_pivot(ung: &UngappedRecord, qa_len: u32, sa_len: u32, lw: u32) -> (u32, u32, u32, u32) {
+    match ung.strand {
+        Strand::Plus => {
+            let (tb_q, tb_s) = if ung.s_end >= ung.s_seed + 8 {
+                (ung.q_seed + 3, ung.s_seed + 3)
+            } else {
+                (ung.q_seed, ung.s_seed)
+            };
+            // Round the pivot to the next 4-base subject boundary.
+            let offset_adj = 4 - (tb_s % 4);
+            let mut pre_s = tb_s + offset_adj;
+            let mut pre_q = tb_q + offset_adj;
+            if pre_s >= sa_len || pre_q >= qa_len {
+                pre_s -= 4;
+                pre_q -= 4;
+            }
+            (pre_q, pre_s, tb_q, tb_s)
+        }
+        Strand::Minus => {
+            // The +3 condition in forward-subject space (bug #38): the record
+            // stores (forward query, RC subject), so the saved seed is
+            // sa_len - s_seed - lw and the ungapped end sa_len - s_start.
+            let s_off_saved_fwd = sa_len - ung.s_seed - lw;
+            let s_end_fwd = sa_len - ung.s_start;
+            let extends = s_end_fwd >= s_off_saved_fwd + 8;
+            let (tb_q, tb_s) = if extends {
+                (ung.q_seed + lw - 4, ung.s_seed + lw - 4)
+            } else {
+                (ung.q_seed, ung.s_seed)
+            };
+            // The pivot in NCBI's own frame, so the guard trims from the high
+            // end as NCBI's does (an RC-frame formula underflowed at the
+            // subject boundary, bug #42's neighbour).
+            let shift = if extends { 3 } else { 0 };
+            let q_off_n = (qa_len - ung.q_seed - lw) + shift; // RC query, word start (+3)
+            let s_off_n = (sa_len - ung.s_seed - lw) + shift; // forward subject, word start (+3)
+            let oa = 4 - (s_off_n % 4);
+            let (mut q_len_piv, mut s_len_piv) = (q_off_n + oa, s_off_n + oa);
+            if q_len_piv > qa_len || s_len_piv > sa_len {
+                q_len_piv -= 4;
+                s_len_piv -= 4;
+            }
+            (q_len_piv, s_len_piv, tb_q, tb_s)
+        }
+    }
+}
+
 /// Phase 2: preliminary gapped + traceback.
 ///
 /// Phase 2a (BLAST_GetGappedScore): sorts ungapped hits by score descending, runs
@@ -1983,96 +2006,16 @@ fn run_gapped_phase<U: UngapOut>(
         //   NCBI Phase 2b seed (context-1): (q_off+3, s_off+3) → Rust FWD: (q_seed+wm4, s_seed+wm4).
         //   NCBI Phase 2a rounding in FWD-TE: offset_adj = 4 - ((sa_len-1-s_seed_tb) % 4).
         //   In RC-TE this subtracts offset_adj: prelim_s = s_seed_tb - offset_adj.
-        let (q_seed_prelim, s_seed_prelim, q_seed_tb, s_seed_tb) = match ung.strand {
-            Strand::Plus => {
-                let (tb_q, tb_s) = if ung.s_end >= ung.s_seed + 8 {
-                    (ung.q_seed + 3, ung.s_seed + 3)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                // Round Phase 2a pivot to next 4-base subject boundary (offset_adjustment).
-                let offset_adj = 4 - (tb_s % 4);
-                let mut pre_s = tb_s + offset_adj;
-                let mut pre_q = tb_q + offset_adj;
-                // Bound check mirrors NCBI: if pivot overshoots, pull back by 4.
-                if pre_s >= sa_len || pre_q >= qa_len {
-                    pre_s -= 4;
-                    pre_q -= 4;
-                }
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-            Strand::Minus => {
-                let lw_u32 = lut_word_length;
-                // NCBI's +3 gapped_start shift (blast_gapalign.c:4109) applies iff the ungapped
-                // alignment extends ≥8 bases to the RIGHT of the saved seed in FORWARD-subject
-                // space: `s_end >= init_hsp->s_off + 8`, where init_hsp->s_off is the saved seed
-                // (FWD-subject) and s_end is the ungapped end (FWD-subject).  Rust stores the
-                // ungapped record in (FWD_query, RC_subject) coords, so map to FWD-subject:
-                //   saved seed FWD_s = sa_len - ung.s_seed - lw   (== NCBI init_hsp->s_off)
-                //   ungapped end FWD_s = sa_len - ung.s_start
-                // The previous condition `ung.s_end >= ung.s_seed + 8` tested the RC-subject end
-                // against the RC-subject anchor — the wrong frame AND the wrong direction.  It
-                // happened to agree with NCBI for most hits but gave the wrong answer when the
-                // ungapped extension to the right (FWD_s) of the seed landed within 8 bases of
-                // the boundary, dropping the +3 shift → traceback gapped_start 3bp off → 1bp
-                // gap-placement shift in homopolymer runs whenever improve_seed early-returns
-                // (bug #38).  This is the minus-strand analog of the plus branch's natural
-                // FWD-subject condition above.
-                let s_off_saved_fwd = sa_len - ung.s_seed - lw_u32; // saved seed, FWD-subject
-                let s_end_fwd       = sa_len - ung.s_start;         // ungapped end, FWD-subject
-                let extends = s_end_fwd >= s_off_saved_fwd + 8;
-                let (tb_q, tb_s) = if extends {
-                    (ung.q_seed + lw_u32 - 4, ung.s_seed + lw_u32 - 4)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                // Phase 2a seed: mirror NCBI's s_BlastDynProgNtGappedAlignment exactly, in
-                // NCBI's own (RC_query, FWD_subject) frame.  NCBI takes the ungapped seed
-                // offsets (with the +3 gapped_start shift above), then
-                // `offset_adjustment = 4 - (s_off % 4)` shifts the start UP to the next 4-base
-                // subject boundary (so the packed-nucleotide left extension starts on a byte
-                // boundary), with a guard that subtracts 4 when the shifted start would run past
-                // the END of either sequence.
-                //
-                // Computing the pivot in this FWD frame (rather than the mirror RC_subject
-                // frame) is essential: NCBI's guard trims from the HIGH end, so the pivot can
-                // never fall below 0.  The previous RC-frame formula applied the guard in the
-                // wrong direction and underflowed for seeds at the subject boundary
-                // (ung.s_seed≈0), producing a negative seed → out-of-bounds panic (mirslib,
-                // word_size 6).  For all non-boundary seeds this yields the identical pivot.
-                let shift = if extends { 3 } else { 0 };
-                let q_off_n = (qa_len - ung.q_seed - lw_u32) + shift; // RC_q word-left (+3)
-                let s_off_n = (sa_len - ung.s_seed - lw_u32) + shift; // FWD_s word-left (+3)
-                let oa = 4 - (s_off_n % 4); // offset_adjustment ∈ [1,4]
-                let mut q_len_piv = q_off_n + oa;
-                let mut s_len_piv = s_off_n + oa;
-                if q_len_piv > qa_len || s_len_piv > sa_len {
-                    q_len_piv -= 4;
-                    s_len_piv -= 4;
-                }
-                // Since bug #42, gapped_extend_score_only uses the pivot as NCBI's
-                // q_length/s_length directly — the EXCLUSIVE left bound / FIRST base of the
-                // right extension (left = [0, pivot)).  So the prelim pivot in NCBI's
-                // (RC_q, FWD_s) frame must equal q_len_piv / s_len_piv.  The caller maps
-                // back via `qa_len-1-pre_q` / `sa_len-1-pre_s`, so store the FWD-frame
-                // complement that yields pivot == q_len_piv: `qa_len-1-q_len_piv`.  (The
-                // plus branch already passes q_length directly; before #42 this used
-                // `qa_len-q_len_piv` to give pivot q_length-1, matching the old pivot-in-left
-                // split — that one-base offset became a latent minus-only bug at #42, only
-                // visible at the prelim-filter boundary, e.g. cc L2d_3end 181-vs-179.)
-                let pre_q = qa_len - 1 - q_len_piv;
-                let pre_s = sa_len - 1 - s_len_piv;
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-        };
+        let (q_pivot, s_pivot, q_seed_tb, s_seed_tb) =
+            prelim_pivot(ung, qa_len, sa_len, lut_word_length);
 
         // Preliminary gapped alignment anchored at seed, with smaller xdrop_gap.
         // Minus strand: use NCBI orientation (RC-query, FWD-TE) so seed lands in LEFT.
         // NCBI: mask_at_hash=TRUE — DUST only affects lookup table, not gapped alignment.
         let (pq_seq, ps_seq, pq_seed, ps_seed) = if ung.strand == Strand::Minus {
-            (&query_rc[..], subject_plus, qa_len - 1 - q_seed_prelim, sa_len - 1 - s_seed_prelim)
+            (&query_rc[..], subject_plus, q_pivot, s_pivot)
         } else {
-            (query, subject_plus, q_seed_prelim, s_seed_prelim)
+            (query, subject_plus, q_pivot, s_pivot)
         };
         // NCBI caps Phase 2a xdrop at min(xdrop_gap, ungapped_score):
         // blast_gapalign.c s_BlastDynProgNtGappedAlignment lines 2970-2972.

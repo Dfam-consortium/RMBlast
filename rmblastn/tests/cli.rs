@@ -244,6 +244,35 @@ fn complexity_adjust_minus_strand_like_ncbi() {
     assert_same_output(&rmblastn(&refs), &expected("expected_asym_freqs.ncbi-2.17.1.tsv"));
 }
 
+/// A query over 1 Mb is searched in chunks, and the chunked pipeline had its
+/// own copy of the minus-strand Phase 2a pivot with an earlier formula, wrong
+/// when NCBI's +3 shift does not apply (review 3.1).  chr22 30,000,000 to
+/// 33,000,000 (from tests/data/chr22.fa) at word size 7: 3.0.12 differed
+/// from NCBI on 33 lines.  Expected output: NCBI 2.17.1, `-gapopen 20
+/// -gapextend 5 -word_size 7 -min_raw_gapped_score 200 -mask_level 80
+/// -outfmt "6 score qseqid qstart qend sstrand sseqid sstart send"`, the
+/// query named chr22_30M_33M.  Slow (~10 s): `make test-full`.
+#[test]
+#[ignore]
+fn chunked_query_minus_pivot_like_ncbi() {
+    let chr22 = format!("{}/../tests/data/chr22.fa", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&chr22).expect("tests/data/chr22.fa");
+    let seq: String = text.lines().filter(|l| !l.starts_with('>')).collect();
+    let slice = &seq[30_000_000..33_000_000];
+    let mut fa = String::from(">chr22_30M_33M\n");
+    for chunk in slice.as_bytes().chunks(60) {
+        fa.push_str(std::str::from_utf8(chunk).unwrap());
+        fa.push('\n');
+    }
+    let q = tempfile_path::TempFile::with_contents(&fa);
+    let (db, m) = (data("db.fa"), data("comparison.matrix"));
+    let r = rmblastn(&["--db", &db, "--query", q.path(), "--matrix", &m, "--gapopen", "20",
+        "--gapextend", "5", "--word-size", "7", "--min-raw-gapped-score", "200",
+        "--mask-level", "80", "--num-threads", "4",
+        "--outfmt", "6 score qseqid qstart qend sstrand sseqid sstart send"]);
+    assert_same_output(&r, &expected("expected_chr22_30M-33M_ws7.ncbi-2.17.1.tsv"));
+}
+
 /// NCBI's single-dash, underscore spellings give the same result as ours.
 #[test]
 fn ncbi_spelling_matches_native_spelling() {
