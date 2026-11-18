@@ -6,7 +6,7 @@
 
 use crate::hits::{EditOp, EditScript};
 use crate::matrix::ScoreMatrix;
-use crate::encoding::BLASTNA_SIZE;
+use crate::encoding::{BLASTNA_COMPLEMENT, BLASTNA_SIZE};
 
 /// Collect the BLASTNA bases from query positions that appear in aligned
 /// (Sub or GapInSubject) positions.  NCBI's complexity adjustment counts
@@ -89,7 +89,9 @@ pub fn compute_adjusted_score(
     }
 
     if t_counts == 0.0 {
-        return raw_score as f64;
+        // NCBI computes t_counts * log(t_counts) = 0 * log(0) = NaN here, and
+        // the NaN score then fails the cutoff, so the hit is dropped.
+        return f64::NAN;
     }
 
     t_factor -= t_counts * t_counts.ln();
@@ -100,6 +102,12 @@ pub fn compute_adjusted_score(
 }
 
 /// Apply complexity adjustment; return None if score falls below cutoff.
+///
+/// `query`, `q_start` and `edit_script` are in forward-query terms.  For a
+/// minus-strand hit NCBI counts the composition of its context query, the
+/// reverse complement, so the aligned bases are complemented: the same
+/// positions read from the other strand.  (Matrices with complement-symmetric
+/// FREQS, like comparison.matrix, give the same score either way.)
 pub fn apply_complexity_adjust(
     raw_score: i32,
     query: &[u8],
@@ -107,9 +115,18 @@ pub fn apply_complexity_adjust(
     edit_script: &EditScript,
     matrix: &ScoreMatrix,
     cutoff: i32,
+    is_minus: bool,
 ) -> Option<i32> {
-    let aligned_bases = collect_query_aligned_bases(query, q_start, edit_script);
+    let mut aligned_bases = collect_query_aligned_bases(query, q_start, edit_script);
+    if is_minus {
+        for b in &mut aligned_bases {
+            *b = BLASTNA_COMPLEMENT[(*b & 15) as usize];
+        }
+    }
     let adj = compute_adjusted_score(raw_score, &aligned_bases, matrix);
+    if adj.is_nan() {
+        return None;
+    }
     let rounded = adj as i32;
     if rounded < cutoff { None } else { Some(rounded) }
 }

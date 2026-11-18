@@ -229,6 +229,21 @@ fn no_score_zero_hits_with_default_cutoff() {
     }
 }
 
+/// Complexity adjustment of a minus-strand hit counts the reverse-complement
+/// query, as NCBI does.  `asym_freqs.matrix` is comparison.matrix with FREQS
+/// A 0.30 C 0.20 G 0.25 T 0.25 (A != T), where the strand matters; 3.0.12
+/// scored every minus hit differently from NCBI.  Expected output: NCBI
+/// 2.17.1 with the rm_defaults options but -mask_level 101 and this matrix.
+#[test]
+fn complexity_adjust_minus_strand_like_ncbi() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("asym_freqs.matrix"));
+    let mut args = search_args(&db, &q, &m);
+    args.extend(["--mask-level", "101", "--complexity-adjust", "--dust", "yes", "--num-threads", "1"]
+        .iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    assert_same_output(&rmblastn(&refs), &expected("expected_asym_freqs.ncbi-2.17.1.tsv"));
+}
+
 /// NCBI's single-dash, underscore spellings give the same result as ours.
 #[test]
 fn ncbi_spelling_matches_native_spelling() {

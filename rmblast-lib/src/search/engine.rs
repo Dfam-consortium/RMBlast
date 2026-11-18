@@ -1571,7 +1571,8 @@ pub fn run_phase2b(
         if params.complexity_adjust {
             match apply_complexity_adjust(
                 score, query, q_start, &edit_script, matrix,
-                params.min_raw_gapped_score,
+                // NCBI compares with cutoffs[ctx].cutoff_score (see gapped_cutoff)
+                params.gapped_cutoff(), phsp.strand == Strand::Minus,
             ) {
                 Some(adj) => score = adj,
                 None => { continue; }
@@ -2254,7 +2255,8 @@ fn run_gapped_phase<U: UngapOut>(
         if params.complexity_adjust {
             match apply_complexity_adjust(
                 score, query, q_start, &edit_script, matrix,
-                params.min_raw_gapped_score,
+                // NCBI compares with cutoffs[ctx].cutoff_score (see gapped_cutoff)
+                params.gapped_cutoff(), phsp.strand == Strand::Minus,
             ) {
                 Some(adj) => score = adj,
                 None => {
