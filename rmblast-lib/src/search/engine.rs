@@ -1330,6 +1330,38 @@ fn collect_ungapped_combined<S: SeedOut>(
     scratch.put_back();
 }
 
+/// Sort ungapped hits as NCBI does before the preliminary gapped stage.
+fn sort_ungapped_like_ncbi(ungapped: &mut [UngappedRecord], q_len: u32, s_len: u32) {
+    // Mirrors Blast_InitHitListSortByScore / score_compare_match in blast_extend.c.
+    // NCBI sorts by combined-query q_start, which for plus strand = FWD q_start (< q_len)
+    // and for minus strand = c1_offset + (q_len - FWD_q_end) (>> q_len).  This naturally
+    // places all plus-strand hits before all minus-strand hits in the q_start tiebreaker.
+    // We replicate that by mapping: plus → q_start, minus → (q_len+1) + (q_len - q_end).
+    // NCBI also stores s_start in FWD-subject space (from the FWD scan), so we FWD-normalize.
+    ungapped.sort_unstable_by(|a, b| {
+        let a_ss = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
+        let b_ss = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
+        let a_qk = match a.strand { Strand::Plus => a.q_start as u64,
+                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(a.q_end as u64) };
+        let b_qk = match b.strand { Strand::Plus => b.q_start as u64,
+                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(b.q_end as u64) };
+        // s_seed ASC: word-hit position in FWD-subject coords — matches NCBI's effective
+        // insertion order (left-to-right scan) for hits with otherwise equal sort keys.
+        let a_sk = match a.strand { Strand::Plus => a.s_seed, Strand::Minus => s_len - a.s_seed };
+        let b_sk = match b.strand { Strand::Plus => b.s_seed, Strand::Minus => s_len - b.s_seed };
+        b.score.cmp(&a.score)
+            .then_with(|| a_ss.cmp(&b_ss))
+            .then_with(|| {
+                let la = a.s_end - a.s_start;
+                let lb = b.s_end - b.s_start;
+                lb.cmp(&la)
+            })
+            .then_with(|| a_qk.cmp(&b_qk))
+            .then_with(|| a_sk.cmp(&b_sk))
+    });
+
+}
+
 /// Phase 2a inner loop: for each pre-sorted ungapped hit, run preliminary gapped alignment
 /// and populate the interval-tree containment filter.  Returns preliminary HSPs (already
 /// purged via purge_prelim_common_endpoints) in the caller's coordinate space.
@@ -1346,11 +1378,11 @@ fn run_phase2a_inner(
     params: &SearchParams,
     matrix: &ScoreMatrix,
     lut_word_length: u32,
+    ws: &mut AlignWorkspace,
 ) -> Vec<PrelimHsp> {
     let mut accepted_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, sa_len + 1);
     let mut accepted_minus = BlastIntervalTree::new(0, qa_len + 1, 0, sa_len + 1);
     let mut prelim_hsps: Vec<PrelimHsp> = Vec::new();
-    let mut ws = AlignWorkspace::new();
 
     for ung in ungapped {
         let (cand_s_start, cand_s_end) = match ung.strand {
@@ -1443,10 +1475,31 @@ pub fn run_phase2b(
     query_id: &str,
     subject: &PreparedSubject,
     subject_id: &str,
+    prelim_hsps: Vec<PrelimHsp>,
+    params: &SearchParams,
+    matrix: &ScoreMatrix,
+    n_mask: &[u8],
+) -> Vec<AlignResult> {
+    traceback_phase(query, query_rc, query_id, subject, subject_id, prelim_hsps,
+                    params, matrix, n_mask, &mut AlignWorkspace::new())
+}
+
+/// Phase 2b for one subject: traceback of the preliminary HSPs, the
+/// common-endpoint cut and purge, and the final containment pass.  Shared by
+/// the single-chunk pipeline (run_gapped_phase) and the chunked one
+/// (run_phase2b).
+#[allow(clippy::too_many_arguments)]
+fn traceback_phase(
+    query: &[u8],
+    query_rc: &[u8],
+    query_id: &str,
+    subject: &PreparedSubject,
+    subject_id: &str,
     mut prelim_hsps: Vec<PrelimHsp>,
     params: &SearchParams,
     matrix: &ScoreMatrix,
     n_mask: &[u8],
+    ws: &mut AlignWorkspace,
 ) -> Vec<AlignResult> {
     let qa_len = (query.len() - 2) as u32;
     let s_len  = (subject.align.len() - 2) as u32;
@@ -1463,7 +1516,6 @@ pub fn run_phase2b(
     debug_assert_eq!(subject.n_mask_rc.len(), n_mask.len(), "n_mask is not this subject's");
     let subject_plus: &[u8] = &subject.align;
     let subj_rc: &[u8] = &subject.align_rc;
-    let mut ws   = AlignWorkspace::new();
 
     // ScoreCompareHSPs sort: score DESC, FWD s_start ASC, FWD s_end DESC,
     // query.offset ASC, query.end DESC.  NCBI coordinate transform per strand:
@@ -1544,7 +1596,7 @@ pub fn run_phase2b(
             tq_seq, ts_seq, tq_seed, ts_seed,
             params.gap_open, params.gap_extend,
             params.xdrop_gap_final,
-            matrix, &mut ws,
+            matrix, ws,
         );
         if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
             if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
@@ -1814,30 +1866,7 @@ pub fn search_phase2a(
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
     );
 
-    // Same sort as run_gapped_phase (Blast_InitHitListSortByScore).
-    ungapped.sort_unstable_by(|a, b| {
-        let a_ss = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
-        let b_ss = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
-        let a_qk = match a.strand {
-            Strand::Plus  => a.q_start as u64,
-            Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(a.q_end as u64),
-        };
-        let b_qk = match b.strand {
-            Strand::Plus  => b.q_start as u64,
-            Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(b.q_end as u64),
-        };
-        let a_sk = match a.strand { Strand::Plus => a.s_seed, Strand::Minus => s_len - a.s_seed };
-        let b_sk = match b.strand { Strand::Plus => b.s_seed, Strand::Minus => s_len - b.s_seed };
-        b.score.cmp(&a.score)
-            .then_with(|| a_ss.cmp(&b_ss))
-            .then_with(|| {
-                let la = a.s_end - a.s_start;
-                let lb = b.s_end - b.s_start;
-                lb.cmp(&la)
-            })
-            .then_with(|| a_qk.cmp(&b_qk))
-            .then_with(|| a_sk.cmp(&b_sk))
-    });
+    sort_ungapped_like_ncbi(&mut ungapped, q_len, s_len);
 
     let query_rc = ql.query_rc(query);
     let qa_len   = q_len;
@@ -1845,7 +1874,7 @@ pub fn search_phase2a(
 
     let mut prelims = run_phase2a_inner(
         query, query_rc, subject_plus, qa_len, sa_len, &ungapped,
-        params, matrix, ql.lut_word_length(),
+        params, matrix, ql.lut_word_length(), &mut AlignWorkspace::new(),
     );
 
     if chunk_offset > 0 {
@@ -1949,39 +1978,9 @@ fn run_gapped_phase<U: UngapOut>(
 ) -> Vec<AlignResult> {
     // N/IUPAC handling: NCBI uses CRandom (2-bit scan) for Phase 2a (score-only filter)
     // and the original ambiguity code for Phase 2b (full traceback + improve_seed + reevaluate).
-    // Phase 2a uses the original subject_plus/subj_rc parameters (CRandom at ambig positions).
-    // Phase 2b uses the align views below (original BLASTNA code at ambig positions),
-    // borrowed from the per-subject cache (built with this same n_mask).
-    let subject_align: &[u8] = &prep.align;
-    let subj_rc_align: &[u8] = &prep.align_rc;
-
-    // Mirrors Blast_InitHitListSortByScore / score_compare_match in blast_extend.c.
-    // NCBI sorts by combined-query q_start, which for plus strand = FWD q_start (< q_len)
-    // and for minus strand = c1_offset + (q_len - FWD_q_end) (>> q_len).  This naturally
-    // places all plus-strand hits before all minus-strand hits in the q_start tiebreaker.
-    // We replicate that by mapping: plus → q_start, minus → (q_len+1) + (q_len - q_end).
-    // NCBI also stores s_start in FWD-subject space (from the FWD scan), so we FWD-normalize.
-    ungapped.sort_unstable_by(|a, b| {
-        let a_ss = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
-        let b_ss = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
-        let a_qk = match a.strand { Strand::Plus => a.q_start as u64,
-                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(a.q_end as u64) };
-        let b_qk = match b.strand { Strand::Plus => b.q_start as u64,
-                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(b.q_end as u64) };
-        // s_seed ASC: word-hit position in FWD-subject coords — matches NCBI's effective
-        // insertion order (left-to-right scan) for hits with otherwise equal sort keys.
-        let a_sk = match a.strand { Strand::Plus => a.s_seed, Strand::Minus => s_len - a.s_seed };
-        let b_sk = match b.strand { Strand::Plus => b.s_seed, Strand::Minus => s_len - b.s_seed };
-        b.score.cmp(&a.score)
-            .then_with(|| a_ss.cmp(&b_ss))
-            .then_with(|| {
-                let la = a.s_end - a.s_start;
-                let lb = b.s_end - b.s_start;
-                lb.cmp(&la)
-            })
-            .then_with(|| a_qk.cmp(&b_qk))
-            .then_with(|| a_sk.cmp(&b_sk))
-    });
+    // Phase 2a gets subject_plus (CRandom bases at ambiguous positions); Phase 2b
+    // reads prep's align views (the original codes), built with this same n_mask.
+    sort_ungapped_like_ncbi(&mut ungapped, q_len, s_len);
 
     // Emit ungapped hits (sorted, FWD-normalized) for collection and optional debug dump.
     for ung in &ungapped {
@@ -1996,436 +1995,23 @@ fn run_gapped_phase<U: UngapOut>(
         });
     }
 
-    // Interval trees for Phase 2a containment (one per strand, mirrors NCBI BlastIntervalTree).
-    // Tree range = [0, query_non_sentinel_length + 1] matching NCBI's Blast_IntervalTreeInit.
-    let q_tree_end = (query.len() - 2) as u32 + 1;
-    let mut accepted_plus  = BlastIntervalTree::new(0, q_tree_end, 0, s_len + 1);
-    let mut accepted_minus = BlastIntervalTree::new(0, q_tree_end, 0, s_len + 1);
-    let mut prelim_hsps: Vec<PrelimHsp> = Vec::new();
-    let mut ws = AlignWorkspace::new();
+    // No ungapped hits, no prelims, no results (most subjects of a short
+    // query against a large library).
+    if ungapped.is_empty() {
+        return Vec::new();
+    }
 
-    // For minus-strand gapped alignment, use NCBI orientation (RC-query, FWD-subject) so the
-    // seed always lands in the LEFT (reverse) extension, matching BLAST_GappedAlignmentWithTraceback.
-    // Results are converted back to FWD-genomic + RC-subject before storage.
-    // NCBI: mask_at_hash=TRUE — masked query only affects lookup table, not gapped alignment.
+    // Phase 2a, then 2b, sharing one workspace (the chunked pipeline runs
+    // the same two functions with a cross-chunk merge in between).
     let qa_len = (query.len() - 2) as u32;   // non-sentinel bases in query
     let sa_len = (subject_plus.len() - 2) as u32; // non-sentinel bases in subject
-
-    // Phase 2a: preliminary gapped alignment with xdrop_gap (mirrors BLAST_GetGappedScore).
-    for ung in &ungapped {
-        // Normalize candidate s coords to plus-strand for the interval tree query.
-        let (cand_s_start, cand_s_end) = match ung.strand {
-            Strand::Plus  => (ung.s_start, ung.s_end),
-            Strand::Minus => (s_len - ung.s_end, s_len - ung.s_start),
-        };
-        let plus = ung.strand == Strand::Plus;
-        let contained = {
-            let tree = if plus { &accepted_plus } else { &accepted_minus };
-            tree.contains(ung.q_start, ung.q_end, cand_s_start, cand_s_end,
-                          ung.score, plus, MIN_DIAG_SEP)
-        };
-        if contained {
-            continue;
-        }
-
-        // NCBI shifts the seed +3 before Phase 2a if the ungapped extension extends ≥8
-        // bases past the word-start (blast_gapalign.c lines 4041-4044).  It then rounds
-        // the Phase 2a pivot to the next 4-base subject boundary inside
-        // s_BlastDynProgNtGappedAlignment (offset_adjustment = 4 - (s_off % 4)).
-        // This rounding changes the prelim alignment boundaries, which in turn affects the
-        // search range used by BlastGetStartForGappedAlignmentNucl (improve_seed) in Phase
-        // 2b.  We must replicate the rounding so our improve_seed search covers the same
-        // region, even though 1-byte-per-base alignment doesn't require it algorithmically.
-        //
-        // Phase 2a uses (q_seed_prelim, s_seed_prelim) — the rounded pivot.
-        // Phase 2b uses (q_seed_tb, s_seed_tb) — the unrounded seed (stored as gapped_start).
-        //
-        // For plus strand: both +3 shift and 4-base rounding apply to Phase 2a.
-        //   offset_adj = 4 - ((s_seed + 3) % 4)  (always 1..=4)
-        //   prelim seed = (q_seed + 3 + offset_adj, s_seed + 3 + offset_adj)
-        //   tb seed     = (q_seed + 3, s_seed + 3)
-        //
-        // For minus strand: NCBI context-1 FWD-TE shifts correspond to RC-TE shifts in
-        //   the opposite direction.
-        //   NCBI Phase 2b seed (context-1): (q_off+3, s_off+3) → Rust FWD: (q_seed+wm4, s_seed+wm4).
-        //   NCBI Phase 2a rounding in FWD-TE: offset_adj = 4 - ((sa_len-1-s_seed_tb) % 4).
-        //   In RC-TE this subtracts offset_adj: prelim_s = s_seed_tb - offset_adj.
-        let (q_pivot, s_pivot, q_seed_tb, s_seed_tb) =
-            prelim_pivot(ung, qa_len, sa_len, lut_word_length);
-
-        // Preliminary gapped alignment anchored at seed, with smaller xdrop_gap.
-        // Minus strand: use NCBI orientation (RC-query, FWD-TE) so seed lands in LEFT.
-        // NCBI: mask_at_hash=TRUE — DUST only affects lookup table, not gapped alignment.
-        let (pq_seq, ps_seq, pq_seed, ps_seed) = if ung.strand == Strand::Minus {
-            (query_rc, subject_plus, q_pivot, s_pivot)
-        } else {
-            (query, subject_plus, q_pivot, s_pivot)
-        };
-        // NCBI caps Phase 2a xdrop at min(xdrop_gap, ungapped_score):
-        // blast_gapalign.c s_BlastDynProgNtGappedAlignment lines 2970-2972.
-        let phase2a_xdrop = params.xdrop_gap.min(ung.score);
-        crate::diag_count!(COUNT_PRELIM_GAPPED);
-        let prelim = gapped_extend_score_only(
-            pq_seq, ps_seq, pq_seed, ps_seed,
-            params.gap_open, params.gap_extend,
-            phase2a_xdrop,
-            matrix, &mut ws.dp_score,
-        );
-
-        let (prelim_score, q_start, q_end, s_start, s_end) = match prelim {
-            None => {
-                continue;
-            }
-            Some((sc, q0, q1, s0, s1)) => {
-                if ung.strand == Strand::Minus {
-                    // RC-query + FWD-TE → FWD-genomic + RC-TE
-                    (sc, qa_len - q1, qa_len - q0, sa_len - s1, sa_len - s0)
-                } else {
-                    (sc, q0, q1, s0, s1)
-                }
-            }
-        };
-
-        // NCBI keeps a preliminary HSP iff score >= cutoff_score_min
-        // (blast_traceback.c:857), at least 1.  With --min-raw-gapped-score 0
-        // 3.0.12 kept score-0, zero-length prelims, which came out as hits
-        // like "0 q1 3940 3939".
-        if prelim_score < params.gapped_cutoff() {
-            continue;
-        }
-
-        // Normalize subject coordinates to plus-strand for the interval tree.
-        let (norm_s_start, norm_s_end) = match ung.strand {
-            Strand::Plus => (s_start, s_end),
-            Strand::Minus => (s_len - s_end, s_len - s_start),
-        };
-
-        // Add to interval tree using PRELIMINARY (compact) boundaries.
-        {
-            let tree = if ung.strand == Strand::Plus { &mut accepted_plus } else { &mut accepted_minus };
-            tree.add(ITreeHsp { q_start, q_end, s_start: norm_s_start, s_end: norm_s_end, score: prelim_score }, plus);
-        }
-
-        prelim_hsps.push(PrelimHsp {
-            q_seed: q_seed_tb,
-            s_seed: s_seed_tb,
-            q_start,
-            q_end,
-            s_start,  // in strand's subject space
-            s_end,
-            score: prelim_score,
-            strand: ung.strand,
-        });
-    }
-
-    // Mirrors Blast_HSPListPurgeHSPsWithCommonEndpoints (called in blast_engine.c between
-    // Phase 2a and Phase 2b). Removes prelim HSPs that share the same start or end
-    // coordinates, keeping only the best-scoring one in each group.
-    purge_prelim_common_endpoints(&mut prelim_hsps, s_len);
-
-    // Phase 2b: traceback with xdrop_gap_final (mirrors Blast_TracebackFromHSPList).
-    // NCBI sorts the preliminary HSP list by ScoreCompareHSPs: score DESC, then
-    // subject.offset ASC (FWD s_start), subject.end DESC, query.offset ASC, query.end DESC.
-    // NCBI coordinate transform per strand:
-    //   plus:  query.offset = FWD_qs,        query.end = FWD_qe
-    //   minus: query.offset = qlen - FWD_qe, query.end = qlen - FWD_qs
-    prelim_hsps.sort_by(|a, b| {
-        let fwd_sa = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
-        let fwd_sb = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
-        let fwd_ea = match a.strand { Strand::Plus => a.s_end, Strand::Minus => s_len - a.s_start };
-        let fwd_eb = match b.strand { Strand::Plus => b.s_end, Strand::Minus => s_len - b.s_start };
-        let q_off_a = match a.strand { Strand::Plus => a.q_start, Strand::Minus => qa_len - a.q_end };
-        let q_off_b = match b.strand { Strand::Plus => b.q_start, Strand::Minus => qa_len - b.q_end };
-        let q_end_a = match a.strand { Strand::Plus => a.q_end, Strand::Minus => qa_len - a.q_start };
-        let q_end_b = match b.strand { Strand::Plus => b.q_end, Strand::Minus => qa_len - b.q_start };
-        b.score.cmp(&a.score)
-            .then_with(|| fwd_sa.cmp(&fwd_sb))
-            .then_with(|| fwd_eb.cmp(&fwd_ea))
-            .then_with(|| q_off_a.cmp(&q_off_b))
-            .then_with(|| q_end_b.cmp(&q_end_a))
-    });
-
-    // Interval trees for Phase 2b containment (mirrors NCBI BlastIntervalTree in
-    // Blast_TracebackFromHSPList — same structure as Phase 2a, separate per strand).
-    let mut tb_accepted_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, s_len + 1);
-    let mut tb_accepted_minus = BlastIntervalTree::new_rc(0, qa_len + 1, 0, s_len + 1);
-    let mut results: Vec<AlignResult> = Vec::new();
-
-    for phsp in &prelim_hsps {
-        // Containment check: is the preliminary HSP enclosed by an already-accepted
-        // traceback HSP? Mirrors BlastIntervalTreeContainsHSP in Blast_TracebackFromHSPList.
-        let (ps_start, ps_end) = match phsp.strand {
-            Strand::Plus  => (phsp.s_start, phsp.s_end),
-            Strand::Minus => (s_len - phsp.s_end, s_len - phsp.s_start),
-        };
-        let plus2 = phsp.strand == Strand::Plus;
-        let prelim_contained = {
-            let tree = if plus2 { &tb_accepted_plus } else { &tb_accepted_minus };
-            let (cq_start, cq_end) = if plus2 {
-                (phsp.q_start, phsp.q_end)
-            } else {
-                (qa_len - phsp.q_end, qa_len - phsp.q_start)
-            };
-            tree.contains(cq_start, cq_end, ps_start, ps_end,
-                          phsp.score, plus2, MIN_DIAG_SEP)
-        };
-        if prelim_contained {
-            continue;
-        }
-
-        // improve_seed still operates in FWD-genomic + RC-TE space (PrelimHsp coords).
-        // NCBI: mask_at_hash=TRUE — unmasked query for improve_seed and Phase 2b traceback.
-        let sa_for_seed = if phsp.strand == Strand::Minus {
-            &subj_rc_align[1..subj_rc_align.len() - 1]
-        } else {
-            &subject_align[1..subject_align.len() - 1]
-        };
-        let qa_for_seed = &query[1..query.len() - 1];
-
-        let (new_q_seed, new_s_seed) = improve_seed(
-            qa_for_seed, sa_for_seed,
-            phsp.q_seed, phsp.s_seed,
-            phsp.q_start, phsp.q_end,
-            phsp.s_start, phsp.s_end,
-            phsp.strand == Strand::Minus,
-        );
-        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
-            eprintln!("RUST_IMPROVE strand={:?} prelim q=[{},{}] s=[{},{}] seed=({},{}) -> ({},{})",
-                phsp.strand, phsp.q_start, phsp.q_end, phsp.s_start, phsp.s_end,
-                phsp.q_seed, phsp.s_seed, new_q_seed, new_s_seed);
-        }
-
-        // Full traceback: minus strand uses NCBI orientation (RC-query, FWD-TE) so seed is in LEFT.
-        let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
-            let tq = qa_len - 1 - new_q_seed;
-            let ts = sa_len - 1 - new_s_seed;
-            (query_rc, subject_align, tq, ts)
-        } else {
-            (query, subject_align, new_q_seed, new_s_seed)
-        };
-
-        crate::diag_count!(COUNT_FINAL_GAPPED);
-        let gapped = gapped_extend_bidirectional(
-            tq_seq, ts_seq, tq_seed, ts_seed,
-            params.gap_open, params.gap_extend,
-            params.xdrop_gap_final,
-            matrix, &mut ws,
-        );
-        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
-            if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
-                eprintln!("RUST_TB seed=({},{}) -> score={} q=[{},{}] s=[{},{}]",
-                    tq_seed, ts_seed, sc, q0, q1, s0, s1);
-            }
-        }
-        let (mut score, q_start, q_end, s_start, s_end, mut edit_script, q_bases, s_bases) = match gapped {
-            None => continue,
-            Some((sc, q0, q1, s0, s1, es)) => {
-                if phsp.strand == Strand::Minus {
-                    let (qb, sb) = extract_aligned(
-                        &query_rc[1..query_rc.len() - 1],
-                        &subject_align[1..subject_align.len() - 1],
-                        q0 as usize,
-                        s0 as usize,
-                        &es,
-                        n_mask,
-                    );
-                    let (fqs, fqe, fss, fse) = (qa_len - q1, qa_len - q0, sa_len - s1, sa_len - s0);
-                    (sc, fqs, fqe, fss, fse, es,
-                     revcomp_blastna(&qb), revcomp_blastna(&sb))
-                } else {
-                    let (qb, sb) = extract_aligned(
-                        &query[1..query.len() - 1],
-                        &subject_align[1..subject_align.len() - 1],
-                        q0 as usize,
-                        s0 as usize,
-                        &es,
-                        n_mask,
-                    );
-                    (sc, q0, q1, s0, s1, es, qb, sb)
-                }
-            }
-        };
-        if phsp.strand == Strand::Minus {
-            edit_script.reverse();
-        }
-
-        // Score filter: complexity_adjust only. NCBI does not re-apply min_raw_gapped_score
-        // after Phase 2b traceback — hits that passed Phase 2a are kept regardless of final score.
-        if params.complexity_adjust {
-            match apply_complexity_adjust(
-                score, query, q_start, &edit_script, matrix,
-                // NCBI compares with cutoffs[ctx].cutoff_score (see gapped_cutoff)
-                params.gapped_cutoff(), phsp.strand == Strand::Minus,
-            ) {
-                Some(adj) => score = adj,
-                None => {
-                    continue;
-                }
-            }
-        }
-
-        // Normalize subject coordinates to plus-strand for output.
-        let (report_q_start, report_q_end, report_s_start, report_s_end) = match phsp.strand {
-            Strand::Plus => (q_start, q_end, s_start, s_end),
-            Strand::Minus => (q_start, q_end, s_len - s_end, s_len - s_start),
-        };
-
-        crate::diag_count!(COUNT_FINAL_HITS);
-
-        // Add traceback result to the interval tree so subsequent prelim HSPs
-        // can be checked against it.
-        {
-            let tree = if phsp.strand == Strand::Plus { &mut tb_accepted_plus } else { &mut tb_accepted_minus };
-            let (tree_qs, tree_qe) = if phsp.strand == Strand::Plus {
-                (report_q_start, report_q_end)
-            } else {
-                (qa_len - report_q_end, qa_len - report_q_start)
-            };
-            tree.add(ITreeHsp { q_start: tree_qs, q_end: tree_qe,
-                                s_start: report_s_start, s_end: report_s_end, score }, true);
-        }
-
-        let q_iupac = blastna_to_iupac_aligned(&q_bases);
-        let s_iupac = blastna_to_iupac_aligned(&s_bases);
-        // subject is ancestral (repeat consensus), query is derived (genome) — matches NCBI
-        let stats = compute_align_stats(&q_iupac, &s_iupac, false);
-
-        results.push(AlignResult {
-            hsp: Hsp {
-                score,
-                q_start: report_q_start,
-                q_end: report_q_end,
-                q_len,
-                s_start: report_s_start,
-                s_end: report_s_end,
-                s_len,
-                strand: phsp.strand,
-                edit_script,
-                q_seq: q_bases,
-                s_seq: s_bases,
-            },
-            query_id: query_id.to_string(),
-            subject_id: subject_id.to_string(),
-            stats,
-        });
-    }
-
-    // NCBI PurgeHSPsWithCommonEndpoints (blast_traceback.c lines 638-687):
-    // First pass (purge=FALSE): cut secondaries and reevaluate via
-    // Blast_HSPReevaluateWithAmbiguitiesGapped.  Second pass (purge=TRUE): delete.
-    {
-        // NCBI blast_traceback.c:658/688 — purge(FALSE) cut pass, re-trace the cut
-        // remainders (arr[extra_start..]) in array order, PurgeNull, purge(TRUE).
-        let mut arr: Vec<Option<AlignResult>> =
-            std::mem::take(&mut results).into_iter().map(Some).collect();
-        let extra_start = purge_hsps_with_common_endpoints(&mut arr, false);
-
-        let q_core   = &query[1..query.len() - 1];
-        let src_core = &subject_align[1..subject_align.len() - 1];
-        let rc_core  = &subj_rc_align[1..subj_rc_align.len() - 1];
-        let n_mask_rc_2b: &[u8] = &prep.n_mask_rc;
-
-        for slot in arr[extra_start..].iter_mut() {
-            let mut r = match slot.take() { Some(r) => r, None => continue };
-            let is_minus = r.hsp.strand == Strand::Minus;
-            let a_start = r.hsp.q_start as usize;
-            let b_start = if is_minus {
-                (sa_len - r.hsp.s_end) as usize
-            } else {
-                r.hsp.s_start as usize
-            };
-            let b_core = if is_minus { rc_core } else { src_core };
-            let b_mask_2b = if is_minus { n_mask_rc_2b } else { n_mask };
-            let (q_seq, s_seq) = extract_aligned(q_core, b_core, a_start, b_start, &r.hsp.edit_script, b_mask_2b);
-
-            let delete = reevaluate_gapped(
-                &mut r.hsp,
-                &q_seq,
-                &s_seq,
-                matrix,
-                params.gap_open,
-                params.gap_extend,
-                // NCBI Blast_HSPReevaluateWithAmbiguitiesGapped uses cutoff_score
-                // (see SearchParams::gapped_cutoff) both for the run-restart
-                // logic and the final keep/delete decision
-                // (s_UpdateReevaluatedHSP: keep iff score >= cutoff_score).  Cut
-                // secondaries that re-score below this are deleted, not kept.
-                params.gapped_cutoff(),
-                is_minus,
-                q_core,
-                a_start,
-                b_core,
-                b_start,
-            );
-            if delete { continue; }
-
-            // Rebuild q_seq/s_seq/stats for the trimmed region.
-            let a_start2 = r.hsp.q_start as usize;
-            let b_start2 = if is_minus {
-                (sa_len - r.hsp.s_end) as usize
-            } else {
-                r.hsp.s_start as usize
-            };
-            let (q2, s2) = extract_aligned(q_core, b_core, a_start2, b_start2, &r.hsp.edit_script, b_mask_2b);
-            let q_iupac2 = blastna_to_iupac_aligned(&q2);
-            let s_iupac2 = blastna_to_iupac_aligned(&s2);
-            r.stats = compute_align_stats(&q_iupac2, &s_iupac2, false);
-            r.hsp.q_seq = q2;
-            r.hsp.s_seq = s2;
-
-            *slot = Some(r);
-        }
-
-        results = arr.into_iter().flatten().collect();
-
-        let mut arr2: Vec<Option<AlignResult>> =
-            std::mem::take(&mut results).into_iter().map(Some).collect();
-        purge_hsps_with_common_endpoints(&mut arr2, true);
-        results = arr2.into_iter().flatten().collect();
-    }
-
-    // NCBI Phase 2c: third containment check (blast_traceback.c lines 678-692).
-    // Sort traceback results by score descending, then for each result drop it if
-    // its BOTH endpoints fall inside a higher-scoring (or equal) already-accepted
-    // result on the same strand.  Mirrors BlastIntervalTreeContainsHSP, which
-    // requires BOTH spatial containment AND diagonal proximity (MB_HSP_CLOSE):
-    // at least one endpoint must be within MIN_DIAG_SEP diagonals of the accepted
-    // hit.  Sub-alignments on different diagonals are NOT removed.
-    // Sort traceback results by ScoreCompareHSPs (NCBI coordinate space):
-    // score DESC, s_start ASC, s_end DESC, query.offset ASC, query.end DESC.
-    // For minus strand: query.offset = qlen - FWD_qe (ASC → FWD_qe DESC),
-    //                   query.end   = qlen - FWD_qs (DESC → FWD_qs ASC).
-    results.sort_by(|a, b| {
-        let q_off_a = match a.hsp.strand { Strand::Plus => a.hsp.q_start, Strand::Minus => qa_len - a.hsp.q_end };
-        let q_off_b = match b.hsp.strand { Strand::Plus => b.hsp.q_start, Strand::Minus => qa_len - b.hsp.q_end };
-        let q_end_a = match a.hsp.strand { Strand::Plus => a.hsp.q_end, Strand::Minus => qa_len - a.hsp.q_start };
-        let q_end_b = match b.hsp.strand { Strand::Plus => b.hsp.q_end, Strand::Minus => qa_len - b.hsp.q_start };
-        b.hsp.score.cmp(&a.hsp.score)
-            .then_with(|| a.hsp.s_start.cmp(&b.hsp.s_start))
-            .then_with(|| b.hsp.s_end.cmp(&a.hsp.s_end))
-            .then_with(|| q_off_a.cmp(&q_off_b))
-            .then_with(|| q_end_b.cmp(&q_end_a))
-    });
-    // Phase 2c containment: interval trees per strand (mirrors Phase 2a structure).
-    let mut final_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, s_len + 1);
-    let mut final_minus = BlastIntervalTree::new(0, qa_len + 1, 0, s_len + 1);
-    results.retain(|r| {
-        let plus3 = r.hsp.strand == Strand::Plus;
-        let contained = {
-            let tree = if plus3 { &final_plus } else { &final_minus };
-            tree.contains(r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end,
-                          r.hsp.score, plus3, MIN_DIAG_SEP)
-        };
-        if !contained {
-            let tree = if plus3 { &mut final_plus } else { &mut final_minus };
-            tree.add_simple(ITreeHsp { q_start: r.hsp.q_start, q_end: r.hsp.q_end,
-                                s_start: r.hsp.s_start, s_end: r.hsp.s_end,
-                                score: r.hsp.score });
-        }
-        !contained
-    });
-
-    results
+    let mut ws = AlignWorkspace::new();
+    let prelim_hsps = run_phase2a_inner(
+        query, query_rc, subject_plus, qa_len, sa_len, &ungapped,
+        params, matrix, lut_word_length, &mut ws,
+    );
+    traceback_phase(query, query_rc, query_id, prep, subject_id, prelim_hsps,
+                    params, matrix, n_mask, &mut ws)
 }
 
 /// Remove prelim HSPs that share a start or end point with a higher-scoring prelim HSP.
