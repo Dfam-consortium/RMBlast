@@ -10,11 +10,17 @@ Sources:
     entry is appended, both taken from fits/*.fit produced by alp-fit.
 
 Output: rmstats/src/tables_data.rs
+
+The NCBI source tree is outside this repo: set NCBI_SRC to its c++/ parent
+(default: ncbi-blast-2.17.0+-src next to the repo checkout).
 """
 import re, glob, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, '../ncbi-blast-2.17.0+-src/c++/src/algo/blast/core/blast_stat.c')
+NCBI_SRC = os.environ.get('NCBI_SRC', os.path.join(HERE, '../../ncbi-blast-2.17.0+-src'))
+SRC = os.path.join(NCBI_SRC, 'c++/src/algo/blast/core/blast_stat.c')
+if not os.path.isfile(SRC):
+    sys.exit('gen_tables.py: %s not found; set NCBI_SRC to the NCBI source tree' % SRC)
 
 src = open(SRC).read()
 
