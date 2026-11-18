@@ -4,7 +4,7 @@ pub mod twobit;
 
 pub use fasta::{FastaRecord, FastaReader};
 pub use fasta_db::FastaDb;
-pub use twobit::{SeqInfo, TwoBitFile, TwoBitSeqIter};
+pub use twobit::{SeqInfo, TwoBitFile};
 
 use std::io::Read;
 use std::collections::HashMap;

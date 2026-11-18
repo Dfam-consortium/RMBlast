@@ -110,20 +110,6 @@ impl BlastIntervalTree {
         t
     }
 
-    /// Reset to empty without releasing memory (mirrors `Blast_IntervalTreeReset`).
-    pub fn reset(&mut self) {
-        self.nodes.truncate(1);
-        let root = &mut self.nodes[0];
-        root.leftptr  = NIL;
-        root.midptr   = NIL;
-        root.rightptr = NIL;
-        root.hsp_idx  = INTERNAL;
-        self.hsps.clear();
-        self.deleted.clear();
-        self.left_endpoints.clear();
-        self.right_endpoints.clear();
-    }
-
     /// Allocate an internal node covering `[le, re]`; returns its index.
     #[inline]
     fn alloc_internal(&mut self, le: u32, re: u32) -> u32 {

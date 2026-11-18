@@ -119,9 +119,6 @@ impl NaLookup {
     #[inline] fn lut_word_length(&self) -> i32 {
         match self { NaLookup::Small(l) => l.lut_word_length, NaLookup::Mega(l) => l.lut_word_length }
     }
-    #[inline] fn scan_step(&self) -> i32 {
-        match self { NaLookup::Small(l) => l.scan_step, NaLookup::Mega(l) => l.scan_step }
-    }
     #[inline] fn longest_chain(&self) -> i32 {
         match self { NaLookup::Small(l) => l.longest_chain, NaLookup::Mega(l) => l.longest_chain }
     }
@@ -759,7 +756,7 @@ pub fn search_with_query_lookup(
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
     );
     let mut results = run_gapped_phase(
-        query, ql.query_rc(query), query_id, subject_plus, subj_rc, subject_id,
+        query, ql.query_rc(query), query_id, subject_plus, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
         ql.lut_word_length(), n_mask, prep,
     );
@@ -817,7 +814,7 @@ pub fn search_with_query_lookup_seeds(
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
     );
     let mut results = run_gapped_phase(
-        query, ql.query_rc(query), query_id, subject_plus, subj_rc, subject_id,
+        query, ql.query_rc(query), query_id, subject_plus, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
         ql.lut_word_length(), n_mask, prep,
     );
@@ -875,7 +872,7 @@ pub fn search_with_query_lookup_ungapped(
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
     );
     let mut results = run_gapped_phase(
-        query, ql.query_rc(query), query_id, subject_plus, subj_rc, subject_id,
+        query, ql.query_rc(query), query_id, subject_plus, subject_id,
         q_len, s_len, ungapped, params, matrix, ungap_out,
         ql.lut_word_length(), n_mask, prep,
     );
@@ -1134,11 +1131,8 @@ fn collect_ungapped_combined<S: SeedOut>(
     seed_out: &mut S,
     ungapped: &mut Vec<UngappedRecord>,
 ) {
-    let _ = (q_len, matrix);
-
     let s_real = subject_plus.len().saturating_sub(2);
     let lw    = lookup.lut_word_length() as i64;
-    let step  = lookup.scan_step() as usize;
 
     let end_range = s_real.saturating_sub(lw as usize) as i32;
     if end_range < 0 { return; }
@@ -1225,7 +1219,7 @@ fn collect_ungapped_combined<S: SeedOut>(
                 seed_out.push_seed(SeedRecord { q_off, s_off, strand: Strand::Plus });
                 crate::diag_count!(COUNT_SEEDS);
                 // NCBI: mask_at_hash=TRUE — unmasked query for ungapped extension scoring.
-                let raw_plus = extend_ungapped(query, subject_plus, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
+                let raw_plus = extend_ungapped(query, subject_plus, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN).unwrap();
                 let s_end_store = if raw_plus.score >= ungapped_cutoff { raw_plus.s_end } else { s_off + params.word_size as u32 };
                 diag_hash.insert(diag, s_end_store, s_off, 1 - params.word_size as i32);
                 if raw_plus.score < ungapped_cutoff { continue; }
@@ -1307,7 +1301,7 @@ fn collect_ungapped_combined<S: SeedOut>(
                 // adjacent regions, diverging from NCBI and dedup-suppressing real seeds (#36).
                 let qn = q_len - 1 - q_off;
                 let sn = s_len - 1 - s_off;
-                let raw_ncbi = extend_ungapped(query_rc_full, subject_plus, qn, sn, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
+                let raw_ncbi = extend_ungapped(query_rc_full, subject_plus, qn, sn, matrix, params.xdrop_ungap, i32::MIN).unwrap();
                 // Map (RC_q, FWD_s) result back to (FWD_q, RC_s) for UngappedRecord storage.
                 let raw_minus = UngappedResult {
                     score:   raw_ncbi.score,
@@ -1333,7 +1327,6 @@ fn collect_ungapped_combined<S: SeedOut>(
 
         if scan_range[0] > end_range { break; }
     }
-    let _ = step; // scan_step is encoded in the packed subject scan
     scratch.put_back();
 }
 
@@ -1353,7 +1346,6 @@ fn run_phase2a_inner(
     params: &SearchParams,
     matrix: &ScoreMatrix,
     lut_word_length: u32,
-    _chunk_offset: u32,
 ) -> Vec<PrelimHsp> {
     let mut accepted_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, sa_len + 1);
     let mut accepted_minus = BlastIntervalTree::new(0, qa_len + 1, 0, sa_len + 1);
@@ -1791,7 +1783,6 @@ pub fn search_phase2a(
     query: &[u8],
     masked_query: &[u8],
     subject_plus: &[u8],
-    _subject_id: &str,
     params: &SearchParams,
     matrix: &ScoreMatrix,
     chunk_offset: u32,
@@ -1854,7 +1845,7 @@ pub fn search_phase2a(
 
     let mut prelims = run_phase2a_inner(
         query, query_rc, subject_plus, qa_len, sa_len, &ungapped,
-        params, matrix, ql.lut_word_length(), chunk_offset,
+        params, matrix, ql.lut_word_length(),
     );
 
     if chunk_offset > 0 {
@@ -1945,7 +1936,6 @@ fn run_gapped_phase<U: UngapOut>(
     query_rc: &[u8],
     query_id: &str,
     subject_plus: &[u8],
-    _subj_rc: &[u8],
     subject_id: &str,
     q_len: u32,
     s_len: u32,

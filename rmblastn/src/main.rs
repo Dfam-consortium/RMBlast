@@ -1266,7 +1266,7 @@ fn search_db_parallel(
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
                 let prep = db.get_prepared(name).ok();
-                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, name, params, matrix, chunk_start as u32, prep.as_deref())
+                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, params, matrix, chunk_start as u32, prep.as_deref())
             })
             .collect();
 

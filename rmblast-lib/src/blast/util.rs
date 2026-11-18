@@ -122,10 +122,3 @@ pub fn seqblk_from_blastna(bases: &[u8]) -> SeqBlk {
     blastna.extend_from_slice(bases);
     SeqBlk { blastna, packed: Vec::new(), length }
 }
-
-/// Build a SeqBlk, also compressing to NCBI2NA packed form.
-pub fn seqblk_from_blastna_with_compress(bases: &[u8]) -> SeqBlk {
-    let mut blk = seqblk_from_blastna(bases);
-    blast_compress_blastna_sequence(&mut blk);
-    blk
-}

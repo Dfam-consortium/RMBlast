@@ -311,20 +311,6 @@ impl TwoBitFile {
         (n_start.min(n_end), n_end)
     }
 
-    /// Decode a subsequence [start, start+len) (0-based, half-open) to BLASTNA.
-    /// Returns a Vec with a leading and trailing sentinel (15).
-    /// N-block positions use NCBI-compatible random bases (matching makeblastdb).
-    pub fn get_sequence_blastna(
-        &self,
-        name: &str,
-        start: u32,
-        len: u32,
-    ) -> Result<Vec<u8>, TwoBitError> {
-        let idx = *self.name_to_index.get(name)
-            .ok_or_else(|| TwoBitError::NotFound(name.to_owned()))?;
-        self.decode_sequence(idx, start, len)
-    }
-
     /// Decode the full sequence to BLASTNA (with sentinels).
     /// N-block positions use NCBI-compatible random bases (matching makeblastdb).
     pub fn get_full_sequence_blastna(&self, name: &str) -> Result<Vec<u8>, TwoBitError> {
@@ -392,38 +378,6 @@ impl TwoBitFile {
         }
 
         Ok(out)
-    }
-
-    /// Iterate over all sequence names.
-    pub fn seq_names(&self) -> impl Iterator<Item = &str> {
-        self.sequences.iter().map(|s| s.name.as_str())
-    }
-}
-
-/// Iterator over all sequences in a 2bit file decoded to BLASTNA.
-pub struct TwoBitSeqIter<'a> {
-    file: &'a TwoBitFile,
-    idx: usize,
-}
-
-impl<'a> TwoBitSeqIter<'a> {
-    pub fn new(file: &'a TwoBitFile) -> Self {
-        TwoBitSeqIter { file, idx: 0 }
-    }
-}
-
-impl<'a> Iterator for TwoBitSeqIter<'a> {
-    type Item = Result<(String, Vec<u8>), TwoBitError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx >= self.file.sequences.len() {
-            return None;
-        }
-        let idx = self.idx;
-        self.idx += 1;
-        let seq = &self.file.sequences[idx];
-        let name = seq.name.clone();
-        Some(self.file.decode_sequence(idx, 0, seq.dna_size).map(|v| (name, v)))
     }
 }
 

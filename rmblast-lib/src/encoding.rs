@@ -11,16 +11,8 @@
 
 /// BLASTNA alphabet size (including gap/N/ambiguous codes).
 pub const BLASTNA_SIZE: usize = 16;
-/// Unambiguous base count (A, C, G, T).
-pub const BLAST2NA_SIZE: usize = 4;
 /// Sentinel value for sequence ends (same as GAP in BLASTNA).
 pub const NUCL_SENTINEL: u8 = 15;
-
-/// BLASTNA indices for unambiguous bases.
-pub const BLASTNA_A: u8 = 0;
-pub const BLASTNA_C: u8 = 1;
-pub const BLASTNA_G: u8 = 2;
-pub const BLASTNA_T: u8 = 3;
 
 /// Convert IUPAC ASCII character to BLASTNA index.
 /// Unknown characters map to N (14).
@@ -138,14 +130,6 @@ pub fn encode_iupac(seq: &[u8]) -> Vec<u8> {
     }
     out.push(NUCL_SENTINEL);
     out
-}
-
-/// Decode a BLASTNA slice back to IUPAC ASCII (no sentinels).
-pub fn decode_blastna(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .filter(|&&b| b != NUCL_SENTINEL)
-        .map(|&b| BLASTNA_TO_IUPAC[(b & 15) as usize])
-        .collect()
 }
 
 /// Reverse-complement a BLASTNA encoded sequence (excluding sentinels).

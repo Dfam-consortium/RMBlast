@@ -1,11 +1,5 @@
 //! Search parameters mirroring the rmblastn CLI options in scope.
 
-/// Gap alignment algorithm to use (always ALIGN_EX for rmblastn with matrix scoring).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GapAlignAlgo {
-    AlignEx,
-}
-
 /// Threading mode (mirrors NCBI -mt_mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtMode {
