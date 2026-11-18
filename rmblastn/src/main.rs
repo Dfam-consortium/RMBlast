@@ -104,7 +104,7 @@ where
 #[derive(Parser, Debug)]
 #[command(
     name = "rmblastn",
-    version,
+    version = env!("RMBLAST_VERSION"), // "<version> (<commit>[-dirty])", build.rs
     about = "RepeatMasker BLAST — Rust port of NCBI rmblastn",
     after_help = "\
 ARGUMENT SYNTAX NOTES:

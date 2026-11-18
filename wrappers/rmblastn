@@ -87,7 +87,7 @@ REAL_RMBLASTN="$(rmblast_find_bin rmblastn)" || exit 1
 # reporting its own honest "rmblastn <ver>".  The version number itself is
 # always taken from the binary -- it is never hardcoded in the wrapper.
 rmblast_print_version() {
-    local raw ver
+    local raw ver build
     raw="$("$REAL_RMBLASTN" --version 2>&1)"
     ver="$(printf '%s\n' "$raw" \
            | sed -n '1s/^[[:space:]]*rmblastn[: ][[:space:]]*\([0-9][^[:space:]]*\).*/\1/p')"
@@ -96,8 +96,10 @@ rmblast_print_version() {
         return
     fi
     ver="${ver%+}"               # never double up the '+'
+    # The binary's "(<commit>[-dirty])", if any, goes on the free-text line.
+    build="$(printf '%s\n' "$raw" | sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p')"
     printf 'rmblastn: %s+\n' "$ver"
-    printf ' Package: rmblast %s, Rust port\n' "$ver"
+    printf ' Package: rmblast %s, Rust port%s\n' "$ver" "${build:+, build $build}"
 }
 
 # Informational invocations short-circuit before any argument translation.

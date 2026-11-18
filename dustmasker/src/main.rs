@@ -73,7 +73,7 @@ fn normalize_args() -> Vec<std::ffi::OsString> {
 #[derive(Parser, Debug)]
 #[command(
     name = "dustmasker",
-    version,
+    version = env!("RMBLAST_VERSION"), // "<version> (<commit>[-dirty])", build.rs
     about = "Low complexity region masker based on Symmetric DUST algorithm",
     after_help = "\
 SCOPE:

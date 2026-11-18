@@ -538,11 +538,21 @@ fn unknown_option_is_rejected() {
     assert!(r.stderr.contains("--no-such-option"), "stderr: {}", r.stderr);
 }
 
+/// `rmblastn <version>`, followed in a git checkout by ` (<commit>)` or
+/// ` (<commit>-dirty)` (build.rs).
 #[test]
-fn version_prints_crate_version() {
+fn version_prints_crate_version_and_commit() {
     let r = rmblastn(&["--version"]);
     assert_eq!(r.code, Some(0));
-    assert_eq!(r.stdout.trim(), format!("rmblastn {}", env!("CARGO_PKG_VERSION")));
+    let out = r.stdout.trim();
+    let rest = out.strip_prefix(&format!("rmblastn {}", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| panic!("--version: {out}"));
+    if !rest.is_empty() {
+        let id = rest.strip_prefix(" (").and_then(|s| s.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("--version: {out}"));
+        let commit = id.strip_suffix("-dirty").unwrap_or(id);
+        assert!(commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()), "--version: {out}");
+    }
 }
 
 // ── mt-mode 1 failure handling (needs `--features diagnostics`) ─────────────

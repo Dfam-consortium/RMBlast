@@ -88,17 +88,28 @@ jobs:
         shell: bash
         run: |
           VERSION="$(make version)"
-          BIN="stage/staging/rmblast-${VERSION}/bin"
-          # Each shipped binary must run and report the package version; a
-          # crate that stopped inheriting the workspace version fails here.
+          COMMIT="$(git rev-parse --short=7 HEAD)"
+          PKG="stage/staging/rmblast-${VERSION}"
+          # Each shipped binary must run and report the package version and
+          # the commit being released (build.rs).  A crate that stopped
+          # inheriting the workspace version, or a build from a tree with
+          # uncommitted changes ("-dirty", e.g. a Cargo.lock the build had to
+          # update), fails here.
           for prog in rmblastn dustmasker; do
-            OUT="$("${BIN}/${prog}" -version)"
+            OUT="$("${PKG}/bin/${prog}" -version)"
             echo "${OUT}"
-            if [ "${OUT}" != "${prog} ${VERSION}" ]; then
-              echo "${prog} reports '${OUT}', expected '${prog} ${VERSION}'" >&2
+            if [ "${OUT}" != "${prog} ${VERSION} (${COMMIT})" ]; then
+              echo "${prog} reports '${OUT}', expected '${prog} ${VERSION} (${COMMIT})'" >&2
               exit 1
             fi
           done
+          # RepeatMasker and RepeatModeler parse NCBI's "rmblastn: X.Y.Z+".
+          OUT="$("${PKG}/wrappers/rmblastn" -version | head -1)"
+          echo "${OUT}"
+          if [ "${OUT}" != "rmblastn: ${VERSION}+" ]; then
+            echo "wrappers/rmblastn reports '${OUT}', expected 'rmblastn: ${VERSION}+'" >&2
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
