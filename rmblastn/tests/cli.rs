@@ -199,6 +199,21 @@ fn defaults_match_ncbi() {
     assert_same_output(&r, &expected("expected_defaults.ncbi-2.17.1.tsv"));
 }
 
+/// When E-values come from the built-in table, stderr says the entry was
+/// chosen by the matrix file name; without statistics nothing is printed.
+#[test]
+fn table_statistics_say_they_are_chosen_by_name() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    let base = ["--db", &db, "--query", &q, "--matrix", &m, "--gapopen", "20", "--gapextend", "5"];
+    let with = rmblastn(&[&base[..], &["--outfmt", "6 score evalue"]].concat());
+    assert_eq!(with.code, Some(0));
+    assert!(with.stderr.contains(
+        "parameters for 'comparison.matrix' at gap costs 20/5 taken from the built-in table by matrix file name"),
+        "stderr:\n{}", with.stderr);
+    let without = rmblastn(&[&base[..], &["--outfmt", "6 score"]].concat());
+    assert!(!without.stderr.contains("built-in table"), "stderr:\n{}", without.stderr);
+}
+
 // ── errors ──────────────────────────────────────────────────────────────────
 
 /// A database with two records of the same id is rejected.  3.0.12 searched

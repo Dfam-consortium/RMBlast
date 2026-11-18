@@ -180,6 +180,11 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   with E > 10 whenever the matrix is in its baked table; the port keeps them
   unless you pass `--evalue` or `--ncbi-compat`. On a matrix absent from that
   table, such as `comparison.matrix`, both engines cull nothing.
+- The built-in Karlin-Altschul table is looked up by the matrix file's name
+  and gap costs, as NCBI does; the matrix contents are not checked against it.
+  The same matrix under another name falls back to a startup ALP fit, whose
+  lambda can differ by about 1%. When E-values or bit scores are computed,
+  stderr says which source was used.
 - The whole database stays resident. NCBI streams database volumes; the port
   loads and decodes all of it, and caches the reverse complement and packed
   strands of every subject it touches at about 1.5 times that subject's size.

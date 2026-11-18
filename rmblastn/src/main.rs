@@ -659,6 +659,13 @@ fn main() -> Result<()> {
             if args.ncbi_compat { " (--ncbi-compat 2.17.1 emulation)" } else { "" },
             ka_ctx.source.describe()
         );
+        if ka_ctx.source == ka_stats::KaSource::BakedTable {
+            eprintln!(
+                "#   Karlin-Altschul parameters for '{}' at gap costs {}/{} taken from the \
+                 built-in table by matrix file name; the matrix contents are not checked",
+                ka_stats::matrix_basename(&args.matrix), args.gapopen, args.gapextend
+            );
+        }
         if ka_ctx.kbp_gap.is_valid() {
             eprintln!(
                 "#   lambda={:.10} K={:.10} H={:.10}",
