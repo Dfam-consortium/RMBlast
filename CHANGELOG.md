@@ -21,6 +21,20 @@ Each case below either gave wrong or incomplete output, or hung or crashed
 - An empty database is refused
 - A query or database sequence longer than 2^31 - 1 bases is refused instead of
   silently giving no hits
+- Malformed matrix files are refused with the line number: a score that is not
+  an integer, a short or long row, a matrix that is not square, a row label that
+  does not match its header symbol, a repeated header symbol, a missing or
+  malformed FREQS line, and a matrix whose expected score is not negative.
+  NCBI also refuses the missing FREQS line, short rows and non-square matrices;
+  it silently gives no hits for a positive expected score (RepeatModeler's
+  at.matrix.4.2)
+- Malformed FASTA (query, database, or dustmasker input) is refused with the
+  line number: sequence before the first '>', a '>' with no id, ';' comment
+  lines, a defline that is not UTF-8, whitespace inside a sequence line, and any
+  character that is not a nucleotide code. Before, these were skipped, counted
+  as N, or aborted with "stream did not contain valid UTF-8"
+- dustmasker refuses an empty record (NCBI also aborts), and its usage errors
+  exit 1 as NCBI's do
 
 ### Fixed
 - --word-size defaulted to 8; it now defaults to 11, as in NCBI. RepeatMasker
@@ -33,6 +47,20 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   as '-' and scored differently from NCBI. It is now N, as in NCBI
 - A truncated or corrupt .2bit file panicked, or loaded with fewer sequences;
   it is now an error that says what is wrong and where
+- Matrices with a Z column (ctools.matrix, symmetricNscores1matrix) scored N as
+  +3 instead of the file's -1: Z took N's slot. Header symbols outside the IUPAC
+  codes are now discarded as NCBI discards them, and all four such matrices give
+  output identical to NCBI
+- A FREQS line written as `#  FREQS ...` was missed, which left lambda at 0 and
+  turned -complexity_adjust off silently. NCBI finds FREQS anywhere on a comment
+  line, and so does the port now
+- Leading spaces on a FASTA sequence line were counted as N; they are now
+  ignored, as in NCBI
+- dustmasker printed deflines verbatim; it now prints them as NCBI does (spaces
+  collapsed, cut at a tab, trailing periods stripped, HTML entities decoded),
+  byte-identical to NCBI on 13,000 random deflines
+- When E-values come from the built-in table, stderr says the entry was chosen
+  by the matrix file name
 - A gilist that matches no sequence and an empty query file used to exit with
   no output and no message. Both now warn on stderr (the empty query with
   NCBI's own warning) and give the normal empty output
