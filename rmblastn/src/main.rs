@@ -20,7 +20,7 @@ use rmblast_lib::output::{
 };
 use rmblast_lib::search::{apply_mask_level, sort_hit_list_order_by_oid, subject_oids, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
-use rmblast_lib::seq::{check_seq_len, FastaReader, SubjectDb};
+use rmblast_lib::seq::{check_seq_len, FastaReader, FastaRecord, SubjectDb};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Argument-normalization shim for NCBI single-dash compatibility
@@ -704,7 +704,7 @@ fn main() -> Result<()> {
         prelim_cull
     };
 
-    let query_reader: Box<dyn std::io::Read> = if args.query == "-" {
+    let query_reader: Box<dyn std::io::Read + Send> = if args.query == "-" {
         Box::new(std::io::stdin())
     } else {
         Box::new(
@@ -759,7 +759,11 @@ fn main() -> Result<()> {
             // as soon as all earlier queries' are written, so output order is
             // unchanged.  A dispatcher thread hands the queries out in input
             // order and does not hand out one more than `window` ahead of the
-            // next one to write; memory then holds about `window` queries'
+            // next one to write.  It also reads each query from the file just
+            // before handing it out, and the job sends the query back with its
+            // results, so memory holds about `window` queries and their
+            // results (3.0.12 read the whole query file first).  As in mode 0,
+            // a malformed record is reported after the queries before it.
             // results instead of every query's.
             //
             // The holding back happens on the dispatcher, outside the pool,
@@ -770,16 +774,8 @@ fn main() -> Result<()> {
             // next -- a deadlock (3.0.10 did that).
             use std::collections::BTreeMap;
             use std::sync::atomic::{AtomicBool, Ordering};
-            use std::sync::{mpsc, Condvar, Mutex};
+            use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-            let all_queries: Vec<_> = query_reader
-                .collect::<Result<Vec<_>, _>>()
-                .context("reading query FASTA")?;
-            for q in &all_queries {
-                check_seq_len(&q.id, q.len()).map_err(anyhow::Error::msg)?;
-            }
-            n_queries = all_queries.len();
-            let n = all_queries.len();
             let workers = rayon::current_num_threads();
             let window = 4 * workers.max(4);
             // queries written so far, and the dispatcher's wake-up
@@ -789,17 +785,22 @@ fn main() -> Result<()> {
             // panic until the scope ends, and the writer would wait forever
             // for the missing query, so the job catches it and the writer
             // turns it into an error exit.
-            let (tx, rx) = mpsc::channel::<(usize, std::thread::Result<Vec<AlignResult>>)>();
+            type Job = (usize, Arc<FastaRecord>, std::thread::Result<Vec<AlignResult>>);
+            let (tx, rx) = mpsc::channel::<Job>();
             #[cfg(feature = "diagnostics")]
             let panic_at = test_panic_at_query();
-            let (queries, subjects, oids, db, params, matrix, reap) =
-                (&all_queries, &subject_names, &subject_oid, &db, &params, &matrix, &reap_for_query);
+            let (subjects, oids, db, params, matrix, reap) =
+                (&subject_names, &subject_oid, &db, &params, &matrix, &reap_for_query);
             let (written, stop) = (&written, &stop);
-            std::thread::scope(|ts| -> Result<()> {
-                ts.spawn(move || {
+            let mut query_reader = query_reader;
+            let query_reader = &mut query_reader;
+            n_queries = std::thread::scope(|ts| -> Result<usize> {
+                // Returns the number of queries read, or the read error.
+                let dispatcher = ts.spawn(move || -> Result<usize> {
                     // in_place_scope: this loop runs here, outside the pool
-                    rayon::in_place_scope(|s| {
-                        for i in 0..n {
+                    rayon::in_place_scope(|s| -> Result<usize> {
+                        let mut i = 0usize;
+                        loop {
                             {
                                 let (lock, cvar) = written;
                                 let mut w = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -810,12 +811,17 @@ fn main() -> Result<()> {
                             if stop.load(Ordering::Relaxed) {
                                 break;
                             }
+                            let q = match query_reader.next() {
+                                None => break,
+                                Some(q) => q.context("reading query FASTA")?,
+                            };
+                            check_seq_len(&q.id, q.len()).map_err(anyhow::Error::msg)?;
+                            let q = Arc::new(q);
                             let tx = tx.clone();
                             s.spawn(move |_| {
                                 if stop.load(Ordering::Relaxed) {
                                     return;
                                 }
-                                let q = &queries[i];
                                 let qr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     #[cfg(feature = "diagnostics")]
                                     if panic_at == Some(i) {
@@ -829,11 +835,13 @@ fn main() -> Result<()> {
                                     sort_hit_list_order_by_oid(&mut qr, oids);
                                     qr
                                 }));
-                                let _ = tx.send((i, qr));
+                                let _ = tx.send((i, q, qr));
                             });
+                            i += 1;
                         }
                         drop(tx);
-                    });
+                        Ok(i)
+                    })
                 });
                 // However this thread leaves -- a write error, a failed
                 // search, or a panic in here -- tell the dispatcher to stop, or
@@ -848,11 +856,10 @@ fn main() -> Result<()> {
                     }
                 }
                 let _stop_on_exit = StopOnExit(stop, written);
-                let mut pending: BTreeMap<usize, Vec<AlignResult>> = BTreeMap::new();
+                let mut pending: BTreeMap<usize, (Arc<FastaRecord>, Vec<AlignResult>)> = BTreeMap::new();
                 let mut k = 0usize;
-                let mut write_ready = |pending: &mut BTreeMap<usize, Vec<AlignResult>>| -> Result<()> {
-                    while let Some(results) = pending.remove(&k) {
-                        let q = &queries[k];
+                let mut write_ready = |pending: &mut BTreeMap<usize, (Arc<FastaRecord>, Vec<AlignResult>)>| -> Result<()> {
+                    while let Some((q, results)) = pending.remove(&k) {
                         match &output_format {
                             OutputFormat::Pairwise => {
                                 let qlen = q.len() as u32;
@@ -874,22 +881,24 @@ fn main() -> Result<()> {
                     }
                     Ok(())
                 };
-                for (i, results) in rx.iter() {
+                for (i, q, results) in rx.iter() {
                     match results {
                         Ok(results) => {
-                            pending.insert(i, results);
+                            pending.insert(i, (q, results));
                         }
                         Err(payload) => {
                             let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
                                 .or_else(|| payload.downcast_ref::<String>().cloned())
                                 .unwrap_or_else(|| "unknown panic".to_string());
-                            anyhow::bail!("search of query '{}' failed: {}", queries[i].id, msg);
+                            anyhow::bail!("search of query '{}' failed: {}", q.id, msg);
                         }
                     }
                     // on a write error, _stop_on_exit winds the dispatcher down
                     write_ready(&mut pending)?;
                 }
-                Ok(())
+                // The channel closes once the dispatcher stops and every job
+                // it started has sent, so all queries it read are written.
+                dispatcher.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
             })?;
         }
     }

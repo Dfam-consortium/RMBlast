@@ -424,6 +424,32 @@ fn empty_query_warns_like_ncbi() {
     }
 }
 
+/// A malformed query record ends the run with an error after the queries
+/// before it are written, the same in both mt-modes.  3.0.12's mt-mode 1 read
+/// every query before searching, so it wrote nothing.
+#[test]
+fn bad_query_record_mid_file_in_both_mt_modes() {
+    let good = std::fs::read_to_string(data("query.fa")).unwrap();
+    let q_good = tempfile_path::TempFile::with_contents(&good);
+    let q_bad = tempfile_path::TempFile::with_contents(&format!("{good}>bad\nACGT*ACGT\n{good}"));
+    let (db, m) = (data("db.fa"), data("comparison.matrix"));
+    let args = |q: &str, mode: &'static str| -> Vec<String> {
+        ["--db", &db, "--query", q, "--matrix", &m, "--gapopen", "20", "--gapextend", "5",
+         "--outfmt", RM_FIELDS, "--mt-mode", mode, "--num-threads", "2"].iter().map(|s| s.to_string()).collect()
+    };
+    for mode in ["0", "1"] {
+        let a = args(q_good.path(), mode);
+        let want = rmblastn(&a.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        assert_eq!(want.code, Some(0));
+        assert!(!want.stdout.is_empty());
+        let a = args(q_bad.path(), mode);
+        let r = rmblastn(&a.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        assert_eq!(r.code, Some(1), "mt-mode {mode}: stderr:\n{}", r.stderr);
+        assert!(r.stderr.contains("not a nucleotide code"), "stderr:\n{}", r.stderr);
+        assert_eq!(r.stdout, want.stdout, "mt-mode {mode}: the queries before the bad record");
+    }
+}
+
 /// A gilist that selects nothing is a valid search with no hits, with a warning.
 #[test]
 fn gilist_matching_nothing_warns() {
