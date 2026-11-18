@@ -34,9 +34,11 @@ pub struct SeqBlk {
     /// `blast_compress_blastna_sequence`).
     ///
     /// Layout mirrors NCBI's compressed_nuc_seq:
-    ///   packed[0..2] = pre-sequence bytes (right-justified partial packs)
-    ///   packed[3..]  = packed bases; packed[3+k] covers bases k..k+3 with
-    ///                  base k in bits 7:6 (MSB) and base k+3 in bits 1:0.
+    ///   packed[0..3] = zero padding before the sequence
+    ///   packed[3..]  = packed bases; packed[3+j] covers bases 4j..4j+3 with
+    ///                  base 4j in bits 7:6 (MSB) and base 4j+3 in bits 1:0;
+    ///                  a partial last byte is left-justified
+    ///   then PACKED_TAIL_PAD zero bytes (blast::util).
     ///
     /// `compressed_nuc_seq` in C points to packed[3].
     pub packed: Vec<u8>,

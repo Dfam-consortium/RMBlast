@@ -10,7 +10,7 @@
 #
 # Examples:
 #   make                          # build (release)
-#   make install PREFIX=/opt      # -> /opt/rmblast-0.1.0/...
+#   make install PREFIX=/opt      # -> /opt/rmblast-<version>/...
 #   make install PREFIX=/opt MATRIX_SRC=../   # also install ../*.matrix
 #   make dist PREFIX=/tmp/stage   # build a versioned tarball
 #   make version                  # print the workspace version from Cargo.toml

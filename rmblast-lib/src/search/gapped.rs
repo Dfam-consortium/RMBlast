@@ -338,7 +338,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
 
 /// Score-only bidirectional gapped alignment (for preliminary extension — no traceback needed).
 ///
-/// Mirrors `gapped_extend_bidirectional` but uses `align_ex_score_only` to skip
+/// Mirrors `engine::gapped_extend_bidirectional` but uses `align_ex_score_only` to skip
 /// all traceback bookkeeping.  Returns `(score, q_start, q_end, s_start, s_end)`.
 ///
 /// Loop orientation matches NCBI `s_BlastAlignPackedNucl`: subject is the OUTER loop

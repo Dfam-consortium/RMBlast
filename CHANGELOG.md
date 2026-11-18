@@ -77,7 +77,7 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   subject defline wrapped as NCBI wraps it, DUST-masked query bases in lower
   case, a "No hits found" block for queries without hits, and NCBI's blank
   lines between queries. Tabular output is unchanged
-- Queries over 1 Mb (searched in chunks) used an older minus-strand formula
+- Queries of 2 Mb or more (searched in 1 Mb chunks) used an older minus-strand formula
   for the start of the preliminary gapped alignment. At word size 7 it gave
   different hits from NCBI (33 of about 4,200 lines on a 3 Mb chr22 slice); it
   now uses the same formula as single-chunk queries and matches NCBI

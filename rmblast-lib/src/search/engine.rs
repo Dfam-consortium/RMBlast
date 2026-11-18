@@ -16,7 +16,8 @@
 //!       full gapped alignment with traceback (xdrop_gap_final=100) →
 //!       score/complexity filter → output.
 //!
-//! Threading: parallelism is over subject sequences (see search_db_parallel in main.rs).
+//! Threading: each query's search runs in parallel over subject sequences
+//! (search_db_parallel in main.rs); --mt-mode 1 also runs queries in parallel.
 
 use crate::hits::score_compare_hsps;
 use crate::search::diag_hash::BlastDiagHash;
@@ -688,10 +689,11 @@ impl QueryLookup {
     }
 }
 
-/// Apply DUST masking to a query sequence (with leading/trailing sentinels).
-/// When dust=false, returns a clone of the input unchanged.
-/// The masked query is used for seeding (LUT construction, word extension, ungapped scoring)
-/// but NOT for Phase 2a/2b gapped alignment — NCBI uses mask_at_hash=TRUE for rmblastn.
+/// DUST-mask a whole query (sentinels included) for the multi-chunk path, with
+/// NCBI's chunked-interval off-by-one (dust_mask_ncbi_compat); a clone when
+/// dust is off.  Each chunk's lookup table is built from its slice, and exact
+/// word extension reads it.  Ungapped and gapped extension use the unmasked
+/// query (NCBI mask_at_hash), so despite the name it is not an alignment input.
 pub fn mask_query_for_alignment(query: &[u8], params: &SearchParams) -> Vec<u8> {
     if params.dust {
         let mut v = query.to_vec();
@@ -1759,21 +1761,17 @@ fn traceback_phase(
     results
 }
 
-/// Phase 1 (ungapped) + Phase 2a (preliminary gapped) for one chunk × subject pair.
+/// Seeding, ungapped extension and Phase 2a (preliminary gapped alignment) for
+/// one chunk x subject pair of a multi-chunk query.
 ///
-/// Returns preliminary HSPs in **global** coordinates: q_start, q_end, q_seed are
-/// offset by `chunk_offset`; s coords are in strand-native subject space (unchanged).
-/// Call [`merge_chunk_prelims`] to combine adjacent-chunk results, then [`run_phase2b`]
-/// with the full query for the final traceback.
-/// Phase 2a: seeding (word extension + ungapped extension) + preliminary gapped alignment.
+/// Returns preliminary HSPs in **global** coordinates: q_start, q_end and q_seed
+/// are offset by `chunk_offset`; s coords are in strand-native subject space.
+/// The caller (main.rs) merges adjacent chunks' prelims, then runs
+/// [`run_phase2b`] with the full query.
 ///
-/// NCBI applies DUST masking as soft masking: the masked query is used for seeding
-/// (LUT + word extension check + ungapped extension scoring) AND for preliminary gapped
-/// Phase 2a: preliminary gapped alignment for multi-chunk searches.
-///
-/// `query`        — original unmasked chunk; used for Phase 2a gapped alignment (mask_at_hash=TRUE).
-/// `masked_query` — DUST-masked chunk; used for seeding (LUT lookup, word extension, ungapped scoring).
-///                  When dust=false, pass the same slice as query.
+/// `query`        — unmasked chunk; ungapped and gapped extension read it (NCBI mask_at_hash).
+/// `masked_query` — DUST-masked chunk, as `ql` was built from; exact word extension reads it.
+///                  When dust is off, pass the same slice as `query`.
 pub fn search_phase2a(
     ql: &QueryLookup,
     query: &[u8],
@@ -2004,10 +2002,6 @@ fn purge_prelim_common_endpoints(prelim_hsps: &mut Vec<PrelimHsp>, sa_len: u32) 
         idx.sort_unstable_by(|&a, &b| {
             let ha = &prelim_hsps[a];
             let hb = &prelim_hsps[b];
-            // NCBI s_QueryOffsetCompareHSPs: after (ctx, q_off, s_off, score DESC),
-            // tiebreaker is query.end DESC.  For plus strand, query.end = FWD_qe → DESC.
-            // For minus strand, NCBI query.end = qlen - FWD_qs → DESC means SMALLER
-            // FWD_qs (more leftward start) wins, so we sort ASC on q_end_key (= FWD_qs).
             // NCBI s_QueryOffsetCompareHSPs: after (ctx, q_off, s_off, score DESC),
             // tiebreaker is query.end DESC.  For plus strand, query.end = FWD_qe → DESC.
             // For minus strand, NCBI query.end = qlen - FWD_qs → DESC means SMALLER

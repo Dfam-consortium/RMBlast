@@ -1,7 +1,7 @@
 //! rmblastn — Rust port of NCBI rmblastn (BLAST 2.17.0)
 //!
-//! Nucleotide BLAST with custom substitution matrices, UCSC 2bit database
-//! support, and RepeatMasker-specific output fields.
+//! Nucleotide BLAST with custom substitution matrices, a FASTA or UCSC 2bit
+//! database, and RepeatMasker-specific output fields.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufWriter, Write};
@@ -126,7 +126,9 @@ ARGUMENT SYNTAX NOTES:
 "
 )]
 struct Args {
-    /// UCSC 2bit database file
+    /// Database: a FASTA file (preferred) or a UCSC .2bit file, told apart by
+    /// extension (.fa .fasta .fas .fna .fn / .2bit), else by a leading '>'.
+    /// .2bit folds IUB codes other than N to N.
     #[arg(long)]
     db: String,
 
@@ -220,8 +222,10 @@ struct Args {
     gilist: Option<String>,
 
 
-    /// Write all merged Phase 2a prelim HSPs to this file before Phase 2b runs.
-    /// Format: sseqid TAB strand TAB qstart TAB qend TAB sstart TAB send TAB score
+    /// Debugging: write each multi-chunk query's (1,999,800 bp or longer) merged Phase 2a
+    /// prelim HSPs to this file before Phase 2b, queries appended in order.
+    /// Columns: sseqid strand qstart qend sstart send score qseed sseed (tab
+    /// separated).  Not available with --mt-mode 1.
     #[arg(long)]
     dump_prelims: Option<String>,
 
@@ -232,7 +236,7 @@ struct Args {
     /// fraction of heavily-overlapped, mostly low-scoring hits (chr22
     /// benchmark: balanced ~0.2% of annotated bp).  Modes: off (default),
     /// conservative, balanced, aggressive.  Active only for multi-chunk
-    /// queries (>1 Mbp) with mask_level < 100.
+    /// queries (1,999,800 bp or longer: NCBI splits at 2 x (1 Mbp - 100)) with mask_level < 100.
     #[arg(long, default_value = "off")]
     prelim_cull: String,
 
@@ -514,6 +518,14 @@ fn main() -> Result<()> {
 
     if args.matrix.is_empty() {
         anyhow::bail!("--matrix is required");
+    }
+    if let Some(path) = &args.dump_prelims {
+        if args.mt_mode == 1 {
+            anyhow::bail!("--dump-prelims is not available with --mt-mode 1");
+        }
+        // Created (emptied) once here; each multi-chunk query appends to it.
+        std::fs::File::create(path)
+            .with_context(|| format!("creating --dump-prelims file '{path}'"))?;
     }
 
     let matrix_path = match find_matrix_path(&args.matrix, &MatrixEnv::from_env()) {
@@ -1182,12 +1194,12 @@ fn search_db_parallel(
 
     // Single-chunk path: use original run_gapped_phase pipeline (unchanged).
     if effective_num_chunks <= 1 {
+        static CULL_NOTE: std::sync::Once = std::sync::Once::new();
         if prelim_cull.is_some() {
-            eprintln!(
-                "Note: --prelim-cull applies only to multi-chunk queries (>1 Mbp); \
-                 running the faithful pipeline for '{}'.",
-                query_id
-            );
+            CULL_NOTE.call_once(|| eprintln!(
+                "Note: --prelim-cull applies only to multi-chunk queries (1,999,800 bp or \
+                 longer); shorter ones (first: '{query_id}') run the faithful pipeline."
+            ));
         }
         let (chunk_lookup, _) = build_query_lookup(query, params);
         let mut results: Vec<AlignResult> = subject_names
@@ -1283,18 +1295,23 @@ fn search_db_parallel(
     }
 
     // Optional: dump all merged prelim HSPs before Phase 2b (for phase-attribution analysis).
+    // main created the file; a failure here is reported but does not stop
+    // the search.
     if let Some(path) = dump_prelims {
         use std::io::Write as IoWrite;
-        let f = std::fs::File::create(path)
-            .expect("cannot create dump-prelims file");
-        let mut bw = std::io::BufWriter::new(f);
-        for (name, prelims) in subject_names.iter().zip(accumulated_prelims.iter()) {
-            for p in prelims {
-                let strand = if p.strand == rmblast_lib::hits::Strand::Plus { "plus" } else { "minus" };
-                writeln!(bw, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    name, strand, p.q_start, p.q_end, p.s_start, p.s_end, p.score, p.q_seed, p.s_seed)
-                    .expect("write prelim");
+        let written = std::fs::OpenOptions::new().append(true).open(path).and_then(|f| {
+            let mut bw = std::io::BufWriter::new(f);
+            for (name, prelims) in subject_names.iter().zip(accumulated_prelims.iter()) {
+                for p in prelims {
+                    let strand = if p.strand == rmblast_lib::hits::Strand::Plus { "plus" } else { "minus" };
+                    writeln!(bw, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        name, strand, p.q_start, p.q_end, p.s_start, p.s_end, p.score, p.q_seed, p.s_seed)?;
+                }
             }
+            bw.flush()
+        });
+        if let Err(e) = written {
+            eprintln!("warning: --dump-prelims '{path}': {e}");
         }
     }
 

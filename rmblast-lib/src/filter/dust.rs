@@ -398,8 +398,6 @@ pub fn dust_intervals(
         // `rng` advances on each N, so re-visited N's get fresh CRandom values exactly as NCBI.
         let mut conv_from = j_start;
 
-        let mut done = false;
-
         'inner: loop {
             if j >= j_end { break; }
 
@@ -423,7 +421,6 @@ pub fn dust_intervals(
                     while conv_from <= j + 2 { conv[conv_from] = cvt_base(bases[conv_from], rng); conv_from += 1; }
                     let t2 = (conv[j] << 4) | (conv[j + 1] << 2) | conv[j + 2];
                     if w.shift_window(t2, &mut perfect) {
-                        done = true;
                         // Do NOT advance j here (mirrors NCBI: no ++it when done=true).
                         break;
                     }
@@ -441,7 +438,6 @@ pub fn dust_intervals(
         }
 
         // Restart outer loop from the advanced window position (NCBI restart logic).
-        let _ = done; // used implicitly via w.start advancing
         if w.start > j_start {
             j_start = w.start;
         } else {
@@ -449,10 +445,10 @@ pub fn dust_intervals(
         }
     }
 
-    // Sort and merge (save_masked already merges incrementally, but res may be
-    // slightly out of order across outer-loop restarts).
-    res.sort_unstable();
-    merge_intervals(res, linker)
+    // save_masked merges as it goes and NCBI does no final pass; 3.0.12 sorted
+    // and merged again here, which changed nothing on chr20, chr22, human-1mb
+    // or the TE libraries.
+    res
 }
 
 /// Mask a BLASTNA-encoded sequence in place.
@@ -631,23 +627,6 @@ pub fn dust_mask_ncbi_compat(
         }
     }
     intervals
-}
-
-fn merge_intervals(mut ivs: Vec<(usize, usize)>, linker: usize) -> Vec<(usize, usize)> {
-    if ivs.is_empty() { return ivs; }
-    ivs.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    let mut cur = ivs[0];
-    for (s, e) in ivs.into_iter().skip(1) {
-        if s <= cur.1 + linker {
-            cur.1 = cur.1.max(e);
-        } else {
-            merged.push(cur);
-            cur = (s, e);
-        }
-    }
-    merged.push(cur);
-    merged
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

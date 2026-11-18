@@ -16,7 +16,7 @@
 //!    spaces next to brackets go, and so on
 //!
 //! Checked against NCBI dustmasker 2.17.0 on randomly generated deflines
-//! (see `run_dustmasker_compare.sh`).
+//! (tests/cli.rs, deflines_match_ncbi_in_every_format).
 
 use crate::html_entities::HTML_ENTITIES;
 
