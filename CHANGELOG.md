@@ -77,10 +77,12 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   subject defline wrapped as NCBI wraps it, DUST-masked query bases in lower
   case, a "No hits found" block for queries without hits, and NCBI's blank
   lines between queries. Tabular output is unchanged
-- Queries of 2 Mb or more (searched in 1 Mb chunks) used an older minus-strand formula
-  for the start of the preliminary gapped alignment. At word size 7 it gave
-  different hits from NCBI (33 of about 4,200 lines on a 3 Mb chr22 slice); it
-  now uses the same formula as single-chunk queries and matches NCBI
+- Queries of 2 Mb or more (searched in 1 Mb chunks) used an older
+  minus-strand formula for the start of the preliminary gapped alignment. At
+  word size 7 it gave different hits from NCBI (33 of about 4,200 lines on a
+  3 Mb chr22 slice); it now uses the same formula as single-chunk queries and
+  matches NCBI. The two kinds of query now share one gapped-alignment
+  pipeline, so the copies cannot drift apart again
 - Complexity adjustment (-complexity_adjust) of a minus-strand hit counted the
   forward query's bases; NCBI counts the reverse complement. This matters only
   for matrices whose FREQS are not complement-symmetric, which the RepeatMasker
@@ -100,6 +102,12 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   -ctrl_a, -target_only and -long_seqids swallowed the next argument; a
   "> name" defline lost its record; and -out was truncated before the arguments
   were checked
+- --dump-prelims overwrote its file for each query, panicked if the file could
+  not be created, and did nothing in --mt-mode 1. The file is now created at
+  startup (a normal error if it cannot be), each query of 2 Mb or more appends
+  to it, and --mt-mode 1 refuses the option. Its help now lists all 9 columns
+- The --prelim-cull "multi-chunk queries only" note printed once per query; it
+  prints once per run
 - The verify wrappers failed every search under RepeatMasker 4.2.6, which
   drives a 3.x rmblastn with GNU-style options and a matrix path; NCBI rejected
   both. They now give NCBI its own spelling. They also share a query on stdin
@@ -108,6 +116,18 @@ Each case below either gave wrong or incomplete output, or hung or crashed
 - A gilist that matches no sequence and an empty query file used to exit with
   no output and no message. Both now warn on stderr (the empty query with
   NCBI's own warning) and give the normal empty output
+
+### Removed
+- rmblast-lib: library code with no caller in rmblastn or dustmasker
+  (about 2,000 lines): the modules blast::gapalign, blast::extend and lookup,
+  most of blast::types, the mirror-frame minus branch of extend_ungapped (its
+  plus_strand parameter is gone), and GapAlignAlgo,
+  TwoBitFile::get_sequence_blastna, TwoBitFile::seq_names, TwoBitSeqIter,
+  decode_blastna, BLASTNA_A/C/G/T, BLAST2NA_SIZE,
+  EditScript::{align_len, query_consumed, subject_consumed},
+  seqblk_from_blastna_with_compress and BlastIntervalTree::reset. The
+  search_phase2a parameter subject_id is gone too. Code that used any of
+  these from the library must change
 
 ### Performance
 - Startup took 28 s on a database of 100,000 sequences; it takes 0.4 s
