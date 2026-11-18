@@ -202,6 +202,14 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   in local time. Without `-parse_seqids`, NCBI wraps a long subject defline
   slightly differently, and an id-only defline has no trailing space.
 - The bare binary rejects `-num_alignments`; `wrappers/rmblastn` drops it.
+- NCBI 2.17.1 rejects `-xdrop_ungap` ("Attempt to cast to a wrong (Integer)
+  type") unless `-min_raw_gapped_score` is also given; the port accepts it on
+  its own.
+- Two small fidelity gaps remain, both far from RepeatMasker's parameters. At
+  `-mask_level 0`, which HSPs a touching neighbour masks can differ, because
+  NCBI's choice depends on its interval-tree layout. With `identity.matrix` and
+  no `--min-raw-gapped-score`, a few minus-strand seeds differ (see
+  FIX_PLAN 5.9).
 - The built-in Karlin-Altschul table is looked up by the matrix file's name
   and gap costs, as NCBI does; the matrix contents are not checked against it.
   The same matrix under another name falls back to a startup ALP fit, whose

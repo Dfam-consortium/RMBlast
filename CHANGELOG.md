@@ -14,6 +14,8 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   and any --dust value except yes, no, true or false. NCBI also accepts negative
   gap costs and -mt_mode 2; we don't. NCBI's -dust 'level window linker' form is
   refused, where it used to run silently with the default parameters
+- --seed-mode is removed. Its non-default "separate" mode had known
+  minus-strand bugs; the default seeding, which matches NCBI, is unchanged
 - --gapopen and --gapextend are required. Their defaults were 4/4; NCBI's are
   0/0, which NCBI itself rejects
 - A database with two sequences of the same id is refused. Before, the first
@@ -75,6 +77,19 @@ Each case below either gave wrong or incomplete output, or hung or crashed
   subject defline wrapped as NCBI wraps it, DUST-masked query bases in lower
   case, a "No hits found" block for queries without hits, and NCBI's blank
   lines between queries. Tabular output is unchanged
+- Queries over 1 Mb (searched in chunks) used an older minus-strand formula
+  for the start of the preliminary gapped alignment. At word size 7 it gave
+  different hits from NCBI (33 of about 4,200 lines on a 3 Mb chr22 slice); it
+  now uses the same formula as single-chunk queries and matches NCBI
+- Complexity adjustment (-complexity_adjust) of a minus-strand hit counted the
+  forward query's bases; NCBI counts the reverse complement. This matters only
+  for matrices whose FREQS are not complement-symmetric, which the RepeatMasker
+  matrices are
+- With --min-raw-gapped-score 0 (the default), zero-score, zero-length hits
+  could be printed, and the ungapped cutoff was 0 where NCBI's is at least 1
+- -mask_level used integer arithmetic where NCBI divides in floating point
+  (e.g. 29 of 50 bases is 57% in NCBI, 58% before), and at -mask_level 0 an
+  HSP only touching a better one was not masked
 - The rmblastn wrappers mangled negative option values: `-matrix_beta -4.9`
   became `--4.9` and failed. Values now pass through unchanged
 - The makeblastdb wrapper needed faToTwoBit at a fixed path, so it failed on any
