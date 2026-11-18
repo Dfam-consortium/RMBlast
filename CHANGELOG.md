@@ -111,8 +111,23 @@ Each case below either gave wrong or incomplete output, or hung or crashed
 
 ### Performance
 - Startup took 28 s on a database of 100,000 sequences; it takes 0.4 s
-- The query was DUST-masked again for every database sequence. A 60 bp query
-  against 100,000 sequences took 42 s; it takes 1.1 s
+- Per-subject work for short queries against many database sequences: the
+  query was DUST-masked and reverse-complemented again for every database
+  sequence, a 4096-entry buffer and a hash table were allocated and zeroed for
+  each, and each was given a seeded random generator whether or not it had an
+  ambiguous base. A 60 bp query against 100,000 sequences took 14-42 s; it
+  takes 0.3 s
+- The gapped-alignment stage copied each database sequence, and its reverse
+  complement, for every query instead of using the copies already cached: two
+  chromosome-sized copies per thread per query when searching against a
+  genome. 200 TE queries against chr20: peak memory 360 MB -> 294 MB
+- -mask_level filtering (and --prelim-cull) was quadratic in the number of
+  HSPs kept, and slowed further after one long HSP was kept: 1 million HSPs
+  took 12.6 s at -mask_level 99; it takes 1.1 s
+- --mt-mode 1 read the whole query file before searching; it now reads each
+  query as it is searched, so memory holds only the queries in flight. A
+  malformed query record is now reported after the output of the queries
+  before it, as in --mt-mode 0
 
 ## 3.0.12 - 2026-11-04
 ### Fixed
