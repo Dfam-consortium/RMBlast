@@ -264,6 +264,22 @@ fn bad_option_values_are_rejected() {
     }
 }
 
+/// A malformed FASTA query or database is an error naming the line.  3.0.12
+/// counted '*' as N in a database, skipped sequence before the first '>',
+/// and so on.
+#[test]
+fn malformed_fasta_is_rejected() {
+    let bad = tempfile_path::TempFile::with_contents(">x\nACGT\nAC*GT\n");
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    for (db, q) in [(db.as_str(), bad.path()), (bad.path(), q.as_str())] {
+        let r = rmblastn(&["--db", db, "--query", q, "--matrix", &m, "--gapopen", "20",
+                           "--gapextend", "5", "--outfmt", "6 score"]);
+        assert_eq!(r.code, Some(1), "stderr:\n{}", r.stderr);
+        assert!(r.stderr.contains("FASTA line 3: '*' is not a nucleotide code (in record 'x')"),
+            "stderr:\n{}", r.stderr);
+    }
+}
+
 /// An empty database is an error, FASTA or 2bit (3.0.12 exited 0 silently).
 #[test]
 fn empty_database_is_an_error() {
