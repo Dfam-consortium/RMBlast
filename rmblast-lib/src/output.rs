@@ -733,10 +733,10 @@ mod tests {
     /// NCBI 2.17.1's "Database:" lines for these titles (kFormatLineLength 68).
     #[test]
     fn database_title_wraps_like_ncbi() {
-        let path = "/tmp/claude-500/-home-rhubley-projects-Claude-rmblast-port/3186f3d4-03c5-4897-8678-3c2c9c42be0a/scratchpad/ndb/db.fa";
+        let path = "databases/repeat-libraries/2026-11-release/curated-families-with-long-names/db.fa";
         assert_eq!(ncbi_wrap_flat(path, 68), [
-            "/tmp/claude-500/-home-rhubley-projects-Claude-rmblast-port/3186f3d4-",
-            "03c5-4897-8678-3c2c9c42be0a/scratchpad/ndb/db.fa",
+            "databases/repeat-libraries/2026-11-release/curated-families-with-",
+            "long-names/db.fa",
         ]);
         assert_eq!(ncbi_wrap_flat("db.fa", 68), ["db.fa"]);
     }
