@@ -27,9 +27,14 @@ use crate::seq::twobit::LazyRandom;
 
 // ── BLASTNA → NCBI4NA table ───────────────────────────────────────────────────
 //
-// BLASTNA: A=0 C=1 G=2 T=3 R=4 Y=5 M=6 K=7 S=8 W=9 H=10 B=11 V=12 D=13 N=14 gap=15
+// BLASTNA: A=0 C=1 G=2 T=3 R=4 Y=5 M=6 K=7 W=8 S=9 B=10 D=11 H=12 V=13 N=14 gap=15
+//          (encoding::BLASTNA_TO_IUPAC order)
 // NCBI4NA: bit0=A bit1=C bit2=G bit3=T; N=15 gap=0
-const BLASTNA_TO_NCBI4NA: [u8; 16] = [1, 2, 4, 8, 5, 10, 3, 12, 6, 9, 11, 14, 7, 13, 15, 0];
+// Copied from blast_encoding.c.  3.0.12's table assumed another BLASTNA order
+// (W/S swapped, B/D/H/V permuted).  The CLI never reached it, since both
+// database decoders resolve ambiguity codes before packing, but a library
+// caller packing raw IUPAC codes drew from the wrong base sets.
+const BLASTNA_TO_NCBI4NA: [u8; 16] = [1, 2, 4, 8, 5, 10, 3, 12, 9, 6, 14, 13, 11, 7, 15, 0];
 
 /// Convert a single BLASTNA base to NCBI2NA, advancing the RNG for ambiguous bases.
 ///
@@ -121,4 +126,26 @@ pub fn seqblk_from_blastna(bases: &[u8]) -> SeqBlk {
     blastna.push(0u8); // sentinel
     blastna.extend_from_slice(bases);
     SeqBlk { blastna, packed: Vec::new(), length }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::BLASTNA_TO_IUPAC;
+
+    /// Each BLASTNA code maps to the NCBI4NA bit set of its IUPAC meaning.
+    #[test]
+    fn blastna_to_ncbi4na_matches_iupac() {
+        for (code, &letter) in BLASTNA_TO_IUPAC.iter().enumerate() {
+            let bases: &[u8] = match letter {
+                b'A' => b"A", b'C' => b"C", b'G' => b"G", b'T' => b"T",
+                b'R' => b"AG", b'Y' => b"CT", b'M' => b"AC", b'K' => b"GT",
+                b'W' => b"AT", b'S' => b"CG", b'B' => b"CGT", b'D' => b"AGT",
+                b'H' => b"ACT", b'V' => b"ACG", b'N' => b"ACGT", b'-' => b"",
+                _ => unreachable!(),
+            };
+            let bits = bases.iter().fold(0u8, |m, b| m | 1 << b"ACGT".iter().position(|x| x == b).unwrap());
+            assert_eq!(BLASTNA_TO_NCBI4NA[code], bits, "BLASTNA {code} ({})", letter as char);
+        }
+    }
 }

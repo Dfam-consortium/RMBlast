@@ -3860,7 +3860,7 @@ mod tests {
     fn mask_level_matches_brute_force() {
         for seed in 1..=20u64 {
             for &level in &[0u32, 1, 29, 57, 58, 80, 99] {
-                let input = random_hsps(600, seed * 0x9E3779B97F4A7C15);
+                let input = random_hsps(600, seed.wrapping_mul(0x9E3779B97F4A7C15));
                 let mut want: Vec<AlignResult> = Vec::new();
                 let mut sorted = input.clone();
                 sorted.sort_by_key(|r| std::cmp::Reverse(r.hsp.score));

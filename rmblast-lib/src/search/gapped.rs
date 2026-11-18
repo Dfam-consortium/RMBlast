@@ -25,12 +25,11 @@ use crate::matrix::ScoreMatrix;
 #[cfg(feature = "diagnostics")]
 pub static TOTAL_DP_CELLS: AtomicU64 = AtomicU64::new(0);
 
-/// Diagnostic counter: number of times the REVERSE band pointer had to be clamped
-/// because `first_b_index` reached `n` (see `align_ex_score_only_inner`).  The clamp
-/// is behaviour-neutral — the inner loop runs zero times in that state — this counter
-/// only records how often the degenerate band state occurs.
+/// Diagnostic counter: REVERSE rows whose band starts at `first_b_index == n`
+/// (see `align_ex_score_only_inner`), where the inner loop runs zero times and
+/// the b pointer must not be formed below the slice.
 #[cfg(feature = "diagnostics")]
-pub static REVERSE_FBI_CLAMPED: AtomicU64 = AtomicU64::new(0);
+pub static REVERSE_BAND_AT_END: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: total score-only DP cells (subset of TOTAL_DP_CELLS).
 #[cfg(feature = "diagnostics")]
@@ -100,6 +99,8 @@ impl Default for AlignWorkspace {
 ///
 /// Returns (score, a_len, b_len). Much faster than `align_ex` when traceback not needed.
 /// Score-only gapped alignment (dispatch wrapper — picks monomorphised variant).
+///
+/// Every byte of `b[..n]` must be a BLASTNA code (0..=15); see the inner loop.
 pub fn align_ex_score_only(
     a: &[u8],
     b: &[u8],
@@ -207,7 +208,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
             if first_b_index < n {
                 unsafe { b.as_ptr().add(n - 1 - first_b_index) }
             } else {
-                crate::diag_count!(REVERSE_FBI_CLAMPED);
+                crate::diag_count!(REVERSE_BAND_AT_END);
                 b.as_ptr()
             }
         } else {
@@ -219,8 +220,16 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
         // Hot inner loop — no sentinel branch.
         let mut b_idx = first_b_index;
         while b_idx < inner_end {
+            // Unlike align_ex, b_base is not masked with & 15: that costs 2.3% of
+            // this loop.  Every b byte is BLASTNA (0..=15) by construction: the
+            // subject's packing (blast_compress_blastna_sequence) indexes a
+            // 16-entry table with each byte, so a larger one panics before any
+            // DP runs.  Calling this directly with other bytes is unsound.
             let b_base = unsafe { *b_cur as usize };
-            b_cur = if REVERSE { unsafe { b_cur.sub(1) } } else { unsafe { b_cur.add(1) } };
+            debug_assert!(b_base < 16, "b byte {b_base} is not a BLASTNA code");
+            // REVERSE steps below b after reading b[0]; `sub` may not form that
+            // pointer (3.0.12 did), `wrapping_sub` may, and it is never read.
+            b_cur = if REVERSE { b_cur.wrapping_sub(1) } else { unsafe { b_cur.add(1) } };
 
             let (score_gap_col, next_score) = unsafe {
                 let cell = dp.get_unchecked(b_idx);
@@ -694,20 +703,25 @@ fn traceback_flat(
     let mut b = end_b;
     let mut prev_op = SCRIPT_SUB;
 
-    while a > 0 || b > 0 {
-        if a >= row_info.len() {
-            push_rev(&mut ops_rev, EditOp::GapInQuery);
-            b = b.saturating_sub(1);
-            continue;
-        }
+    // The DP records a row for every a the walk reaches and never points a
+    // step past a = 0 or b = 0, so each step lowers a + b by at least 1 and the
+    // walk takes at most end_a + end_b steps.  3.0.12 looped `while a > 0 ||
+    // b > 0`: had that invariant broken, a step saturating at 0 could repeat
+    // forever.  The step budget bounds the walk (a walk it cuts off panics
+    // below), and `row_info[a]` panics past the last row.
+    for _ in 0..end_a + end_b {
 
         let (byte_off, first_b) = row_info[a];
         let row_end = if a + 1 < row_info.len() { row_info[a + 1].0 } else { flat.len() };
 
+        // A cell outside the row's stored band reads as a gap in A.  The
+        // traceback never visits one (checked in debug builds).
         let raw_op = if b >= first_b {
             let byte_idx = byte_off + (b - first_b);
+            debug_assert!(byte_idx < row_end, "traceback: ({a}, {b}) past the end of its row");
             if byte_idx < row_end { flat[byte_idx] } else { SCRIPT_GAP_IN_A }
         } else {
+            debug_assert!(false, "traceback: ({a}, {b}) before the start of its row ({first_b})");
             SCRIPT_GAP_IN_A
         };
 
@@ -735,10 +749,17 @@ fn traceback_flat(
 
         if a == 0 && b == 0 { break; }
     }
+    if a != 0 || b != 0 { traceback_unfinished(end_a, end_b, a, b) }
 
     ops_rev.reverse();
     for (op, n) in ops_rev { result.push(op, n); }
     result
+}
+
+#[cold]
+#[inline(never)]
+fn traceback_unfinished(end_a: usize, end_b: usize, a: usize, b: usize) -> ! {
+    panic!("traceback from ({end_a}, {end_b}) did not reach (0, 0) in {} steps; stopped at ({a}, {b})", end_a + end_b)
 }
 
 fn push_rev(ops: &mut Vec<(EditOp, u32)>, op: EditOp) {
@@ -884,8 +905,8 @@ T -4  -4  -4   5
         // degenerate state, so the test cannot silently stop covering the bug.
         // The counter only exists with the diagnostics feature.
         #[cfg(feature = "diagnostics")]
-        assert!(REVERSE_FBI_CLAMPED.load(std::sync::atomic::Ordering::Relaxed) > 0,
-                "no reverse-band clamp observed — test inputs no longer reach the bug");
+        assert!(REVERSE_BAND_AT_END.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "no band at first_b_index == n observed — test inputs no longer reach the case");
     }
 
     #[test]
