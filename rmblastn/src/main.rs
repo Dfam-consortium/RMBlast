@@ -196,7 +196,11 @@ struct Args {
           value_parser = clap::value_parser!(u8).range(0..=1))]
     mt_mode: u8,
 
-    /// Output format: 0 = pairwise (default, matches NCBI rmblastn), 6 [fields...] = tabular.
+    /// Output format: 0 = pairwise (the default, as in NCBI), or "6 <fields>"
+    /// = tabular with these fields: score perc_sub perc_query_gap perc_db_gap
+    /// qseqid qstart qend qlen sstrand sseqid sstart send slen kdiv cpg_kdiv
+    /// transi transv cpg_sites qseq sseq evalue bitscore.  Other formats, a
+    /// bare 6 and other field names are refused.
     #[arg(long, default_value = "0")]
     outfmt: String,
 
@@ -381,22 +385,15 @@ enum OutputFormat {
 
 fn parse_output_format(s: &str) -> Result<OutputFormat> {
     let trimmed = s.trim();
-    if trimmed == "0" || trimmed.is_empty() {
+    if trimmed == "0" {
         return Ok(OutputFormat::Pairwise);
     }
-    let first_token = trimmed.split_whitespace().next().unwrap_or("");
-    if first_token == "0" {
-        return Ok(OutputFormat::Pairwise);
+    if trimmed.split_whitespace().next() == Some("0") {
+        anyhow::bail!("--outfmt '{}': format 0 (pairwise) takes no fields", s);
     }
-    // Attempt tabular parse (format 6 or bare field list).
-    let fields = parse_outfmt(trimmed);
-    if fields.is_empty() {
-        anyhow::bail!(
-            "--outfmt '{}' is not recognized; use '0' for pairwise or '6 <fields>' for tabular",
-            s
-        );
-    }
-    Ok(OutputFormat::Tabular(fields))
+    parse_outfmt(trimmed)
+        .map(OutputFormat::Tabular)
+        .map_err(|e| anyhow::anyhow!("--outfmt '{}': {}", s, e))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -66,6 +66,13 @@ pub enum OutField {
     Bitscore,
 }
 
+/// The field names `-outfmt 6` accepts, in the order the help lists them.
+pub const OUT_FIELD_NAMES: &[&str] = &[
+    "score", "perc_sub", "perc_query_gap", "perc_db_gap", "qseqid", "qstart", "qend",
+    "qlen", "sstrand", "sseqid", "sstart", "send", "slen", "kdiv", "cpg_kdiv", "transi",
+    "transv", "cpg_sites", "qseq", "sseq", "evalue", "bitscore",
+];
+
 impl OutField {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -103,12 +110,27 @@ pub fn outfmt_needs_stats(fields: &[OutField]) -> bool {
     fields.iter().any(|f| matches!(f, OutField::Evalue | OutField::Bitscore))
 }
 
-/// Parse an outfmt string like "6 score perc_sub ... qseq sseq" into a field list.
-/// The leading format number (e.g. "6") is skipped.
-pub fn parse_outfmt(s: &str) -> Vec<OutField> {
-    s.split_whitespace()
-        .filter(|t| t.parse::<u32>().is_err())
-        .filter_map(OutField::parse)
+/// Parse a tabular outfmt string, "6 score perc_sub ... qseq sseq", into its
+/// field list.  Anything this port does not implement is an error: another
+/// format number, a bare "6" (NCBI's default 12 columns are not implemented),
+/// or an unknown field name.  3.0.12 dropped unknown fields silently, shifting
+/// the columns, and treated "7 ..." and "10 ..." as 6.
+pub fn parse_outfmt(s: &str) -> Result<Vec<OutField>, String> {
+    let mut tokens = s.split_whitespace();
+    match tokens.next() {
+        Some("6") => {}
+        Some(fmt) => return Err(format!(
+            "output format '{fmt}' is not supported; use 0 (pairwise) or 6 <fields> (tabular)")),
+        None => return Err("empty output format".into()),
+    }
+    let fields: Vec<&str> = tokens.collect();
+    if fields.is_empty() {
+        return Err(format!(
+            "-outfmt 6 needs a field list; NCBI's default columns are not supported. Fields: {}",
+            OUT_FIELD_NAMES.join(" ")));
+    }
+    fields.iter().map(|f| OutField::parse(f).ok_or_else(|| format!(
+        "unknown -outfmt field '{f}'. Supported fields: {}", OUT_FIELD_NAMES.join(" "))))
         .collect()
 }
 

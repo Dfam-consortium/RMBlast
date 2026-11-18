@@ -337,6 +337,28 @@ fn gilist_matching_nothing_warns() {
     assert!(r.stdout.is_empty());
 }
 
+/// Output formats and fields that are not implemented are refused, naming
+/// the problem.  3.0.12 dropped unknown fields silently (shifting the columns),
+/// treated "7 ..." and "10 ..." as 6, and refused a bare "6" only by accident.
+#[test]
+fn unsupported_outfmt_is_rejected() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("comparison.matrix"));
+    for (fmt, needle) in [
+        ("6", "needs a field list"),
+        ("7 score", "output format '7' is not supported"),
+        ("10 score qseqid", "output format '10' is not supported"),
+        ("6 score pident qseqid", "unknown -outfmt field 'pident'"),
+        ("6 std", "unknown -outfmt field 'std'"),
+        ("0 score", "takes no fields"),
+    ] {
+        let r = rmblastn(&["--db", &db, "--query", &q, "--matrix", &m, "--gapopen", "20",
+                           "--gapextend", "5", "--outfmt", fmt]);
+        assert_eq!(r.code, Some(1), "{fmt:?}: stderr:\n{}", r.stderr);
+        assert!(r.stderr.contains(needle), "{fmt:?}: stderr:\n{}", r.stderr);
+        assert!(r.stdout.is_empty(), "{fmt:?}");
+    }
+}
+
 /// Gap costs have no usable default (NCBI rmblastn's 0/0 is rejected).
 #[test]
 fn gap_costs_are_required() {
