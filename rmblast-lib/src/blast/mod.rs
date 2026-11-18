@@ -18,3 +18,6 @@ pub mod util;
 pub mod nalookup;
 pub mod nascan;
 pub mod mblookup;
+
+#[cfg(test)]
+mod tests;

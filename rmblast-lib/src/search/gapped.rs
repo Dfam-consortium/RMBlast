@@ -856,9 +856,91 @@ T -4  -4  -4   5
         let a = vec![0u8, 1, 2, 3, 0, 1, 2, 3];
         let s = vec![0u8, 1, 2, 3, 1, 2, 3];
         let r = align_ex(&a, &s, 8, 7, 4, 4, 50, &m, false, &mut w);
-        assert!(r.score > 0, "score={}", r.score);
-        assert!(r.a_len > 0);
-        assert!(r.b_len > 0);
+        // 7 matches (35) and one 1-base gap (open 4 + extend 4): 27, the
+        // best the oracle finds too.
+        assert_eq!((r.score, r.a_len, r.b_len), (27, 8, 7));
+        assert_eq!(r.score, best_anchored_score(&a, &s, &m, 4, 4));
+        assert_eq!(r.edit_script.ops, vec![(EditOp::Sub, 4), (EditOp::GapInSubject, 1), (EditOp::Sub, 3)]);
+    }
+
+    /// Best score of an alignment of a prefix of `a` with a prefix of `b`
+    /// (both starting at 0, ending anywhere, 0 for the empty one), with a gap
+    /// of k bases costing open + k * extend: an independent Gotoh DP.
+    fn best_anchored_score(a: &[u8], b: &[u8], m: &ScoreMatrix, open: i32, ext: i32) -> i32 {
+        const NEG: i64 = i64::MIN / 4;
+        let (oe, e) = ((open + ext) as i64, ext as i64);
+        let (la, lb) = (a.len(), b.len());
+        let mut h = vec![vec![NEG; lb + 1]; la + 1]; // best ending at (i, j)
+        let mut gx = vec![vec![NEG; lb + 1]; la + 1]; // ending in a gap consuming a
+        let mut gy = vec![vec![NEG; lb + 1]; la + 1]; // ending in a gap consuming b
+        h[0][0] = 0;
+        let mut best = 0i64;
+        for i in 0..=la {
+            for j in 0..=lb {
+                if i == 0 && j == 0 { continue; }
+                if i > 0 { gx[i][j] = (h[i - 1][j] - oe).max(gx[i - 1][j] - e); }
+                if j > 0 { gy[i][j] = (h[i][j - 1] - oe).max(gy[i][j - 1] - e); }
+                let diag = if i > 0 && j > 0 { h[i - 1][j - 1] + m.score(a[i - 1], b[j - 1]) as i64 } else { NEG };
+                h[i][j] = diag.max(gx[i][j]).max(gy[i][j]);
+                best = best.max(h[i][j]);
+            }
+        }
+        best as i32
+    }
+
+    /// align_ex finds the optimal anchored score when the x-dropoff cannot
+    /// prune; its edit script rescores to that score and consumes exactly
+    /// (a_len, b_len); the score-only aligner gives the same score; and the
+    /// REVERSE variants equal the forward ones on reversed sequences.
+    #[test]
+    fn align_ex_is_optimal_and_consistent() {
+        let m = mat();
+        let mut w = ws();
+        let mut dp = Vec::new();
+        let mut x = 0xA0761D6478BD642Fu64;
+        let mut rnd = move |n: u64| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x % n };
+        for trial in 0..3000 {
+            let la = 1 + rnd(40) as usize;
+            let a: Vec<u8> = (0..la).map(|_| rnd(4) as u8).collect();
+            // b: a mutated copy (substitutions, insertions, deletions)
+            let mut b = Vec::new();
+            for &c in &a {
+                match rnd(12) {
+                    0 => {}
+                    1 => { b.push(c); b.push(rnd(4) as u8); }
+                    2 => b.push(rnd(4) as u8),
+                    _ => b.push(c),
+                }
+            }
+            if b.is_empty() { b.push(0); }
+            let (open, ext) = [(4, 4), (20, 5), (8, 2), (1, 1)][trial % 4];
+            let want = best_anchored_score(&a, &b, &m, open, ext);
+
+            let r = align_ex(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, false, &mut w);
+            assert_eq!(r.score, want, "trial {trial}: a {a:?} b {b:?} gaps {open}/{ext}");
+            let (mut i, mut j, mut sc, mut prev) = (0usize, 0usize, 0i32, None);
+            for &(op, n) in &r.edit_script.ops {
+                for _ in 0..n {
+                    match op {
+                        EditOp::Sub => { sc += m.score(a[i], b[j]); i += 1; j += 1; }
+                        EditOp::GapInSubject => { sc -= if prev == Some(op) { ext } else { open + ext }; i += 1; }
+                        EditOp::GapInQuery => { sc -= if prev == Some(op) { ext } else { open + ext }; j += 1; }
+                    }
+                    prev = Some(op);
+                }
+            }
+            assert_eq!((i, j), (r.a_len, r.b_len), "trial {trial}: script length");
+            assert_eq!(sc, r.score, "trial {trial}: script rescored");
+
+            let (so, ..) = align_ex_score_only(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, false, &mut dp);
+            assert_eq!(so, want, "trial {trial}: score-only");
+
+            let (ra, rb): (Vec<u8>, Vec<u8>) = (a.iter().rev().copied().collect(), b.iter().rev().copied().collect());
+            let want_rev = best_anchored_score(&ra, &rb, &m, open, ext);
+            let rr = align_ex(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, true, &mut w);
+            let (rso, ..) = align_ex_score_only(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, true, &mut dp);
+            assert_eq!((rr.score, rso), (want_rev, want_rev), "trial {trial}: reverse");
+        }
     }
 
     #[test]
