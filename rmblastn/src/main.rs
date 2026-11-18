@@ -1342,12 +1342,12 @@ fn search_db_parallel(
             .zip(per_subject.into_par_iter())
             .flat_map(|(name, prelims)| {
                 if prelims.is_empty() { return vec![]; }
-                let seq = match db.get_full_sequence_blastna(name) {
-                    Ok(s) => s,
+                let prep = match db.get_prepared(name) {
+                    Ok(p) => p,
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
                 let n_mask = db.get_n_mask(name);
-                let mut r = run_phase2b(query, query_rc, query_id, &seq, name, prelims, params, matrix, &n_mask);
+                let mut r = run_phase2b(query, query_rc, query_id, &prep, name, prelims, params, matrix, &n_mask);
                 for h in &mut r { h.hsp.q_len = full_q_len_u32; }
                 r
             })

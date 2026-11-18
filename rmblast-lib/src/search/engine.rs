@@ -1439,7 +1439,7 @@ pub fn run_phase2b(
     query: &[u8],
     query_rc: &[u8],
     query_id: &str,
-    subject_plus: &[u8],
+    subject: &PreparedSubject,
     subject_id: &str,
     mut prelim_hsps: Vec<PrelimHsp>,
     params: &SearchParams,
@@ -1447,7 +1447,7 @@ pub fn run_phase2b(
     n_mask: &[u8],
 ) -> Vec<AlignResult> {
     let qa_len = (query.len() - 2) as u32;
-    let s_len  = (subject_plus.len() - 2) as u32;
+    let s_len  = (subject.align.len() - 2) as u32;
     let sa_len = s_len;
 
     // query_rc (reverse-complement of the FULL query) is computed once by the caller
@@ -1456,18 +1456,11 @@ pub fn run_phase2b(
     // memory note on the chr22×longlib footprint).
     // CRandom bases at N/IUPAC positions are used only for seeding/ungapped extension.
     // For gapped alignment and improve_seed, NCBI scores ambiguous positions using the
-    // original ambiguity code (14=N, or 4-13 for S/M/R/Y/K/W etc.).
-    let subject_align_vec: Vec<u8> = if n_mask.is_empty() {
-        subject_plus.to_vec()
-    } else {
-        let mut s = subject_plus.to_vec();
-        for (i, &code) in n_mask.iter().enumerate() {
-            if code != 0 { s[i + 1] = code; }
-        }
-        s
-    };
-    let subject_plus: &[u8] = &subject_align_vec;
-    let subj_rc  = revcomp_blastna(subject_plus);
+    // original ambiguity code (14=N, or 4-13 for S/M/R/Y/K/W etc.): the subject's
+    // cached `align` view and its reverse complement (3.0.12 rebuilt both per call).
+    debug_assert_eq!(subject.n_mask_rc.len(), n_mask.len(), "n_mask is not this subject's");
+    let subject_plus: &[u8] = &subject.align;
+    let subj_rc: &[u8] = &subject.align_rc;
     let mut ws   = AlignWorkspace::new();
 
     // ScoreCompareHSPs sort: score DESC, FWD s_start ASC, FWD s_end DESC,
@@ -1666,9 +1659,7 @@ pub fn run_phase2b(
         let rc_core  = &subj_rc[1..subj_rc.len() - 1];
         // Re-extraction for minus strand uses rc_core (reversed), so n_mask must be
         // reversed and each IUPAC code complemented to match the RC strand orientation.
-        let n_mask_rc_gapped: Vec<u8> = if n_mask.is_empty() { Vec::new() } else {
-            n_mask.iter().rev().map(|&c| if c == 0 { 0 } else { BLASTNA_COMPLEMENT[c as usize] }).collect()
-        };
+        let n_mask_rc_gapped: &[u8] = &subject.n_mask_rc;
 
         for slot in arr[extra_start..].iter_mut() {
             let mut r = match slot.take() { Some(r) => r, None => continue };
@@ -1683,7 +1674,7 @@ pub fn run_phase2b(
                 r.hsp.s_start as usize
             };
             let b_core = if is_minus { rc_core } else { src_core };
-            let b_mask_r = if is_minus { &n_mask_rc_gapped[..] } else { n_mask };
+            let b_mask_r = if is_minus { n_mask_rc_gapped } else { n_mask };
             let (q_seq, s_seq) = extract_aligned(q_core, b_core, a_start, b_start, &r.hsp.edit_script, b_mask_r);
 
             let delete = reevaluate_gapped(
