@@ -950,7 +950,15 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
             continue;
         }
 
-        let upper = accepted.partition_point(|a| a.0 < qe_i);
+        // At mask level 0 an HSP that only touches a better one is masked too:
+        // NCBI's overlap is then 0 and 0 >= 0.  At any higher level touching
+        // cannot mask, so only real overlaps are examined.
+        let touching = mask_level == 0;
+        let upper = if touching {
+            accepted.partition_point(|a| a.0 <= qe_i)
+        } else {
+            accepted.partition_point(|a| a.0 < qe_i)
+        };
         let min_start = qs_i.saturating_sub(max_accepted_span);
 
         let mut masked = false;
@@ -961,7 +969,7 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
             if qs_j < min_start {
                 break;
             }
-            if qe_j <= qs_i {
+            if qe_j < qs_i || (qe_j == qs_i && !touching) {
                 continue;
             }
             // Mirror NCBI s_HSPQueryRangeIsMasklevelContained: skip only if accepted
@@ -970,8 +978,12 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
                 continue;
             }
             let ovlp = (qe_j.min(qe_i) as i64) - (qs_j.max(qs_i) as i64);
-            // NCBI: (Int4)(100*(double)ovlp/span) >= masklevel
-            if ovlp * 100 / q_span_i >= mask_level as i64 {
+            // NCBI s_HSPQueryRangeIsMasklevelContained (blast_itree.c):
+            // (Int4)(100*((double)ovlp/span)) >= masklevel -- the division in
+            // double first.  Integer ovlp*100/span differs where the double
+            // quotient rounds down, e.g. 29/100 -> 28.999..., at levels 29, 57, 58.
+            let perc = (100.0 * (ovlp as f64 / q_span_i as f64)) as i64;
+            if perc >= mask_level as i64 {
                 masked = true;
                 break;
             }
@@ -3774,6 +3786,30 @@ mod tests {
         let expected: std::collections::HashSet<u32> =
             [1u32, 21, 41, 61, 81, 101, 121, 141, 161].iter().copied().collect();
         assert_eq!(q_start_set, expected);
+    }
+
+    /// NCBI's overlap percentage divides in double first: 29 of 50 bases is
+    /// (Int4)(100 * 0.58) = 57, not 2900/50 = 58, so at mask level 58 the
+    /// weaker HSP survives.  And at mask level 0 an HSP that only touches a
+    /// better one is masked (overlap 0, 0 >= 0); at 1 it is not.
+    #[test]
+    fn mask_level_percent_and_touching_like_ncbi() {
+        // better [0,50), weaker [21,71): overlap 29 of the weaker's 50
+        let mk = || vec![make_result(100, 0, 50, 0, 50), make_result(90, 21, 71, 21, 71)];
+        let mut r = mk();
+        apply_mask_level(&mut r, 58, &[]);
+        assert_eq!(r.len(), 2, "57% overlap must not mask at level 58");
+        let mut r = mk();
+        apply_mask_level(&mut r, 57, &[]);
+        assert_eq!(r.len(), 1);
+
+        let touch = || vec![make_result(100, 0, 50, 0, 50), make_result(90, 50, 100, 50, 100)];
+        let mut r = touch();
+        apply_mask_level(&mut r, 0, &[]);
+        assert_eq!(r.len(), 1, "touching masks at level 0");
+        let mut r = touch();
+        apply_mask_level(&mut r, 1, &[]);
+        assert_eq!(r.len(), 2);
     }
 
     // Port of NCBI's nuclwordfinder_unit_test.cpp (testExtend).
