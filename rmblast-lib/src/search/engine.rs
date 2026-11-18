@@ -3098,9 +3098,13 @@ fn cut_start_secondary(primary: &AlignResult, sec: &mut AlignResult) -> bool {
         Strand::Minus => {
             let dq = sec.hsp.q_end.saturating_sub(primary.hsp.q_start);
             let ds = primary.hsp.s_end.saturating_sub(sec.hsp.s_start);
+            let old_q_end = sec.hsp.q_end;
             let old_s_start = sec.hsp.s_start;
-            let (ok, _gq, gs) = cut_ops_back(&mut sec.hsp.edit_script.ops, dq, ds);
-            if ok { sec.hsp.q_end = primary.hsp.q_start; sec.hsp.s_start = old_s_start + gs; }
+            let (ok, gq, gs) = cut_ops_back(&mut sec.hsp.edit_script.ops, dq, ds);
+            // gq is the query span actually cut, which can exceed dq at a gap
+            // (as the plus branch uses it); 3.0.12 set q_end = primary.q_start,
+            // right only when gq == dq (review 3.6).
+            if ok { sec.hsp.q_end = old_q_end - gq; sec.hsp.s_start = old_s_start + gs; }
         }
     }
     !sec.hsp.edit_script.ops.is_empty()
