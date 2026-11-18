@@ -41,7 +41,10 @@ quirk that changes results, the port reproduces it on purpose.
   from NCBI's hardcoded table. Build `rmblast-lib` with `--no-default-features`
   to skip it; E-value statistics then fall back to the sentinel.
 - For the wrapper scripts only: UCSC's `faToTwoBit`, `twoBitInfo`, and
-  `twoBitToFa` on `PATH`.
+  `twoBitToFa`, found in `$UCSCTOOLS_DIR`, then on `PATH`, then in
+  `/usr/local/ucscTools`. `makeblastdb` builds a usable database without
+  `faToTwoBit` (searches read the FASTA); `blastdbcmd` needs the other two only
+  for a `.2bit` database.
 
 ## Build and install
 
@@ -149,7 +152,18 @@ export PATH=/opt/rmblast-<version>/wrappers:$PATH
 The `makeblastdb` here never calls NCBI's. It converts the FASTA to `.2bit`,
 leaves a FASTA at the database base path for the engine to read, and writes
 placeholder index files so that callers checking for a BLAST database are
-satisfied.
+satisfied. Every file is written under a temporary name and renamed into place,
+so a search during a rebuild never reads a half-written database. It accepts the
+options RepeatMasker and RepeatModeler pass (`-in`, `-out`, `-dbtype nucl`,
+`-parse_seqids`, `-blastdb_version`, `-title`). It refuses `-dbtype prot` (the
+port is nucleotide only), `-mask_data` (the engine would not apply the masks)
+and any other option.
+
+The `rmblastn` wrapper passes every argument through unchanged, values
+included, except that it drops `-num_alignments`, points `-db` at the FASTA,
+and prints `-version` in NCBI's `rmblastn: X.Y.Z+` shape, which RepeatMasker
+and RepeatModeler parse. `bash tests/wrappers.sh` tests all of the wrappers,
+and compares against NCBI where it is installed.
 
 ### verify_wrappers/
 
@@ -206,7 +220,10 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   any character that is not a nucleotide code (NCBI drops it), and a negative
   `-window` or `-linker` (NCBI clamps them).
 - The `blastdbcmd` and `blastdb_aliastool` wrappers cover what RepeatMasker and
-  RepeatModeler call, not the full tools. Unsupported options exit non-zero.
+  RepeatModeler call, not the full tools. Unsupported options exit non-zero, as
+  do a missing `-entry` and a batch with entries skipped (as in NCBI). A batch
+  interval that starts past the end of its sequence is skipped with an error;
+  NCBI silently returns the whole sequence for it.
 - `blastdbcmd` reads the `.2bit` our `makeblastdb` writes or a FASTA beside the
   database, never an NCBI BLAST index. For a database BuildDatabase built with
   the real NCBI `makeblastdb`, it therefore falls back to BuildDatabase's input
