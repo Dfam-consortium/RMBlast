@@ -968,8 +968,8 @@ fn diagnostics_report() {
     use std::sync::atomic::Ordering;
     if std::env::var_os("RMBLAST_DEBUG_COUNTERS").is_some() {
         eprintln!(
-            "REVERSE_FBI_CLAMPED={} IMPROVE_SEED_NEGATIVE_OFFSET={}",
-            rmblast_lib::search::gapped::REVERSE_FBI_CLAMPED.load(Ordering::Relaxed),
+            "REVERSE_BAND_AT_END={} IMPROVE_SEED_NEGATIVE_OFFSET={}",
+            rmblast_lib::search::gapped::REVERSE_BAND_AT_END.load(Ordering::Relaxed),
             rmblast_lib::search::engine::IMPROVE_SEED_NEGATIVE_OFFSET.load(Ordering::Relaxed),
         );
     }
