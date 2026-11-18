@@ -3813,6 +3813,38 @@ mod tests {
         assert_eq!(r.len(), 2);
     }
 
+    /// A match that ends on the subject's last base is found, on both strands,
+    /// for every subject length mod 4 and a range of word sizes: the scanners
+    /// read the packed subject's last word, which must sit inside the buffer
+    /// (see blast_compress_blastna_sequence's tail pad).
+    #[test]
+    fn match_at_subject_end_found_for_every_length() {
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut base = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"ACGT"[(x % 4) as usize] };
+        let query: Vec<u8> = (0..64).map(|_| base()).collect();
+        let rc: Vec<u8> = query.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' }).collect();
+        let q = dna_to_blastna_sentinels(&query);
+        let matrix = blastn_1m3_matrix();
+        for &ws in &[4usize, 5, 7, 8, 11, 12, 14, 16, 20, 28] {
+            let params = SearchParams { word_size: ws, min_raw_gapped_score: ws as i32, dust: false, ..Default::default() };
+            for len in ws..ws + 48 {
+                let k = len.min(48);
+                for minus in [false, true] {
+                    let mut subj: Vec<u8> = (0..len - k).map(|_| base()).collect();
+                    // plus: subject ends with query[..k]; minus: with revcomp(query[64-k..])
+                    if minus { subj.extend_from_slice(&rc[..k]); } else { subj.extend_from_slice(&query[..k]); }
+                    let s = dna_to_blastna_sentinels(&subj);
+                    let hits = search_query_vs_subject(&q, "q", &s, "s", &params, &matrix);
+                    let want = if minus { Strand::Minus } else { Strand::Plus };
+                    let at_end = hits.iter().any(|h| h.hsp.strand == want && if minus {
+                        h.hsp.s_start == 0 || h.hsp.s_end == len as u32 } else { h.hsp.s_end == len as u32 });
+                    assert!(at_end, "ws {ws} len {len} minus {minus}: no hit at the subject end; hits {:?}",
+                        hits.iter().map(|h| (h.hsp.strand, h.hsp.q_start, h.hsp.q_end, h.hsp.s_start, h.hsp.s_end)).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
     /// Random HSPs in a small query range (so overlaps, touches and both
     /// strands are common), distinct scores so the sort is score order.
     fn random_hsps(n: usize, seed: u64) -> Vec<AlignResult> {

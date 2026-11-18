@@ -69,11 +69,20 @@ fn blastna_to_ncbi2na(b: u8, rng: &mut LazyRandom) -> u8 {
 /// Format: packed[3+j] covers bases 4j..4j+3, base 4j in bits 7:6 (MSB),
 /// base 4j+3 in bits 1:0 (LSB).  A partial final chunk is left-justified.
 /// packed[0..2] are zeroed (pre-sequence padding).
+/// Zero bytes after the last packed base.  The subject scanners (nascan.rs,
+/// mblookup.rs) read a word as up to four bytes from the byte holding the
+/// scan offset (`s_byte + 3`).  Since the last offset scanned leaves a whole
+/// word before the end, 1 byte is enough today; 3 covers a read of
+/// `s_byte + 3` from the last data byte, whatever the word length.  Tested by
+/// match_at_subject_end_found_for_every_length (fails at 0).
+pub const PACKED_TAIL_PAD: usize = 3;
+
 pub fn blast_compress_blastna_sequence(seq_blk: &mut SeqBlk) {
     let len = seq_blk.length as usize;
 
-    // 3 pre-sequence padding bytes + ceil(len/4) data bytes.
-    seq_blk.packed = vec![0u8; len + 3];
+    // 3 pre-sequence padding bytes + ceil(len/4) data bytes + PACKED_TAIL_PAD.
+    // 3.0.12 allocated len + 3 bytes, four times what the bases need.
+    seq_blk.packed = vec![0u8; 3 + len.div_ceil(4) + PACKED_TAIL_PAD];
 
     let old_seq = &seq_blk.blastna[1..1 + len];
 
