@@ -40,8 +40,6 @@ pub struct PreparedSubject {
     pub rc: Arc<[u8]>,
     /// Plus strand packed to NCBI2NA (3 padding bytes + 4 bases/byte).
     pub packed_plus: Arc<[u8]>,
-    /// Minus strand packed to NCBI2NA (3 padding bytes + 4 bases/byte).
-    pub packed_minus: Arc<[u8]>,
     /// Subject with original ambiguity codes restored from n_mask (the
     /// Phase 2b alignment view).  Aliases the plus sequence when n_mask is
     /// empty.
@@ -73,11 +71,6 @@ fn prepare_subject_strands_shared(
         blast_compress_blastna_sequence(&mut blk);
         blk.packed
     };
-    let packed_minus = {
-        let mut blk = seqblk_from_blastna(&rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
     let (align, align_rc, n_mask_rc) = if n_mask.is_empty() {
         let align = match plus_arc {
             Some(a) => a.clone(),
@@ -100,7 +93,6 @@ fn prepare_subject_strands_shared(
     PreparedSubject {
         rc,
         packed_plus: Arc::from(packed_plus),
-        packed_minus: Arc::from(packed_minus),
         align,
         align_rc,
         n_mask_rc,

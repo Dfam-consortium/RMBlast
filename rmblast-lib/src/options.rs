@@ -13,34 +13,6 @@ pub enum MtMode {
     SplitByQueries,
 }
 
-/// Lookup-table seeding strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeedMode {
-    /// NCBI-faithful combined LUT: both forward and RC query k-mers in one table.
-    ///
-    /// Matches NCBI's BlastMBLookupTableNew behavior exactly, including:
-    /// - lut_width chosen with approx_entries = 2 × query_len (both strands counted).
-    /// - DUST applied to the query before LUT construction (masked positions excluded).
-    ///
-    /// Known efficiency flaw (shared with NCBI): ~half the raw hits are from context-1
-    /// (RC-query) k-mers and always fail the exact-match extension step for
-    /// non-palindromic sequences, wasting ~2× seeding work.
-    ///
-    /// Known edge-case bug (shared with NCBI): if word_size == lut_width no exact
-    /// extension is needed, so context-1 hits are NOT filtered and produce alignments
-    /// at wrong query coordinates for palindromic k-mers.
-    Combined,
-
-    /// Efficient single-strand LUT: forward query k-mers only.
-    ///
-    /// lut_width chosen with approx_entries = query_len (one strand).
-    /// DUST applied to the query before LUT construction.
-    /// Minus-strand seeding still uses the forward-query LUT against the revcomp
-    /// subject (matching NCBI's minus-strand scan semantics without the wasted
-    /// context-1 hits).
-    SeparateStrands,
-}
-
 /// All tunable search parameters used by the alignment engine.
 #[derive(Debug, Clone)]
 pub struct SearchParams {
@@ -91,9 +63,6 @@ pub struct SearchParams {
     pub num_threads: usize,
     pub mt_mode: MtMode,
 
-    // Seeding strategy
-    pub seed_mode: SeedMode,
-
 }
 
 impl Default for SearchParams {
@@ -113,7 +82,6 @@ impl Default for SearchParams {
             mask_level: 101,
             num_threads: 1,
             mt_mode: MtMode::SplitByDb,
-            seed_mode: SeedMode::Combined,
         }
     }
 }

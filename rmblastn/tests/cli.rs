@@ -287,7 +287,6 @@ fn bad_option_values_are_rejected() {
         (&["--gapextend", "-1"], "--gapextend"),
         (&["--num-threads", "0"], "--num-threads"),
         (&["--mt-mode", "2"], "--mt-mode"),
-        (&["--seed-mode", "junk"], "--seed-mode"),
         (&["--evalue", "0"], "--evalue"),
         (&["--evalue", "-1"], "--evalue"),
         (&["--evalue", "nan"], "--evalue"),

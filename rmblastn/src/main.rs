@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use rmblast_lib::matrix::ScoreMatrix;
 use rmblast_lib::hits::Strand;
 use rmblast_lib::ka_stats::{self, KaContext, MatrixCliOverrides, RmStats};
-use rmblast_lib::options::{MtMode, SearchParams, SeedMode};
+use rmblast_lib::options::{MtMode, SearchParams};
 use rmblast_lib::output::{
     outfmt_needs_stats, parse_outfmt, write_tabular, write_pairwise_program_header,
     write_pairwise_results, write_pairwise_footer, AlignResult, OutField,
@@ -219,17 +219,6 @@ struct Args {
     #[arg(long)]
     gilist: Option<String>,
 
-    /// Lookup-table seeding strategy: combined (NCBI-faithful) or separate (efficient).
-    ///
-    /// combined: indexes k-mers from both forward and RC query in one table, matching
-    ///   NCBI's BlastMBLookupTableNew exactly (including ~2× wasted context-1 hits).
-    ///   DUST is applied to the query before LUT construction.
-    ///
-    /// separate: indexes only forward-query k-mers; minus-strand seeding uses the
-    ///   same LUT against the revcomp subject.  No wasted context-1 hits.
-    ///   DUST is applied to the query before LUT construction.
-    #[arg(long, default_value = "combined")]
-    seed_mode: String,
 
     /// Write all merged Phase 2a prelim HSPs to this file before Phase 2b runs.
     /// Format: sseqid TAB strand TAB qstart TAB qend TAB sstart TAB send TAB score
@@ -540,11 +529,6 @@ fn main() -> Result<()> {
     let matrix = ScoreMatrix::from_file(&matrix_path)
         .with_context(|| format!("loading matrix '{}'", matrix_path))?;
 
-    let seed_mode = match args.seed_mode.as_str() {
-        "combined" => SeedMode::Combined,
-        "separate" | "separate-strands" | "SeparateStrands" => SeedMode::SeparateStrands,
-        other => anyhow::bail!("--seed-mode '{}': expected combined or separate", other),
-    };
 
     let dust = parse_dust(&args.dust)?;
 
@@ -566,7 +550,6 @@ fn main() -> Result<()> {
         mask_level: if args.mask_level < 0 { 101 } else { args.mask_level as u32 },
         num_threads: args.num_threads,
         mt_mode: if args.mt_mode == 1 { MtMode::SplitByQueries } else { MtMode::SplitByDb }, // 0 or 1 (checked)
-        seed_mode,
     };
 
     let output_format = parse_output_format(&args.outfmt)?;
