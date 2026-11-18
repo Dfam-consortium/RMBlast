@@ -191,11 +191,15 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   `interval`/`fasta`/`acclist`, and `-hard_masking`. Everything else, including
   `-infmt blastdb`, the ASN.1 and XML `-outfmt` variants, and `-parse_seqids`,
   exits non-zero with a "not ported" message rather than emitting near-miss
-  output. Sequence identifiers are echoed from the input defline; NCBI's title
-  cleanup strips spaces just inside parentheses, which is the only output
-  difference we have found on any tested input. `run_dustmasker_compare.sh`
-  checks what is implemented byte for byte against NCBI dustmasker 2.17.0,
-  across all three output formats.
+  output. Deflines are printed as NCBI prints them, through a port of NCBI's
+  title cleanup: spaces collapsed, the line cut at a tab, trailing periods
+  stripped, HTML entities decoded. Like NCBI, a final non-ASCII character is cut
+  to its first byte. The output matched NCBI dustmasker 2.17.0 byte for byte
+  across all three output formats, on 13,000 random deflines and on the
+  repository's own tests (`dustmasker/tests/`).
+  Where NCBI is lenient, this port refuses: an empty record (NCBI also aborts),
+  any character that is not a nucleotide code (NCBI drops it), and a negative
+  `-window` or `-linker` (NCBI clamps them).
 - The `blastdbcmd` and `blastdb_aliastool` wrappers cover what RepeatMasker and
   RepeatModeler call, not the full tools. Unsupported options exit non-zero.
 - `blastdbcmd` reads the `.2bit` our `makeblastdb` writes or a FASTA beside the
