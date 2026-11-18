@@ -132,6 +132,12 @@ Environment variables (no editing required):
   `../target/release/<name>` (source checkout), relative to the wrapper itself
   with symlinks followed.
 - `RMBLAST_VERIFY_DIR` — overrides the bundle directory.
+- `RMBLAST_VERIFY_BUNDLE_MAX_MB` — a mismatch bundle copies the database when
+  it is at most this many MB (default 200) and symlinks it otherwise, so a
+  genome-sized subject is not copied into every bundle.
+- Timing and peak RSS in `verify_log.tsv` need GNU `time` at `/usr/bin/time`;
+  without it the engines still run and the log records `-`.
+- A query on stdin (`-query -`) is saved once and given to both engines.
 - `RMBLAST_VERIFY_DUSTMASKER` — `ncbi` (default) or `rust`.  Only `rmblastn` is
   A/B-compared here; `makeblastdb`, `blastdbcmd` and `dustmasker` defer to the
   real NCBI binaries so that any reported diff is attributable to `rmblastn`
@@ -139,12 +145,12 @@ Environment variables (no editing required):
 - `blastdb_aliastool` is the same pass-through copy as in `../wrappers/`: it
   writes the GI list out as plain text, which both engines accept.
 - `-version` / `--version` / `-v` is answered by the wrapper, not passed
-  through.  The Rust binary prints clap's plain `rmblastn 3.0.3`; both
+  through.  The Rust binary prints clap's plain `rmblastn <ver>`; both
   `rmblastn` wrappers reshape that into NCBI's form:
 
   ```
-  rmblastn: 3.0.3+
-   Package: rmblast 3.0.3, Rust port
+  rmblastn: <ver>+
+   Package: rmblast <ver>, Rust port
   ```
 
   The colon and the trailing `+` are load-bearing.  Every caller-side version

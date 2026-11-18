@@ -58,11 +58,13 @@ test:
 
 # Also runs the #[ignore]d chr22 seed and ungapped-hit regression tests
 # (rmblast-lib/tests/), which compare against NCBI-derived references and add
-# about 40 s, and the CLI tests that need the `diagnostics` test hooks.  Those
-# build in their own target dir so target/release keeps the normal binary.
+# about 40 s, the CLI tests that need the `diagnostics` test hooks (built in
+# their own target dir so target/release keeps the normal binary), and the
+# wrapper tests, which use target/release.
 test-full:
 	$(CARGO) test --release -- --include-ignored
 	CARGO_TARGET_DIR=target/diagnostics $(CARGO) test --release -p rmblastn --features diagnostics --test cli
+	bash tests/wrappers.sh
 
 # Install into a top-level <prefix>/<name>-<version>/ hierarchy.
 #
