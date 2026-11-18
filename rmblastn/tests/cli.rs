@@ -20,6 +20,10 @@
 //!     nomask_nodust:  -mask_level 101 -dust no
 //!   ```
 //!
+//!   `expected_query_dash` / `expected_db_dash` are rm_defaults with
+//!   `query_dash.fa` (q1 with '-' at 8 positions) against `db.fa`, and
+//!   `query.fa` against `db_dash.fa` (4 records with '-' at 4 positions).
+//!
 //!   `expected_defaults` is the same but with only `-gapopen 20 -gapextend 5
 //!   -num_threads 1 -outfmt "6 <RM_FIELDS>"`: every other option at NCBI's default.
 
@@ -149,6 +153,24 @@ fn rm_defaults_match_ncbi_mt_mode_1() {
 fn no_mask_level_no_dust_match_ncbi() {
     let r = run_search(&["--mask-level", "101", "--dust", "no", "--num-threads", "4"]);
     assert_same_output(&r, &expected("expected_nomask_nodust.ncbi-2.17.1.tsv"));
+}
+
+/// A '-' in a sequence is N, on either side (3.0.12 encoded it as the gap
+/// sentinel: `GGC--GGG` instead of NCBI's `GGCNNGGG`, and lower scores).
+#[test]
+fn dash_in_sequence_is_n_like_ncbi() {
+    let m = data("comparison.matrix");
+    for (query, db, want) in [
+        ("query_dash.fa", "db.fa", "expected_query_dash.ncbi-2.17.1.tsv"),
+        ("query.fa", "db_dash.fa", "expected_db_dash.ncbi-2.17.1.tsv"),
+    ] {
+        let (q, d) = (data(query), data(db));
+        let mut args = search_args(&d, &q, &m);
+        args.extend(["--mask-level", "80", "--complexity-adjust", "--dust", "yes", "--num-threads", "1"]
+            .iter().map(|s| s.to_string()));
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        assert_same_output(&rmblastn(&refs), &expected(want));
+    }
 }
 
 /// NCBI's single-dash, underscore spellings give the same result as ours.

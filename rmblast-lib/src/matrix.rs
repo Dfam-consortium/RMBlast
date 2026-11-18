@@ -231,13 +231,13 @@ fn parse_karlin(rest: &str) -> Result<KarlinComment, MatrixError> {
 }
 
 fn parse_freqs(rest: &str, freqs: &mut [f64; BLASTNA_SIZE]) -> Result<(), MatrixError> {
-    use crate::encoding::IUPAC_TO_BLASTNA;
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     let mut i = 0;
     while i + 1 < tokens.len() {
         let sym_bytes = tokens[i].as_bytes();
         if sym_bytes.len() == 1 {
-            let idx = IUPAC_TO_BLASTNA[sym_bytes[0] as usize] as usize;
+            // FREQS symbols are matrix symbols ('-' and 'X' are the gap slot)
+            let idx = matrix_symbol_to_blastna(sym_bytes[0]) as usize;
             let f: f64 = tokens[i + 1].parse().map_err(|_| {
                 MatrixError::Parse(format!("bad frequency value '{}'", tokens[i + 1]))
             })?;
