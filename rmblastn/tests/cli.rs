@@ -211,6 +211,24 @@ fn pairwise_matches_ncbi() {
     }
 }
 
+/// With --min-raw-gapped-score 0 (the default), no HSP below NCBI's cutoff
+/// of 1 is reported.  3.0.12 kept score-0, zero-length preliminary HSPs
+/// (identity.matrix printed lines like "0 q1 3940 3939").
+/// `identity.matrix` is RepeatMasker's Matrices/ncbi/nt/identity.matrix.
+#[test]
+fn no_score_zero_hits_with_default_cutoff() {
+    let (db, q, m) = (data("db.fa"), data("query.fa"), data("identity.matrix"));
+    let r = rmblastn(&["--db", &db, "--query", &q, "--matrix", &m, "--gapopen", "20",
+                       "--gapextend", "5", "--word-size", "14", "--dust", "no",
+                       "--outfmt", "6 score qstart qend"]);
+    assert_eq!(r.code, Some(0), "stderr:\n{}", r.stderr);
+    assert!(r.stdout.lines().count() > 300);
+    for line in r.stdout.lines() {
+        let f: Vec<i64> = line.split('\t').map(|x| x.parse().unwrap()).collect();
+        assert!(f[0] >= 1 && f[2] >= f[1], "hit below the cutoff or empty: {line}");
+    }
+}
+
 /// NCBI's single-dash, underscore spellings give the same result as ours.
 #[test]
 fn ncbi_spelling_matches_native_spelling() {

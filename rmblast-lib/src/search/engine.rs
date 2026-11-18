@@ -460,7 +460,11 @@ fn improve_seed(
             if score > HSP_MAX_IDENT_RUN {
                 return (q_seed as u32, s_seed as u32);
             }
-            if qb <= prelim_q_start || sb <= prelim_s_start { break; }
+            // NCBI's forward check stops only at hsp->query.end (= prelim_q_start
+            // here); the subject is bounded by its buffer, whose sentinel never
+            // matches a base -- here, by index 0.  3.0.12 also stopped at
+            // prelim_s_start, which NCBI does not (review 3.6).
+            if qb <= prelim_q_start || sb == 0 { break; }
             qb -= 1; sb -= 1;
         }
         // Early return didn't fire: scan the prelim HSP region for the longest identity run.
@@ -1079,10 +1083,10 @@ fn collect_ungapped_combined<S: SeedOut>(
     // tightens at different points and the committed endpoint can differ (bug #36).
     let query_rc_full = revcomp_blastna(query);
     // KA-derived cutoff when the matrix+gap combo has ALP params (set per-search
-    // in search_db_parallel); otherwise the historical fixed min_raw_gapped_score/2.
+    // in search_db_parallel); otherwise NCBI's cutoff_score_max.
     let ungapped_cutoff = params
         .ungapped_cutoff
-        .unwrap_or(params.min_raw_gapped_score / 2);
+        .unwrap_or_else(|| params.cutoff_score_max());
     let c1 = c1_start as i64;
     let fn_ = fwd_n as i64;
 
@@ -1367,7 +1371,11 @@ fn run_phase2a_inner(
             }
         };
 
-        if prelim_score < params.min_raw_gapped_score {
+        // NCBI keeps a preliminary HSP iff score >= cutoff_score_min
+        // (blast_traceback.c:857), at least 1.  With --min-raw-gapped-score 0
+        // 3.0.12 kept score-0, zero-length prelims, which came out as hits
+        // like "0 q1 3940 3939".
+        if prelim_score < params.gapped_cutoff() {
             continue;
         }
 
@@ -1661,11 +1669,11 @@ pub fn run_phase2b(
                 params.gap_open,
                 params.gap_extend,
                 // NCBI Blast_HSPReevaluateWithAmbiguitiesGapped uses cutoff_score
-                // (= cutoffs[context].cutoff_score = min_raw_gapped_score for rmblastn)
-                // both for the run-restart logic and the final keep/delete decision
+                // (see SearchParams::gapped_cutoff) both for the run-restart
+                // logic and the final keep/delete decision
                 // (s_UpdateReevaluatedHSP: keep iff score >= cutoff_score).  Cut
                 // secondaries that re-score below this are deleted, not kept.
-                params.min_raw_gapped_score,
+                params.gapped_cutoff(),
                 is_minus,
                 q_core,
                 a_start,
@@ -2078,7 +2086,11 @@ fn run_gapped_phase<U: UngapOut>(
             }
         };
 
-        if prelim_score < params.min_raw_gapped_score {
+        // NCBI keeps a preliminary HSP iff score >= cutoff_score_min
+        // (blast_traceback.c:857), at least 1.  With --min-raw-gapped-score 0
+        // 3.0.12 kept score-0, zero-length prelims, which came out as hits
+        // like "0 q1 3940 3939".
+        if prelim_score < params.gapped_cutoff() {
             continue;
         }
 
@@ -2333,11 +2345,11 @@ fn run_gapped_phase<U: UngapOut>(
                 params.gap_open,
                 params.gap_extend,
                 // NCBI Blast_HSPReevaluateWithAmbiguitiesGapped uses cutoff_score
-                // (= cutoffs[context].cutoff_score = min_raw_gapped_score for rmblastn)
-                // both for the run-restart logic and the final keep/delete decision
+                // (see SearchParams::gapped_cutoff) both for the run-restart
+                // logic and the final keep/delete decision
                 // (s_UpdateReevaluatedHSP: keep iff score >= cutoff_score).  Cut
                 // secondaries that re-score below this are deleted, not kept.
-                params.min_raw_gapped_score,
+                params.gapped_cutoff(),
                 is_minus,
                 q_core,
                 a_start,

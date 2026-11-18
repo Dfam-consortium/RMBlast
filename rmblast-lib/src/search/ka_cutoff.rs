@@ -131,7 +131,8 @@ pub fn ungapped_cutoff(
     query_length: u64,
     avg_subj_length: u64,
 ) -> (i32, Option<KaCutoffInfo>) {
-    let fallback = min_raw_gapped_score / 2;
+    // NCBI's cutoff_score_max (see SearchParams::cutoff_score_max)
+    let fallback = if min_raw_gapped_score > 0 { min_raw_gapped_score / 2 } else { 1 };
     match lookup_ka(matrix_name, gap_open, gap_extend) {
         Some((lambda, k)) if avg_subj_length > 0 && lambda > 0.0 && k > 0.0 => {
             // searchsp = MIN(subj_len, 2*query_len) * subj_len   (Int8 in NCBI)

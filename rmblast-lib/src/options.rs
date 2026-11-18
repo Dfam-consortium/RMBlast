@@ -65,6 +65,29 @@ pub struct SearchParams {
 
 }
 
+impl SearchParams {
+    /// The gapped HSP cutoff, NCBI's `hit_params->cutoffs[ctx].cutoff_score`.
+    /// With a positive --min-raw-gapped-score it is that value (rmblastn's
+    /// matrix-only scoring, BlastHitSavingParametersUpdate).  With 0 NCBI
+    /// derives it from E = 10, starting from 1: for a matrix without
+    /// Karlin-Altschul statistics that is exactly 1, and for one with them it
+    /// is the same E = 10 threshold the --ncbi-compat E-value cull applies.
+    /// So it is never below 1: 3.0.12 used 0 and kept score-0 remainders
+    /// (identity.matrix printed hits like q 3940-3939 with score 0).
+    pub fn gapped_cutoff(&self) -> i32 {
+        self.min_raw_gapped_score.max(1)
+    }
+
+    /// NCBI's `cutoff_score_max`, which caps the ungapped cutoff: half of a
+    /// positive --min-raw-gapped-score (matrix-only scoring), else the
+    /// E-derived gapped cutoff, which is at least 1 -- exactly 1 for a matrix
+    /// without Karlin-Altschul statistics (the RMBlast fallback in
+    /// BlastInitialWordParametersUpdate then uses it as the ungapped cutoff).
+    pub fn cutoff_score_max(&self) -> i32 {
+        if self.min_raw_gapped_score > 0 { self.min_raw_gapped_score / 2 } else { 1 }
+    }
+}
+
 impl Default for SearchParams {
     fn default() -> Self {
         Self {
