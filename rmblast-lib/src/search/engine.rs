@@ -559,6 +559,10 @@ pub struct QueryLookup {
     /// of the time for short queries against many subjects).  `None` with
     /// dust off, or for [`build_query_lookup_premask`].
     masked_query: Option<Vec<u8>>,
+    /// Reverse complement of the query the table was built from, made on
+    /// first use and shared by every subject (3.0.12 recomputed it for each
+    /// subject, three times).
+    query_rc: std::sync::OnceLock<Vec<u8>>,
 }
 
 /// Build the lookup table from the query sequence.
@@ -583,7 +587,8 @@ pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, 
     let lookup = combined_lookup(query_bases, params);
 
     let masked_query = params.dust.then(|| fwd_query_scan.clone());
-    (QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1, masked_query }, fwd_query_scan)
+    (QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1, masked_query,
+                   query_rc: std::sync::OnceLock::new() }, fwd_query_scan)
 }
 
 /// Build a lookup table from a *pre-masked* query (DUST already applied).
@@ -596,7 +601,8 @@ pub fn build_query_lookup_premask(masked_query: &[u8], params: &SearchParams) ->
 
     let lookup = combined_lookup(query_bases, params);
 
-    QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1, masked_query: None }
+    QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1, masked_query: None,
+                  query_rc: std::sync::OnceLock::new() }
 }
 
 /// The lookup table over both strands of the query, as NCBI's
@@ -627,6 +633,15 @@ fn combined_lookup(query_bases: &[u8], params: &SearchParams) -> NaLookup {
 impl QueryLookup {
     pub fn lut_word_length(&self) -> u32 {
         self.lookup.lut_word_length() as u32
+    }
+
+    /// Reverse complement of `query` (sentinels included), computed once.
+    /// The caller passes the query this table was built from, as for
+    /// [`Self::masked`].
+    fn query_rc(&self, query: &[u8]) -> &[u8] {
+        let rc = self.query_rc.get_or_init(|| revcomp_blastna(query));
+        debug_assert_eq!(rc.len(), query.len(), "lookup built from a different query");
+        rc
     }
 
     /// The query used for word extension: DUST-masked when dust is on.  Takes
@@ -708,11 +723,11 @@ pub fn search_with_query_lookup(
     let mut ungapped = Vec::new();
     // Combined LUT: single scan of FWD subject, interleaved plus/minus hits.
     collect_ungapped_combined(
-        query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
+        query, ql.query_rc(query), masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
     );
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, subj_rc, subject_id,
+        query, ql.query_rc(query), query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
         ql.lut_word_length(), n_mask, prep,
     );
@@ -766,11 +781,11 @@ pub fn search_with_query_lookup_seeds(
 
     let mut ungapped = Vec::new();
     collect_ungapped_combined(
-        query, masked_query_s, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
+        query, ql.query_rc(query), masked_query_s, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
     );
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, subj_rc, subject_id,
+        query, ql.query_rc(query), query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
         ql.lut_word_length(), n_mask, prep,
     );
@@ -824,11 +839,11 @@ pub fn search_with_query_lookup_ungapped(
 
     let mut ungapped = Vec::new();
     collect_ungapped_combined(
-        query, masked_query_u, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
+        query, ql.query_rc(query), masked_query_u, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
     );
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, subj_rc, subject_id,
+        query, ql.query_rc(query), query_id, subject_plus, subj_rc, subject_id,
         q_len, s_len, ungapped, params, matrix, ungap_out,
         ql.lut_word_length(), n_mask, prep,
     );
@@ -1049,6 +1064,38 @@ pub fn sort_hit_list_order_by_oid(
 }
 
 
+/// Per-thread scratch for collect_ungapped_combined; `put_back` returns it.
+struct ScanScratch {
+    batch: Vec<BlastOffsetPair>,
+    diag_hash: BlastDiagHash,
+}
+
+thread_local! {
+    static SCAN_SCRATCH: std::cell::RefCell<Option<ScanScratch>> = const { std::cell::RefCell::new(None) };
+}
+
+impl ScanScratch {
+    /// This thread's scratch (or a new one), with at least `batch_len`
+    /// offset slots and an empty diagonal hash.
+    fn take(batch_len: usize) -> Self {
+        let mut sc = SCAN_SCRATCH.with(|c| c.borrow_mut().take()).unwrap_or_else(|| ScanScratch {
+            batch: Vec::new(),
+            diag_hash: BlastDiagHash::new(),
+        });
+        if sc.batch.len() < batch_len {
+            sc.batch.resize(batch_len, BlastOffsetPair::default());
+        }
+        sc.diag_hash.clear();
+        sc
+    }
+}
+
+impl ScanScratch {
+    fn put_back(self) {
+        SCAN_SCRATCH.with(|c| *c.borrow_mut() = Some(self));
+    }
+}
+
 /// Combined-LUT Phase 1: single FWD-subject scan, interleaved plus/minus hits.
 ///
 /// Mirrors NCBI's BlastNaWordFinder with a combined (two-context) lookup table:
@@ -1062,6 +1109,7 @@ pub fn sort_hit_list_order_by_oid(
 #[allow(clippy::too_many_arguments)]
 fn collect_ungapped_combined<S: SeedOut>(
     query: &[u8],
+    query_rc_full: &[u8],
     ext_query: &[u8],
     q_len: u32,
     subject_plus: &[u8],
@@ -1093,7 +1141,6 @@ fn collect_ungapped_combined<S: SeedOut>(
     // (FWD_query, RC_subject) frame is score-equivalent but NOT decision-equivalent: the
     // adaptive-xdrop right extension scores bases in a different order, so X_current
     // tightens at different points and the committed endpoint can differ (bug #36).
-    let query_rc_full = revcomp_blastna(query);
     // KA-derived cutoff when the matrix+gap combo has ALP params (set per-search
     // in search_db_parallel); otherwise NCBI's cutoff_score_max.
     let ungapped_cutoff = params
@@ -1103,15 +1150,20 @@ fn collect_ungapped_combined<S: SeedOut>(
     let fn_ = fwd_n as i64;
 
     let batch_size = (4096usize).max(lookup.longest_chain() as usize + 4096);
-    let mut batch  = vec![BlastOffsetPair::default(); batch_size];
+    // The offset buffer and the diagonal hash are reused per thread: 3.0.12
+    // allocated and zeroed both for every subject, which was half of all the
+    // work for a short query against many subjects.  The scanner writes
+    // batch[0..n) before anything reads it, and a cleared hash is a new one.
+    let mut scratch = ScanScratch::take(batch_size);
+    let batch: &mut [BlastOffsetPair] = &mut scratch.batch[..batch_size];
 
     // Single shared hash table for both strands, matching NCBI's ewp->hash_table which
     // covers both context-0 (plus) and context-1 (minus) seeds in one 512-bucket table.
-    let mut diag_hash = BlastDiagHash::new();
+    let diag_hash = &mut scratch.diag_hash;
 
     let mut scan_range = [0i32, end_range];
     loop {
-        let n = lookup.scan(packed_fwd_subject, &mut batch, batch_size as i32, &mut scan_range);
+        let n = lookup.scan(packed_fwd_subject, batch, batch_size as i32, &mut scan_range);
 
         for i in 0..n as usize {
             let q0_combined = batch[i].q_off as i64;
@@ -1245,7 +1297,7 @@ fn collect_ungapped_combined<S: SeedOut>(
                 // adjacent regions, diverging from NCBI and dedup-suppressing real seeds (#36).
                 let qn = q_len - 1 - q_off;
                 let sn = s_len - 1 - s_off;
-                let raw_ncbi = extend_ungapped(&query_rc_full, subject_plus, qn, sn, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
+                let raw_ncbi = extend_ungapped(query_rc_full, subject_plus, qn, sn, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
                 // Map (RC_q, FWD_s) result back to (FWD_q, RC_s) for UngappedRecord storage.
                 let raw_minus = UngappedResult {
                     score:   raw_ncbi.score,
@@ -1271,7 +1323,8 @@ fn collect_ungapped_combined<S: SeedOut>(
 
         if scan_range[0] > end_range { break; }
     }
-    let _ = step; // scan_step is encoded in the packed subject scan; kept for parity with collect_ungapped
+    let _ = step; // scan_step is encoded in the packed subject scan
+    scratch.put_back();
 }
 
 /// Phase 2a inner loop: for each pre-sorted ungapped hit, run preliminary gapped alignment
@@ -1765,7 +1818,7 @@ pub fn search_phase2a(
 
     let mut ungapped = Vec::new();
     collect_ungapped_combined(
-        query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
+        query, ql.query_rc(query), masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
         ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
     );
 
@@ -1794,12 +1847,12 @@ pub fn search_phase2a(
             .then_with(|| a_sk.cmp(&b_sk))
     });
 
-    let query_rc = revcomp_blastna(query);
+    let query_rc = ql.query_rc(query);
     let qa_len   = q_len;
     let sa_len   = s_len;
 
     let mut prelims = run_phase2a_inner(
-        query, &query_rc, subject_plus, qa_len, sa_len, &ungapped,
+        query, query_rc, subject_plus, qa_len, sa_len, &ungapped,
         params, matrix, ql.lut_word_length(), chunk_offset,
     );
 
@@ -1888,6 +1941,7 @@ fn prelim_pivot(ung: &UngappedRecord, qa_len: u32, sa_len: u32, lw: u32) -> (u32
 /// alignment with traceback using xdrop_gap_final (100).
 fn run_gapped_phase<U: UngapOut>(
     query: &[u8],
+    query_rc: &[u8],
     query_id: &str,
     subject_plus: &[u8],
     _subj_rc: &[u8],
@@ -1963,7 +2017,6 @@ fn run_gapped_phase<U: UngapOut>(
     // seed always lands in the LEFT (reverse) extension, matching BLAST_GappedAlignmentWithTraceback.
     // Results are converted back to FWD-genomic + RC-subject before storage.
     // NCBI: mask_at_hash=TRUE — masked query only affects lookup table, not gapped alignment.
-    let query_rc        = revcomp_blastna(query);
     let qa_len = (query.len() - 2) as u32;   // non-sentinel bases in query
     let sa_len = (subject_plus.len() - 2) as u32; // non-sentinel bases in subject
 
