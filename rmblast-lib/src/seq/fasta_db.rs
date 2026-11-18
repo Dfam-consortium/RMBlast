@@ -26,6 +26,8 @@ pub enum FastaDbError {
     Fasta(String),
     #[error("sequence '{0}' not found in FASTA database")]
     NotFound(String),
+    #[error("{0}")]
+    TooLong(String),
     /// Two records share an id.  Subjects are looked up by id, so one of them
     /// would never be searched; reject the database instead.
     #[error("duplicate sequence id '{id}' (records {first} and {second})")]
@@ -58,6 +60,7 @@ impl FastaDb {
             .next_record()
             .map_err(|e| FastaDbError::Fasta(e.to_string()))?
         {
+            crate::seq::check_seq_len(&rec.id, rec.len()).map_err(FastaDbError::TooLong)?;
             let dna_size = rec.len() as u32;
             let idx = sequences.len();
             if let Some(&first) = name_to_index.get(&rec.id) {

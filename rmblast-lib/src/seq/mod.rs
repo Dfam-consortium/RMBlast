@@ -14,6 +14,20 @@ use anyhow::Result;
 use crate::blast::util::{blast_compress_blastna_sequence, seqblk_from_blastna};
 use crate::encoding::{revcomp_blastna, BLASTNA_COMPLEMENT};
 
+/// The longest query or subject the engine accepts: its coordinates are i32,
+/// as NCBI's are Int4.  Longer sequences used to wrap and silently give no
+/// hits, so they are refused instead.
+pub const MAX_SEQ_LEN: usize = i32::MAX as usize;
+
+/// Err(message) if a sequence of `len` bases is longer than [`MAX_SEQ_LEN`].
+pub fn check_seq_len(id: &str, len: usize) -> std::result::Result<(), String> {
+    if len > MAX_SEQ_LEN {
+        return Err(format!(
+            "sequence '{id}' has {len} bases; the longest supported is {MAX_SEQ_LEN} (2^31 - 1)"));
+    }
+    Ok(())
+}
+
 /// Per-subject derived strands, shared across searches.
 ///
 /// Everything here depends only on the subject bytes + its n_mask (the

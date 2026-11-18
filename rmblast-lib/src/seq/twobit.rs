@@ -129,6 +129,9 @@ pub enum TwoBitError {
     /// where (byte offsets).
     #[error("corrupt 2bit file: {0}")]
     Corrupt(String),
+    /// A sequence longer than the engine supports (`seq::MAX_SEQ_LEN`).
+    #[error("{0}")]
+    TooLong(String),
     /// Two index entries share a name; see `FastaDbError::DuplicateId`.
     #[error("duplicate sequence name '{name}' (index entries {first} and {second})")]
     DuplicateName { name: String, first: usize, second: usize },
@@ -249,6 +252,7 @@ impl TwoBitFile {
             let what = |part: &str| format!("{part} of '{}'", seq.name);
             let base = seq.file_offset as usize;
             seq.dna_size = r32(base, &what("dnaSize"))?;
+            crate::seq::check_seq_len(&seq.name, seq.dna_size as usize).map_err(TwoBitError::TooLong)?;
             let n_block_count = r32(base + 4, &what("nBlockCount"))? as usize;
             let n_starts_off = base + 8;
             let n_sizes_off = skip_u32s(n_starts_off, n_block_count, &what("nBlockStarts"))?;
@@ -550,7 +554,7 @@ mod tests {
             // the bogus 3rd entry parses out of record data; a later check catches it
             ("seqCount past index", { let mut v = full.clone(); put_u32(&mut v, 8, 3); v }, ""),
             ("offset past end", { let mut v = full.clone(); put_u32(&mut v, 18, 1 << 30); v }, "dnaSize of 'a'"),
-            ("huge dnaSize", { let mut v = full.clone(); put_u32(&mut v, rec_a, 0xFFFF_FFF0); v }, "bases"),
+            ("huge dnaSize", { let mut v = full.clone(); put_u32(&mut v, rec_a, 0x7FFF_FFF0); v }, "bases"),
             ("huge nBlockCount", { let mut v = full.clone(); put_u32(&mut v, rec_a + 4, 0x4000_0000); v }, "nBlockStarts of 'a'"),
             ("header only", { let mut v = full[..16].to_vec(); put_u32(&mut v, 8, 1); v }, "sequences"),
         ];
@@ -563,6 +567,22 @@ mod tests {
                 Ok(_) => panic!("{label}: loaded"),
             }
         }
+    }
+
+    /// A 2bit can hold up to 2^32 - 1 bases per sequence; the engine's
+    /// coordinates stop at 2^31 - 1 (3.0.12 wrapped and found nothing).
+    #[test]
+    fn sequences_over_2_31_are_refused() {
+        let mut v = twobit_bytes(&[("big", "ACGT")]);
+        let rec = u32::from_le_bytes(v[16 + 4..16 + 8].try_into().unwrap()) as usize;
+        put_u32(&mut v, rec, 1 << 31);
+        match TwoBitFile::from_bytes(v) {
+            Err(e @ TwoBitError::TooLong(_)) => assert!(e.to_string().contains("'big' has 2147483648 bases"), "{e}"),
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("loaded"),
+        }
+        assert!(crate::seq::check_seq_len("q", i32::MAX as usize).is_ok());
+        assert!(crate::seq::check_seq_len("q", i32::MAX as usize + 1).is_err());
     }
 
     /// N blocks at or past the sequence end are clamped, as before, and a

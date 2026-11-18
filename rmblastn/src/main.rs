@@ -20,7 +20,7 @@ use rmblast_lib::output::{
 };
 use rmblast_lib::search::{apply_mask_level, sort_hit_list_order_by_oid, subject_oids, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
-use rmblast_lib::seq::{FastaReader, SubjectDb};
+use rmblast_lib::seq::{check_seq_len, FastaReader, SubjectDb};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Argument-normalization shim for NCBI single-dash compatibility
@@ -733,6 +733,7 @@ fn main() -> Result<()> {
         MtMode::SplitByDb => {
             for qrec in query_reader {
                 let qrec = qrec.context("reading query FASTA")?;
+                check_seq_len(&qrec.id, qrec.len()).map_err(anyhow::Error::msg)?;
                 let full_q_len = qrec.len() as u32;
                 let mut results = search_db_parallel(
                     &qrec.seq, &qrec.id, &subject_names, &db, &params, &matrix,
@@ -776,6 +777,9 @@ fn main() -> Result<()> {
             let all_queries: Vec<_> = query_reader
                 .collect::<Result<Vec<_>, _>>()
                 .context("reading query FASTA")?;
+            for q in &all_queries {
+                check_seq_len(&q.id, q.len()).map_err(anyhow::Error::msg)?;
+            }
             let n = all_queries.len();
             let workers = rayon::current_num_threads();
             let window = 4 * workers.max(4);
