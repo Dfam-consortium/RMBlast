@@ -200,6 +200,53 @@ pub struct PrelimCullParams {
     pub resurrect_slack: u32,
 }
 
+/// Accepted query ranges for the mask-level and prelim-cull sweeps.
+///
+/// Both sweeps ask whether any accepted range overlaps a new one enough.
+/// 3.0.12 kept the ranges in one vector sorted by start: each accept was a
+/// `Vec::insert` (quadratic), and each check walked back over every range
+/// within the longest accepted span, so one long range made every later
+/// check scan them all.  Here the ranges sit in one ordered map per span
+/// class (power of two), and each class is searched back only as far as its
+/// own longest span.  A range skipped that way ends before the new one
+/// starts, which every caller's test rejects, so the answer is unchanged.
+type SpanMap<T> = std::collections::BTreeMap<(u32, u32), (u32, T)>;
+
+struct SpanIndex<T: Copy> {
+    /// Per class: longest span seen, and (start, insertion seq) -> (end, payload).
+    classes: Vec<(u32, SpanMap<T>)>,
+    seq: u32,
+}
+
+impl<T: Copy> SpanIndex<T> {
+    fn new() -> Self {
+        SpanIndex { classes: (0..33).map(|_| (0, std::collections::BTreeMap::new())).collect(), seq: 0 }
+    }
+
+    fn insert(&mut self, qs: u32, qe: u32, payload: T) {
+        let span = qe - qs;
+        let class = &mut self.classes[(32 - span.leading_zeros()) as usize];
+        class.0 = class.0.max(span);
+        class.1.insert((qs, self.seq), (qe, payload));
+        self.seq += 1;
+    }
+
+    /// True if `test(start, end, payload)` holds for some range with start in
+    /// [`qs` - its class's longest span, `hi`], i.e. every range that can end
+    /// at or after `qs` and starts no later than `hi`.
+    fn any(&self, qs: u32, hi: u32, mut test: impl FnMut(u32, u32, T) -> bool) -> bool {
+        for (max_span, map) in &self.classes {
+            if map.is_empty() { continue; }
+            let lo = qs.saturating_sub(*max_span);
+            if lo > hi { continue; }
+            for (&(qs_j, _), &(qe_j, t)) in map.range((lo, 0)..=(hi, u32::MAX)) {
+                if test(qs_j, qe_j, t) { return true; }
+            }
+        }
+        false
+    }
+}
+
 /// Slop (bp) for deciding that a prelim endpoint abuts a query-chunk edge.
 const CULL_BOUNDARY_EPS: u32 = 5;
 
@@ -255,8 +302,7 @@ pub fn cull_prelims(
 
     let mut keep: Vec<Vec<bool>> =
         prelims_by_subject.iter().map(|v| vec![true; v.len()]).collect();
-    let mut accepted: Vec<(u32, u32, i64)> = Vec::new(); // qs ASC
-    let mut max_span: u32 = 0;
+    let mut accepted: SpanIndex<i64> = SpanIndex::new();
     for c in &cands {
         let span = c.qe.saturating_sub(c.qs) as i64;
         if span == 0 {
@@ -264,33 +310,19 @@ pub fn cull_prelims(
         }
         if abuts_boundary(c.qs, chunk_boundaries) || abuts_boundary(c.qe, chunk_boundaries) {
             // Chunk-truncated span: exempt from culling, but let it dominate.
-            let pos = accepted.partition_point(|a| a.0 < c.qs);
-            accepted.insert(pos, (c.qs, c.qe, c.score));
-            max_span = max_span.max(c.qe - c.qs);
+            accepted.insert(c.qs, c.qe, c.score);
             continue;
         }
-        let upper = accepted.partition_point(|a| a.0 < c.qe);
-        let min_start = c.qs.saturating_sub(max_span);
-        let mut masked = false;
-        let mut i = upper;
-        while i > 0 {
-            i -= 1;
-            let (qs_j, qe_j, sc_j) = accepted[i];
-            if qs_j < min_start { break; }
-            if qe_j <= c.qs { continue; }
-            if sc_j * 100 < c.score * cull_margin_pct as i64 { continue; }
+        let masked = accepted.any(c.qs, c.qe - 1, |qs_j, qe_j, sc_j| {
+            if qe_j <= c.qs { return false; }
+            if sc_j * 100 < c.score * cull_margin_pct as i64 { return false; }
             let ovlp = (qe_j.min(c.qe) as i64) - (qs_j.max(c.qs) as i64);
-            if ovlp * 100 / span >= cull_coverage as i64 {
-                masked = true;
-                break;
-            }
-        }
+            ovlp * 100 / span >= cull_coverage as i64
+        });
         if masked {
             keep[c.subj][c.idx] = false;
         } else {
-            let pos = accepted.partition_point(|a| a.0 < c.qs);
-            accepted.insert(pos, (c.qs, c.qe, c.score));
-            max_span = max_span.max(c.qe - c.qs);
+            accepted.insert(c.qs, c.qe, c.score);
         }
     }
     keep
@@ -942,9 +974,7 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
     let n = results.len();
     if n == 0 { return; }
 
-    // (q_start, q_end, score) — sorted by q_start for binary search.
-    let mut accepted: Vec<(u32, u32, i32)> = Vec::new();
-    let mut max_accepted_span: u32 = 0;
+    let mut accepted: SpanIndex<i32> = SpanIndex::new();
     let mut keep = vec![true; n];
 
     for i in 0..n {
@@ -969,28 +999,16 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
         // NCBI's overlap is then 0 and 0 >= 0.  At any higher level touching
         // cannot mask, so only real overlaps are examined.
         let touching = mask_level == 0;
-        let upper = if touching {
-            accepted.partition_point(|a| a.0 <= qe_i)
-        } else {
-            accepted.partition_point(|a| a.0 < qe_i)
-        };
-        let min_start = qs_i.saturating_sub(max_accepted_span);
+        let hi = if touching { qe_i } else { qe_i - 1 };
 
-        let mut masked = false;
-        let mut idx = upper;
-        while idx > 0 {
-            idx -= 1;
-            let (qs_j, qe_j, sc_j) = accepted[idx];
-            if qs_j < min_start {
-                break;
-            }
+        let masked = accepted.any(qs_i, hi, |qs_j, qe_j, sc_j| {
             if qe_j < qs_i || (qe_j == qs_i && !touching) {
-                continue;
+                return false;
             }
             // Mirror NCBI s_HSPQueryRangeIsMasklevelContained: skip only if accepted
             // entry has strictly lower score (in_score > tree_hsp->score → return 0).
             if sc_j < sc_i {
-                continue;
+                return false;
             }
             let ovlp = (qe_j.min(qe_i) as i64) - (qs_j.max(qs_i) as i64);
             // NCBI s_HSPQueryRangeIsMasklevelContained (blast_itree.c):
@@ -998,21 +1016,13 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
             // double first.  Integer ovlp*100/span differs where the double
             // quotient rounds down, e.g. 29/100 -> 28.999..., at levels 29, 57, 58.
             let perc = (100.0 * (ovlp as f64 / q_span_i as f64)) as i64;
-            if perc >= mask_level as i64 {
-                masked = true;
-                break;
-            }
-        }
+            perc >= mask_level as i64
+        });
 
         if masked {
             keep[i] = false;
         } else {
-            let pos = accepted.partition_point(|a| a.0 < qs_i);
-            accepted.insert(pos, (qs_i, qe_i, sc_i));
-            let span = qe_i - qs_i;
-            if span > max_accepted_span {
-                max_accepted_span = span;
-            }
+            accepted.insert(qs_i, qe_i, sc_i);
         }
     }
 
@@ -3801,6 +3811,58 @@ mod tests {
         let mut r = touch();
         apply_mask_level(&mut r, 1, &[]);
         assert_eq!(r.len(), 2);
+    }
+
+    /// Random HSPs in a small query range (so overlaps, touches and both
+    /// strands are common), distinct scores so the sort is score order.
+    fn random_hsps(n: usize, seed: u64) -> Vec<AlignResult> {
+        let mut x = seed;
+        let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut scores: Vec<i32> = (0..n as i32).map(|i| 1000 + 7 * i).collect();
+        for i in (1..n).rev() { scores.swap(i, (rnd() % (i as u64 + 1)) as usize); }
+        (0..n).map(|i| {
+            let qs = (rnd() % 2000) as u32;
+            let len = [1u32, 2, 50, 100, 400, 1500][(rnd() % 6) as usize];
+            let mut r = make_result(scores[i], qs, qs + len, 0, len);
+            r.hsp.q_len = 4000;
+            if rnd() % 2 == 0 { r.hsp.strand = Strand::Minus; }
+            r
+        }).collect()
+    }
+
+    /// apply_mask_level against a brute-force reading of NCBI's rule: in
+    /// score order, an HSP is masked if any kept, at-least-as-good HSP covers
+    /// (int)(100 * (overlap / span)) >= level of its query span, minus-strand
+    /// coordinates shifted by +1, touching counting only at level 0.
+    #[test]
+    fn mask_level_matches_brute_force() {
+        for seed in 1..=20u64 {
+            for &level in &[0u32, 1, 29, 57, 58, 80, 99] {
+                let input = random_hsps(600, seed * 0x9E3779B97F4A7C15);
+                let mut want: Vec<AlignResult> = Vec::new();
+                let mut sorted = input.clone();
+                sorted.sort_by_key(|r| std::cmp::Reverse(r.hsp.score));
+                let range = |r: &AlignResult| {
+                    let d = (r.hsp.strand == Strand::Minus) as u32;
+                    (r.hsp.q_start + d, r.hsp.q_end + d)
+                };
+                for r in sorted {
+                    let (qs, qe) = range(&r);
+                    let span = (qe - qs) as f64;
+                    let masked = want.iter().any(|k| {
+                        let (ks, ke) = range(k);
+                        let ovlp = ke.min(qe) as i64 - ks.max(qs) as i64;
+                        (ovlp > 0 || (ovlp == 0 && level == 0))
+                            && (100.0 * (ovlp as f64 / span)) as i64 >= level as i64
+                    });
+                    if !masked { want.push(r); }
+                }
+                let mut got = input.clone();
+                apply_mask_level(&mut got, level, &[]);
+                let key = |v: &[AlignResult]| v.iter().map(|r| r.hsp.score).collect::<Vec<_>>();
+                assert_eq!(key(&got), key(&want), "seed {seed} level {level}");
+            }
+        }
     }
 
     // Port of NCBI's nuclwordfinder_unit_test.cpp (testExtend).
