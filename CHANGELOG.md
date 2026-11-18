@@ -3,6 +3,45 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+### Behaviour changes
+Input that used to run is now refused with an error that names the problem.
+Each case below either gave wrong or incomplete output, or hung or crashed
+- Bad option values are usage errors: --word-size below 4, --gapopen below 0,
+  --gapextend below 1, gap costs over 1000000, --num-threads 0, --mt-mode other
+  than 0 or 1, an unknown --seed-mode, --evalue that is not a positive number,
+  negative --xdrop-* or --min-raw-gapped-score, negative -matrix_lambda/_k/_alpha,
+  and any --dust value except yes, no, true or false. NCBI also accepts negative
+  gap costs and -mt_mode 2; we don't. NCBI's -dust 'level window linker' form is
+  refused, where it used to run silently with the default parameters
+- --gapopen and --gapextend are required. Their defaults were 4/4; NCBI's are
+  0/0, which NCBI itself rejects
+- A database with two sequences of the same id is refused. Before, the first
+  was never searched and the last was searched twice
+- An empty database is refused
+- A query or database sequence longer than 2^31 - 1 bases is refused instead of
+  silently giving no hits
+
+### Fixed
+- --word-size defaulted to 8; it now defaults to 11, as in NCBI. RepeatMasker
+  and RepeatModeler always pass it
+- --mt-mode 1 hung forever if the search of one query panicked; it now exits
+  with an error naming the query
+- Word size 0 to 2 panicked and word size 3 hung; negative gap costs, or gap
+  costs near 2^30, hung
+- A '-' in a query or database sequence was treated as a gap code: it printed
+  as '-' and scored differently from NCBI. It is now N, as in NCBI
+- A truncated or corrupt .2bit file panicked, or loaded with fewer sequences;
+  it is now an error that says what is wrong and where
+- A gilist that matches no sequence and an empty query file used to exit with
+  no output and no message. Both now warn on stderr (the empty query with
+  NCBI's own warning) and give the normal empty output
+
+### Performance
+- Startup took 28 s on a database of 100,000 sequences; it takes 0.4 s
+- The query was DUST-masked again for every database sequence. A 60 bp query
+  against 100,000 sequences took 42 s; it takes 1.1 s
+
 ## 3.0.12 - 2026-11-04
 ### Fixed
 - rmblastn could take many hours on a search producing millions of HSPs per
