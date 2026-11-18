@@ -481,14 +481,11 @@ N  -1  -1  -1  -1  -1
 
     #[test]
     fn sentinel_when_no_source() {
-        // No FREQS line -> ALP fit is also unavailable.
-        const NO_FREQS: &str = r"   A   C   G   T
-A  9 -15  -6 -17
-C -15  10 -15  -6
-G  -6 -15  10 -15
-T -17  -6 -15   9
-";
-        let m = ScoreMatrix::from_reader("nosuch.matrix", Cursor::new(NO_FREQS)).unwrap();
+        // No background frequencies -> ALP fit is also unavailable.  The
+        // parser refuses a file without FREQS, so clear them by hand (a
+        // library caller can build a ScoreMatrix this way).
+        let mut m = ScoreMatrix::from_reader("nosuch.matrix", Cursor::new(COMPARISON_LIKE)).unwrap();
+        m.freqs = [0.0; crate::encoding::BLASTNA_SIZE];
         let ctx = resolve(&m, "nosuch.matrix", 20, 5, &MatrixCliOverrides::default(), true, StatsMode::Default);
         assert_eq!(ctx.source, KaSource::Sentinel);
         assert!(!ctx.reap_available());
