@@ -30,7 +30,6 @@
 /// a **subject** range for subject-axis (midpoint-tree) nodes.  An internal query
 /// node's `midptr` points at the root of its subject midpoint tree; a subject node's
 /// `midptr` is the head of a LIFO linked list of leaves straddling the subject center.
-
 use std::collections::HashMap;
 
 const INTERNAL: u32 = u32::MAX; // sentinel: this node is an internal (non-leaf) node
@@ -109,20 +108,6 @@ impl BlastIntervalTree {
         let mut t = Self::new(q_start, q_end, s_min, s_max);
         t.rc_query = true;
         t
-    }
-
-    /// Reset to empty without releasing memory (mirrors `Blast_IntervalTreeReset`).
-    pub fn reset(&mut self) {
-        self.nodes.truncate(1);
-        let root = &mut self.nodes[0];
-        root.leftptr  = NIL;
-        root.midptr   = NIL;
-        root.rightptr = NIL;
-        root.hsp_idx  = INTERNAL;
-        self.hsps.clear();
-        self.deleted.clear();
-        self.left_endpoints.clear();
-        self.right_endpoints.clear();
     }
 
     /// Allocate an internal node covering `[le, re]`; returns its index.

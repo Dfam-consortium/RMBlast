@@ -131,7 +131,8 @@ pub fn ungapped_cutoff(
     query_length: u64,
     avg_subj_length: u64,
 ) -> (i32, Option<KaCutoffInfo>) {
-    let fallback = min_raw_gapped_score / 2;
+    // NCBI's cutoff_score_max (see SearchParams::cutoff_score_max)
+    let fallback = if min_raw_gapped_score > 0 { min_raw_gapped_score / 2 } else { 1 };
     match lookup_ka(matrix_name, gap_open, gap_extend) {
         Some((lambda, k)) if avg_subj_length > 0 && lambda > 0.0 && k > 0.0 => {
             // searchsp = MIN(subj_len, 2*query_len) * subj_len   (Int8 in NCBI)
@@ -181,10 +182,10 @@ mod tests {
         let (c, info) = ungapped_cutoff("18p43g.matrix", 28, 5, 300, 49802, 919);
         let info = info.expect("KA should apply for 18p43g {28,5}");
         // closed form check
-        let searchsp = 919u64.min(2 * 49802).saturating_mul(919);
+        let searchsp = 919u64.saturating_mul(919);
         let es = ((0.1957371364 * searchsp as f64 / 0.05).ln() / 0.1179924113).ceil() as i32;
         assert_eq!(info.es, es);
-        assert_eq!(c, es.max(1).min(150));
+        assert_eq!(c, es.clamp(1, 150));
         assert!(c < 150, "KA cutoff {} must be below the fixed 150", c);
         assert!(c <= 140, "KA cutoff {} must let the ungapped-140 anchor seed through", c);
     }

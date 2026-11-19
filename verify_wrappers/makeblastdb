@@ -22,7 +22,7 @@
 # rounds, and the database must stay paired with the sequences it was built
 # from.
 
-NCBI_DIR="/usr/local/rmblast-2.17.1/bin"
+NCBI_DIR="${NCBI_DIR:-/usr/local/rmblast-2.17.1/bin}"
 NCBI_MAKEBLASTDB="$NCBI_DIR/makeblastdb"
 
 # Pull out -in / -out (NCBI accepts only the space-separated form, but accept
@@ -51,7 +51,9 @@ rc=$?
 # a process substitution, stdin) is skipped rather than guessed at.
 if [ -n "$out_name" ] && [ -n "$in_file" ] && [ -f "$in_file" ] \
    && [ ! "$in_file" -ef "$out_name" ]; then
-    if cp -f -- "$in_file" "$out_name"; then
+    # copy under a temporary name, then rename: a search running during a
+    # rebuild never reads a half-copied FASTA
+    if cp -f -- "$in_file" "$out_name.tmp.$$" && mv -f -- "$out_name.tmp.$$" "$out_name"; then
         echo "[verify makeblastdb] Copied $in_file -> $out_name (FASTA for the Rust engine)" >&2
     else
         echo "[verify makeblastdb] Error: failed to copy $in_file -> $out_name" >&2

@@ -9,7 +9,7 @@
 
 use rmblast_lib::hits::Strand;
 use rmblast_lib::matrix::ScoreMatrix;
-use rmblast_lib::options::{SearchParams, SeedMode};
+use rmblast_lib::options::SearchParams;
 use rmblast_lib::search::{build_query_lookup, search_with_query_lookup_ungapped, UngappedHit};
 use rmblast_lib::seq::{FastaReader, TwoBitFile};
 use std::io::BufReader;
@@ -22,7 +22,7 @@ fn data_dir() -> PathBuf {
 fn workspace_test_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("oxyblast-lib has a parent workspace dir")
+        .expect("rmblast-lib has a parent workspace dir")
         .join("tests/data")
 }
 
@@ -63,11 +63,10 @@ fn ungapped_regression_chr22() {
     let matrix_path = data_dir().join("comparison.matrix");
     let reference   = data_dir().join("chr22_ungapped_hits.txt");
 
+    // All four files are tracked in git: a missing one is a broken checkout,
+    // not a reason to pass.
     for p in &[&chr22, &alu_2bit, &matrix_path, &reference] {
-        if !p.exists() {
-            eprintln!("skipping: {} not found", p.display());
-            return;
-        }
+        assert!(p.exists(), "test data missing: {}", p.display());
     }
 
     let matrix = ScoreMatrix::from_file(matrix_path.to_str().unwrap()).expect("load matrix");
@@ -84,7 +83,6 @@ fn ungapped_regression_chr22() {
         dust: false,
         mask_level: 80,
         num_threads: 1,
-        seed_mode: SeedMode::Combined,
         matrix_name: matrix_path.to_string_lossy().into_owned(),
         ..Default::default()
     };

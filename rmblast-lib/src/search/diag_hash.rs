@@ -109,3 +109,77 @@ impl BlastDiagHash {
         self.occupancy += 1;
     }
 }
+
+impl Default for BlastDiagHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// With nothing ever stale (window i32::MAX), the table behaves as a map
+    /// from diagonal to the last s_end stored, past the initial chain
+    /// capacity; clear() empties it.
+    #[test]
+    fn behaves_as_a_map_when_nothing_is_stale() {
+        let mut h = BlastDiagHash::new();
+        let mut want: HashMap<i32, u32> = HashMap::new();
+        let mut x = 0x9E3779B97F4A7C15u64;
+        for i in 0..20_000u32 {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            let diag = (x % 3000) as i32 - 1500;
+            let s_end = 1 + i;
+            h.insert(diag, s_end, 0, i32::MAX);
+            want.insert(diag, s_end);
+        }
+        assert!(want.len() > INIT_CHAIN_CAP, "test must grow the chain");
+        for d in -1600..1600 {
+            assert_eq!(h.get(d), want.get(&d).copied().unwrap_or(0), "diag {d}");
+        }
+        h.clear();
+        for d in -1600..1600 {
+            assert_eq!(h.get(d), 0, "diag {d} after clear");
+        }
+        h.insert(7, 42, 0, i32::MAX);
+        assert_eq!(h.get(7), 42);
+    }
+
+    /// NCBI's stale rule (s_BlastDiagHashInsert): a cell in the same bucket
+    /// whose level the scan has passed by more than `window`
+    /// (s_off - level > window) is reused for the new diagonal, which drops
+    /// the old one; otherwise a new cell is chained.
+    #[test]
+    fn stale_cell_in_the_bucket_is_reused() {
+        let d1 = 5i32;
+        let d2 = (6..).find(|&d| BlastDiagHash::bucket(d) == BlastDiagHash::bucket(d1)).unwrap();
+        let window = 1 - 14; // word size 14
+
+        // not stale: s_off - level = 80 - 100 = -20, not > -13
+        let mut h = BlastDiagHash::new();
+        h.insert(d1, 100, 50, window);
+        h.insert(d2, 300, 80, window);
+        assert_eq!((h.get(d1), h.get(d2)), (100, 300));
+
+        // stale: 200 - 100 = 100 > -13, so d2 takes d1's cell
+        let mut h = BlastDiagHash::new();
+        h.insert(d1, 100, 50, window);
+        h.insert(d2, 300, 200, window);
+        assert_eq!((h.get(d1), h.get(d2)), (0, 300));
+
+        // at the threshold: 87 - 100 = -13, not > -13
+        let mut h = BlastDiagHash::new();
+        h.insert(d1, 100, 50, window);
+        h.insert(d2, 300, 87, window);
+        assert_eq!((h.get(d1), h.get(d2)), (100, 300));
+
+        // the same diagonal is updated in place, stale or not
+        let mut h = BlastDiagHash::new();
+        h.insert(d1, 100, 50, window);
+        h.insert(d1, 500, 10_000, window);
+        assert_eq!(h.get(d1), 500);
+    }
+}

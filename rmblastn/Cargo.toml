@@ -16,3 +16,6 @@ rmblast-lib = { package = "rmblast-lib", path = "../rmblast-lib" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+
+[lints]
+workspace = true

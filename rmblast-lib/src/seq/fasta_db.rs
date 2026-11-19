@@ -16,7 +16,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::seq::fasta::FastaReader;
-use crate::seq::twobit::{NcbiRandom, SeqInfo};
+use crate::seq::twobit::{LazyRandom, SeqInfo};
 
 #[derive(Debug, Error)]
 pub enum FastaDbError {
@@ -26,6 +26,12 @@ pub enum FastaDbError {
     Fasta(String),
     #[error("sequence '{0}' not found in FASTA database")]
     NotFound(String),
+    #[error("{0}")]
+    TooLong(String),
+    /// Two records share an id.  Subjects are looked up by id, so one of them
+    /// would never be searched; reject the database instead.
+    #[error("duplicate sequence id '{id}' (records {first} and {second})")]
+    DuplicateId { id: String, first: usize, second: usize },
 }
 
 /// An in-memory FASTA subject database with full IUB/IUPAC support.
@@ -39,6 +45,8 @@ pub struct FastaDb {
     /// Raw BLASTNA sequences (sentinel | bases | sentinel).
     /// IUPAC codes 4–14 are preserved; they are resolved at decode time.
     raw_seqs: Vec<Vec<u8>>,
+    /// Full defline of each record (everything after '>'), for pairwise output.
+    deflines: Vec<String>,
 }
 
 impl FastaDb {
@@ -49,19 +57,25 @@ impl FastaDb {
         let mut sequences: Vec<SeqInfo> = Vec::new();
         let mut name_to_index: HashMap<String, usize> = HashMap::new();
         let mut raw_seqs: Vec<Vec<u8>> = Vec::new();
+        let mut deflines: Vec<String> = Vec::new();
 
         while let Some(rec) = reader
             .next_record()
             .map_err(|e| FastaDbError::Fasta(e.to_string()))?
         {
+            crate::seq::check_seq_len(&rec.id, rec.len()).map_err(FastaDbError::TooLong)?;
             let dna_size = rec.len() as u32;
             let idx = sequences.len();
+            if let Some(&first) = name_to_index.get(&rec.id) {
+                return Err(FastaDbError::DuplicateId { id: rec.id, first: first + 1, second: idx + 1 });
+            }
             name_to_index.insert(rec.id.clone(), idx);
             sequences.push(SeqInfo { name: rec.id, file_offset: 0, dna_size });
             raw_seqs.push(rec.seq);
+            deflines.push(rec.defline);
         }
 
-        Ok(FastaDb { sequences, name_to_index, raw_seqs })
+        Ok(FastaDb { sequences, name_to_index, raw_seqs, deflines })
     }
 
     /// Decode a sequence to BLASTNA, resolving every IUB ambiguity (codes 4–14)
@@ -77,12 +91,12 @@ impl FastaDb {
         let dna_size = self.sequences[idx].dna_size;
         let mut out = self.raw_seqs[idx].clone();
         let last = out.len().saturating_sub(1);
-        let mut rng = NcbiRandom::new(dna_size);
+        let mut rng = LazyRandom::new(dna_size);
         // Iterate only the bases (skip sentinels at index 0 and last).
         for slot in &mut out[1..last] {
             let code = *slot;
-            if code >= 4 && code <= 14 {
-                *slot = rng.next_base_iupac(code);
+            if (4..=14).contains(&code) {
+                *slot = rng.get().next_base_iupac(code);
             }
         }
         Ok(out)
@@ -93,21 +107,61 @@ impl FastaDb {
     /// Returns a `Vec<u8>` of length `dna_size` where 0 = unambiguous (A/C/G/T)
     /// and 4–14 = original BLASTNA code at that position.  Returns an empty Vec
     /// if the sequence contains no ambiguous positions.
+    /// The full defline of `name` (everything after '>').
+    pub fn defline(&self, name: &str) -> Option<&str> {
+        self.name_to_index.get(name).map(|&i| self.deflines[i].as_str())
+    }
+
     pub fn get_n_mask(&self, name: &str) -> Vec<u8> {
         let Some(&idx) = self.name_to_index.get(name) else {
             return Vec::new();
         };
         let raw = &self.raw_seqs[idx];
         let bases = &raw[1..raw.len() - 1];
-        if !bases.iter().any(|&c| c >= 4 && c <= 14) {
+        if !bases.iter().any(|&c| (4..=14).contains(&c)) {
             return Vec::new();
         }
         let mut mask = vec![0u8; bases.len()];
         for (i, &c) in bases.iter().enumerate() {
-            if c >= 4 && c <= 14 {
+            if (4..=14).contains(&c) {
                 mask[i] = c;
             }
         }
         mask
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_fasta(tag: &str, text: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("rmblast-fastadb-{}-{tag}.fa", std::process::id()));
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// Subjects are looked up by id, so a duplicate would leave the first
+    /// record unsearched and the last searched twice: reject it at load.
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let p = temp_fasta("dup", ">dup first\nACGTACGT\n>other\nACGT\n>dup second\nTTTT\n");
+        let r = FastaDb::open(&p);
+        std::fs::remove_file(&p).ok();
+        match r {
+            Err(FastaDbError::DuplicateId { id, first: 1, second: 3 }) => assert_eq!(id, "dup"),
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("duplicate accepted"),
+        }
+    }
+
+    #[test]
+    fn distinct_ids_load() {
+        let p = temp_fasta("ok", ">a\nACGT\n>b\nAC\n");
+        let db = FastaDb::open(&p);
+        std::fs::remove_file(&p).ok();
+        let db = db.unwrap();
+        assert_eq!(db.sequences.len(), 2);
+        assert_eq!(db.get_full_sequence_blastna("b").unwrap(), vec![15, 0, 1, 15]);
     }
 }

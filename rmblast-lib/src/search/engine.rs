@@ -16,7 +16,8 @@
 //!       full gapped alignment with traceback (xdrop_gap_final=100) →
 //!       score/complexity filter → output.
 //!
-//! Threading: parallelism is over subject sequences (see search_db_parallel in main.rs).
+//! Threading: each query's search runs in parallel over subject sequences
+//! (search_db_parallel in main.rs); --mt-mode 1 also runs queries in parallel.
 
 use crate::hits::score_compare_hsps;
 use crate::search::diag_hash::BlastDiagHash;
@@ -45,14 +46,12 @@ use crate::blast::mblookup::{blast_mb_lookup_table_new, blast_mb_scan_subject, B
 use crate::blast::nalookup::{blast_na_lookup_table_new, choose_lut_width, BlastNaLookupTable};
 use crate::blast::nascan::blast_na_scan_subject;
 use crate::blast::types::BlastOffsetPair;
-#[cfg(test)]
-use crate::blast::util::{blast_compress_blastna_sequence, seqblk_from_blastna};
 use crate::seq::{prepare_subject_strands, PreparedSubject};
 use crate::encoding::{revcomp_blastna, BLASTNA_COMPLEMENT};
 use crate::filter::dust::{dust_mask, dust_mask_ncbi_compat, DUST_LEVEL, DUST_LINKER, DUST_WINDOW};
 use crate::hits::{EditOp, EditScript, Hsp, Strand};
 use crate::matrix::ScoreMatrix;
-use crate::options::{SearchParams, SeedMode};
+use crate::options::SearchParams;
 use crate::output::AlignResult;
 use crate::search::complexity_adjust::apply_complexity_adjust;
 use crate::search::gapped::{align_ex, extract_aligned, gapped_extend_score_only, AlignWorkspace, GapAlignResult};
@@ -120,9 +119,6 @@ enum NaLookup {
 impl NaLookup {
     #[inline] fn lut_word_length(&self) -> i32 {
         match self { NaLookup::Small(l) => l.lut_word_length, NaLookup::Mega(l) => l.lut_word_length }
-    }
-    #[inline] fn scan_step(&self) -> i32 {
-        match self { NaLookup::Small(l) => l.scan_step, NaLookup::Mega(l) => l.scan_step }
     }
     #[inline] fn longest_chain(&self) -> i32 {
         match self { NaLookup::Small(l) => l.longest_chain, NaLookup::Mega(l) => l.longest_chain }
@@ -202,6 +198,53 @@ pub struct PrelimCullParams {
     pub resurrect_slack: u32,
 }
 
+/// Accepted query ranges for the mask-level and prelim-cull sweeps.
+///
+/// Both sweeps ask whether any accepted range overlaps a new one enough.
+/// 3.0.12 kept the ranges in one vector sorted by start: each accept was a
+/// `Vec::insert` (quadratic), and each check walked back over every range
+/// within the longest accepted span, so one long range made every later
+/// check scan them all.  Here the ranges sit in one ordered map per span
+/// class (power of two), and each class is searched back only as far as its
+/// own longest span.  A range skipped that way ends before the new one
+/// starts, which every caller's test rejects, so the answer is unchanged.
+type SpanMap<T> = std::collections::BTreeMap<(u32, u32), (u32, T)>;
+
+struct SpanIndex<T: Copy> {
+    /// Per class: longest span seen, and (start, insertion seq) -> (end, payload).
+    classes: Vec<(u32, SpanMap<T>)>,
+    seq: u32,
+}
+
+impl<T: Copy> SpanIndex<T> {
+    fn new() -> Self {
+        SpanIndex { classes: (0..33).map(|_| (0, std::collections::BTreeMap::new())).collect(), seq: 0 }
+    }
+
+    fn insert(&mut self, qs: u32, qe: u32, payload: T) {
+        let span = qe - qs;
+        let class = &mut self.classes[(32 - span.leading_zeros()) as usize];
+        class.0 = class.0.max(span);
+        class.1.insert((qs, self.seq), (qe, payload));
+        self.seq += 1;
+    }
+
+    /// True if `test(start, end, payload)` holds for some range with start in
+    /// [`qs` - its class's longest span, `hi`], i.e. every range that can end
+    /// at or after `qs` and starts no later than `hi`.
+    fn any(&self, qs: u32, hi: u32, mut test: impl FnMut(u32, u32, T) -> bool) -> bool {
+        for (max_span, map) in &self.classes {
+            if map.is_empty() { continue; }
+            let lo = qs.saturating_sub(*max_span);
+            if lo > hi { continue; }
+            for (&(qs_j, _), &(qe_j, t)) in map.range((lo, 0)..=(hi, u32::MAX)) {
+                if test(qs_j, qe_j, t) { return true; }
+            }
+        }
+        false
+    }
+}
+
 /// Slop (bp) for deciding that a prelim endpoint abuts a query-chunk edge.
 const CULL_BOUNDARY_EPS: u32 = 5;
 
@@ -257,8 +300,7 @@ pub fn cull_prelims(
 
     let mut keep: Vec<Vec<bool>> =
         prelims_by_subject.iter().map(|v| vec![true; v.len()]).collect();
-    let mut accepted: Vec<(u32, u32, i64)> = Vec::new(); // qs ASC
-    let mut max_span: u32 = 0;
+    let mut accepted: SpanIndex<i64> = SpanIndex::new();
     for c in &cands {
         let span = c.qe.saturating_sub(c.qs) as i64;
         if span == 0 {
@@ -266,33 +308,19 @@ pub fn cull_prelims(
         }
         if abuts_boundary(c.qs, chunk_boundaries) || abuts_boundary(c.qe, chunk_boundaries) {
             // Chunk-truncated span: exempt from culling, but let it dominate.
-            let pos = accepted.partition_point(|a| a.0 < c.qs);
-            accepted.insert(pos, (c.qs, c.qe, c.score));
-            max_span = max_span.max(c.qe - c.qs);
+            accepted.insert(c.qs, c.qe, c.score);
             continue;
         }
-        let upper = accepted.partition_point(|a| a.0 < c.qe);
-        let min_start = c.qs.saturating_sub(max_span);
-        let mut masked = false;
-        let mut i = upper;
-        while i > 0 {
-            i -= 1;
-            let (qs_j, qe_j, sc_j) = accepted[i];
-            if qs_j < min_start { break; }
-            if qe_j <= c.qs { continue; }
-            if sc_j * 100 < c.score * cull_margin_pct as i64 { continue; }
+        let masked = accepted.any(c.qs, c.qe - 1, |qs_j, qe_j, sc_j| {
+            if qe_j <= c.qs { return false; }
+            if sc_j * 100 < c.score * cull_margin_pct as i64 { return false; }
             let ovlp = (qe_j.min(c.qe) as i64) - (qs_j.max(c.qs) as i64);
-            if ovlp * 100 / span >= cull_coverage as i64 {
-                masked = true;
-                break;
-            }
-        }
+            ovlp * 100 / span >= cull_coverage as i64
+        });
         if masked {
             keep[c.subj][c.idx] = false;
         } else {
-            let pos = accepted.partition_point(|a| a.0 < c.qs);
-            accepted.insert(pos, (c.qs, c.qe, c.score));
-            max_span = max_span.max(c.qe - c.qs);
+            accepted.insert(c.qs, c.qe, c.score);
         }
     }
     keep
@@ -462,7 +490,11 @@ fn improve_seed(
             if score > HSP_MAX_IDENT_RUN {
                 return (q_seed as u32, s_seed as u32);
             }
-            if qb <= prelim_q_start || sb <= prelim_s_start { break; }
+            // NCBI's forward check stops only at hsp->query.end (= prelim_q_start
+            // here); the subject is bounded by its buffer, whose sentinel never
+            // matches a base -- here, by index 0.  3.0.12 also stopped at
+            // prelim_s_start, which NCBI does not (review 3.6).
+            if qb <= prelim_q_start || sb == 0 { break; }
             qb -= 1; sb -= 1;
         }
         // Early return didn't fire: scan the prelim HSP region for the longest identity run.
@@ -548,9 +580,19 @@ pub struct QueryLookup {
     lookup: NaLookup,
     /// Forward query length (without leading/trailing sentinels).
     fwd_n: u32,
-    /// For Combined mode: offset of context-1 (RC query) in the combined buffer (= fwd_n + 1).
-    /// For SeparateStrands: 0 (unused).
+    /// Offset of context 1 (the reverse-complement query) in the combined
+    /// buffer (= fwd_n + 1).
     c1_start: u32,
+    /// The DUST-masked query this table was built from, when
+    /// [`build_query_lookup`] masked it.  The search functions use it instead
+    /// of re-masking the query for every subject (3.0.12 did, which was 90%
+    /// of the time for short queries against many subjects).  `None` with
+    /// dust off, or for [`build_query_lookup_premask`].
+    masked_query: Option<Vec<u8>>,
+    /// Reverse complement of the query the table was built from, made on
+    /// first use and shared by every subject (3.0.12 recomputed it for each
+    /// subject, three times).
+    query_rc: std::sync::OnceLock<Vec<u8>>,
 }
 
 /// Build the lookup table from the query sequence.
@@ -562,7 +604,6 @@ pub struct QueryLookup {
 /// `search_phase2a` so that word extension uses the same masked sequence that was
 /// indexed in the lookup table.
 pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, Vec<u8>) {
-    let fwd_n = query.len().saturating_sub(2);
     let fwd_query_scan = if params.dust {
         let mut v = query.to_vec();
         dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
@@ -570,57 +611,8 @@ pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, 
     } else {
         query.to_vec()
     };
-    let query_bases = &fwd_query_scan[1..1 + fwd_n];
-
-    // approx_entries: Combined counts both strand contexts (2×fwd_n), matching
-    // NCBI's BlastChooseNaLookupTable call in BlastNaLookupTableNew.
-    let approx_entries = match params.seed_mode {
-        SeedMode::Combined       => 2 * fwd_n,
-        SeedMode::SeparateStrands => fwd_n,
-    };
-    let lut_width = choose_lut_width(params.word_size, approx_entries);
-
-    let (lookup, c1_start) = match params.seed_mode {
-        SeedMode::Combined => {
-            // Build combined buffer: [fwd_bases | sentinel(14) | rc_bases].
-            // This mirrors NCBI's BlastNaLookupTableNew combined-context layout:
-            //   context-0 at [0, fwd_n-1], separator at fwd_n, context-1 at [fwd_n+1, 2*fwd_n].
-            let rc_bases = revcomp_blastna(query_bases);
-            let mut combined: Vec<u8> = Vec::with_capacity(2 * fwd_n + 1);
-            combined.extend_from_slice(query_bases);
-            combined.push(14u8); // N sentinel separates the two contexts
-            combined.extend_from_slice(&rc_bases);
-            let locs: &[(i32, i32)] = &[(0, fwd_n as i32 - 1), (fwd_n as i32 + 1, 2 * fwd_n as i32)];
-            let lut = if lut_width > 8 {
-                NaLookup::Mega(blast_mb_lookup_table_new(
-                    &combined, locs,
-                    params.word_size as i32, lut_width as i32, approx_entries,
-                ))
-            } else {
-                NaLookup::Small(blast_na_lookup_table_new(
-                    &combined, locs,
-                    params.word_size as i32, lut_width as i32,
-                ))
-            };
-            (lut, fwd_n as u32 + 1)
-        }
-        SeedMode::SeparateStrands => {
-            let lut = if lut_width > 8 {
-                NaLookup::Mega(blast_mb_lookup_table_new(
-                    query_bases, &[(0, fwd_n as i32 - 1)],
-                    params.word_size as i32, lut_width as i32, approx_entries,
-                ))
-            } else {
-                NaLookup::Small(blast_na_lookup_table_new(
-                    query_bases, &[(0, fwd_n as i32 - 1)],
-                    params.word_size as i32, lut_width as i32,
-                ))
-            };
-            (lut, 0u32)
-        }
-    };
-
-    (QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start }, fwd_query_scan)
+    let masked_query = params.dust.then(|| fwd_query_scan.clone());
+    (QueryLookup::from_masked(&fwd_query_scan, masked_query, params), fwd_query_scan)
 }
 
 /// Build a lookup table from a *pre-masked* query (DUST already applied).
@@ -628,65 +620,80 @@ pub fn build_query_lookup(query: &[u8], params: &SearchParams) -> (QueryLookup, 
 /// Use this when the caller has already applied full-query DUST masking and
 /// extracted a chunk from it, to avoid double-masking artifacts at chunk boundaries.
 pub fn build_query_lookup_premask(masked_query: &[u8], params: &SearchParams) -> QueryLookup {
-    let fwd_n = masked_query.len().saturating_sub(2);
-    let query_bases = &masked_query[1..1 + fwd_n];
-
-    let approx_entries = match params.seed_mode {
-        SeedMode::Combined       => 2 * fwd_n,
-        SeedMode::SeparateStrands => fwd_n,
-    };
-    let lut_width = choose_lut_width(params.word_size, approx_entries);
-
-    let (lookup, c1_start) = match params.seed_mode {
-        SeedMode::Combined => {
-            let rc_bases = revcomp_blastna(query_bases);
-            let mut combined: Vec<u8> = Vec::with_capacity(2 * fwd_n + 1);
-            combined.extend_from_slice(query_bases);
-            combined.push(14u8);
-            combined.extend_from_slice(&rc_bases);
-            let locs: &[(i32, i32)] = &[(0, fwd_n as i32 - 1), (fwd_n as i32 + 1, 2 * fwd_n as i32)];
-            let lut = if lut_width > 8 {
-                NaLookup::Mega(blast_mb_lookup_table_new(
-                    &combined, locs,
-                    params.word_size as i32, lut_width as i32, approx_entries,
-                ))
-            } else {
-                NaLookup::Small(blast_na_lookup_table_new(
-                    &combined, locs,
-                    params.word_size as i32, lut_width as i32,
-                ))
-            };
-            (lut, fwd_n as u32 + 1)
-        }
-        SeedMode::SeparateStrands => {
-            let lut = if lut_width > 8 {
-                NaLookup::Mega(blast_mb_lookup_table_new(
-                    query_bases, &[(0, fwd_n as i32 - 1)],
-                    params.word_size as i32, lut_width as i32, approx_entries,
-                ))
-            } else {
-                NaLookup::Small(blast_na_lookup_table_new(
-                    query_bases, &[(0, fwd_n as i32 - 1)],
-                    params.word_size as i32, lut_width as i32,
-                ))
-            };
-            (lut, 0u32)
-        }
-    };
-
-    QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start }
+    QueryLookup::from_masked(masked_query, None, params)
 }
 
-impl QueryLookup {
-    pub fn lut_word_length(&self) -> u32 {
-        self.lookup.lut_word_length() as u32
+/// The lookup table over both strands of the query, as NCBI's
+/// BlastNaLookupTableNew builds it: one buffer [fwd | N | rc] with context 0
+/// at [0, n-1] and context 1 at [n+1, 2n], and the width chosen from
+/// 2 x n entries (both contexts).
+fn combined_lookup(query_bases: &[u8], params: &SearchParams) -> NaLookup {
+    let fwd_n = query_bases.len();
+    let approx_entries = 2 * fwd_n;
+    let lut_width = choose_lut_width(params.word_size, approx_entries);
+    let rc_bases = revcomp_blastna(query_bases);
+    let mut combined: Vec<u8> = Vec::with_capacity(2 * fwd_n + 1);
+    combined.extend_from_slice(query_bases);
+    combined.push(14u8); // N sentinel separates the two contexts
+    combined.extend_from_slice(&rc_bases);
+    let locs: &[(i32, i32)] = &[(0, fwd_n as i32 - 1), (fwd_n as i32 + 1, 2 * fwd_n as i32)];
+    if lut_width > 8 {
+        NaLookup::Mega(blast_mb_lookup_table_new(
+            &combined, locs, params.word_size as i32, lut_width as i32, approx_entries,
+        ))
+    } else {
+        NaLookup::Small(blast_na_lookup_table_new(
+            &combined, locs, params.word_size as i32, lut_width as i32,
+        ))
     }
 }
 
-/// Apply DUST masking to a query sequence (with leading/trailing sentinels).
-/// When dust=false, returns a clone of the input unchanged.
-/// The masked query is used for seeding (LUT construction, word extension, ungapped scoring)
-/// but NOT for Phase 2a/2b gapped alignment — NCBI uses mask_at_hash=TRUE for rmblastn.
+impl QueryLookup {
+    /// The table over `scan_query` (sentinel-wrapped, already DUST-masked if
+    /// dust is on).  `masked_copy` is kept for [`Self::masked`].
+    fn from_masked(scan_query: &[u8], masked_copy: Option<Vec<u8>>, params: &SearchParams) -> Self {
+        let fwd_n = scan_query.len().saturating_sub(2);
+        let lookup = combined_lookup(&scan_query[1..1 + fwd_n], params);
+        QueryLookup { lookup, fwd_n: fwd_n as u32, c1_start: fwd_n as u32 + 1,
+                      masked_query: masked_copy, query_rc: std::sync::OnceLock::new() }
+    }
+
+    pub fn lut_word_length(&self) -> u32 {
+        self.lookup.lut_word_length() as u32
+    }
+
+    /// Reverse complement of `query` (sentinels included), computed once.
+    /// The caller passes the query this table was built from, as for
+    /// [`Self::masked`].
+    fn query_rc(&self, query: &[u8]) -> &[u8] {
+        let rc = self.query_rc.get_or_init(|| revcomp_blastna(query));
+        debug_assert_eq!(rc.len(), query.len(), "lookup built from a different query");
+        rc
+    }
+
+    /// The query used for word extension: DUST-masked when dust is on.  Takes
+    /// the copy made by [`build_query_lookup`] when there is one (the caller
+    /// must pass the query the table was built from), else masks `query` here.
+    fn masked<'a>(&'a self, query: &'a [u8], params: &SearchParams) -> std::borrow::Cow<'a, [u8]> {
+        use std::borrow::Cow;
+        if !params.dust {
+            return Cow::Borrowed(query);
+        }
+        if let Some(m) = &self.masked_query {
+            debug_assert_eq!(m.len(), query.len(), "lookup built from a different query");
+            return Cow::Borrowed(m);
+        }
+        let mut v = query.to_vec();
+        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
+        Cow::Owned(v)
+    }
+}
+
+/// DUST-mask a whole query (sentinels included) for the multi-chunk path, with
+/// NCBI's chunked-interval off-by-one (dust_mask_ncbi_compat); a clone when
+/// dust is off.  Each chunk's lookup table is built from its slice, and exact
+/// word extension reads it.  Ungapped and gapped extension use the unmasked
+/// query (NCBI mask_at_hash), so despite the name it is not an alignment input.
 pub fn mask_query_for_alignment(query: &[u8], params: &SearchParams) -> Vec<u8> {
     if params.dust {
         let mut v = query.to_vec();
@@ -717,6 +724,27 @@ pub fn search_with_query_lookup(
     n_mask: &[u8],
     prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
+    search_one_subject(ql, query, query_id, subject_plus, subject_id, params, matrix,
+                       chunk_offset, n_mask, prepared, &mut DiscardSeeds, &mut DiscardUngap)
+}
+
+/// The body of the search_with_query_lookup family, generic over where
+/// seeds and ungapped hits go (discarded in production).
+#[allow(clippy::too_many_arguments)]
+fn search_one_subject<S: SeedOut, U: UngapOut>(
+    ql: &QueryLookup,
+    query: &[u8],
+    query_id: &str,
+    subject_plus: &[u8],
+    subject_id: &str,
+    params: &SearchParams,
+    matrix: &ScoreMatrix,
+    chunk_offset: u32,
+    n_mask: &[u8],
+    prepared: Option<&PreparedSubject>,
+    seed_out: &mut S,
+    ungap_out: &mut U,
+) -> Vec<AlignResult> {
     let q_len = query.len().saturating_sub(2) as u32;
     let s_len = subject_plus.len().saturating_sub(2) as u32;
 
@@ -724,7 +752,7 @@ pub fn search_with_query_lookup(
         return Vec::new();
     }
 
-    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // Subject RC and the NCBI2NA-packed plus strand: borrow from the shared
     // per-subject cache when supplied, else compute locally (identical bytes).
     let local_prep;
     let prep: &PreparedSubject = match prepared {
@@ -734,41 +762,22 @@ pub fn search_with_query_lookup(
             &local_prep
         }
     };
-    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
-        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
+    let (subj_rc, packed_plus): (&[u8], &[u8]) = (&prep.rc, &prep.packed_plus);
 
-    // Generate masked query for DUST: used for exact extension, ungapped scoring, Phase 2a, Phase 2b.
-    // When dust=false, masked_query == query (no allocation).
-    let masked_query_buf;
-    let masked_query: &[u8] = if params.dust {
-        let mut v = query.to_vec();
-        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
-        masked_query_buf = v;
-        &masked_query_buf
-    } else {
-        query
-    };
+    // DUST-masked query (the query itself with dust off), used for exact word
+    // extension.
+    let masked_query_cow = ql.masked(query, params);
+    let masked_query: &[u8] = &masked_query_cow;
 
     let mut ungapped = Vec::new();
-    if ql.c1_start > 0 {
-        // Combined LUT: single scan of FWD subject, interleaved plus/minus hits.
-        collect_ungapped_combined(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-            ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-    } else {
-        collect_ungapped(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], s_len,
-            Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-        collect_ungapped(
-            query, masked_query, q_len, subj_rc, &packed_minus[3..], s_len,
-            Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-    }
+    // Combined LUT: single scan of FWD subject, interleaved plus/minus hits.
+    collect_ungapped_combined(
+        query, ql.query_rc(query), masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
+        ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
+    );
     let mut results = run_gapped_phase(
-        query, query_id, subject_plus, subj_rc, subject_id,
-        q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
+        query, ql.query_rc(query), query_id, subject_plus, subject_id,
+        q_len, s_len, ungapped, params, matrix, ungap_out,
         ql.lut_word_length(), n_mask, prep,
     );
     if chunk_offset > 0 {
@@ -797,64 +806,8 @@ pub fn search_with_query_lookup_seeds(
     n_mask: &[u8],
     prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
-    let q_len = query.len().saturating_sub(2) as u32;
-    let s_len = subject_plus.len().saturating_sub(2) as u32;
-
-    if q_len < params.word_size as u32 || s_len < params.word_size as u32 {
-        return Vec::new();
-    }
-
-    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
-    // per-subject cache when supplied, else compute locally (identical bytes).
-    let local_prep;
-    let prep: &PreparedSubject = match prepared {
-        Some(p) => p,
-        None => {
-            local_prep = prepare_subject_strands(subject_plus, n_mask);
-            &local_prep
-        }
-    };
-    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
-        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
-
-    let masked_query_buf_s;
-    let masked_query_s: &[u8] = if params.dust {
-        let mut v = query.to_vec();
-        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
-        masked_query_buf_s = v;
-        &masked_query_buf_s
-    } else {
-        query
-    };
-
-    let mut ungapped = Vec::new();
-    if ql.c1_start > 0 {
-        collect_ungapped_combined(
-            query, masked_query_s, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-            ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, seed_out, &mut ungapped,
-        );
-    } else {
-        collect_ungapped(
-            query, masked_query_s, q_len, subject_plus, &packed_plus[3..], s_len,
-            Strand::Plus, &ql.lookup, params, matrix, seed_out, &mut ungapped,
-        );
-        collect_ungapped(
-            query, masked_query_s, q_len, subj_rc, &packed_minus[3..], s_len,
-            Strand::Minus, &ql.lookup, params, matrix, seed_out, &mut ungapped,
-        );
-    }
-    let mut results = run_gapped_phase(
-        query, query_id, subject_plus, subj_rc, subject_id,
-        q_len, s_len, ungapped, params, matrix, &mut DiscardUngap,
-        ql.lut_word_length(), n_mask, prep,
-    );
-    if chunk_offset > 0 {
-        for r in &mut results {
-            r.hsp.q_start += chunk_offset;
-            r.hsp.q_end   += chunk_offset;
-        }
-    }
-    results
+    search_one_subject(ql, query, query_id, subject_plus, subject_id, params, matrix,
+                       chunk_offset, n_mask, prepared, seed_out, &mut DiscardUngap)
 }
 
 /// Like [`search_with_query_lookup`] but also collects post-sort ungapped hits.
@@ -874,64 +827,8 @@ pub fn search_with_query_lookup_ungapped(
     n_mask: &[u8],
     prepared: Option<&PreparedSubject>,
 ) -> Vec<AlignResult> {
-    let q_len = query.len().saturating_sub(2) as u32;
-    let s_len = subject_plus.len().saturating_sub(2) as u32;
-
-    if q_len < params.word_size as u32 || s_len < params.word_size as u32 {
-        return Vec::new();
-    }
-
-    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
-    // per-subject cache when supplied, else compute locally (identical bytes).
-    let local_prep;
-    let prep: &PreparedSubject = match prepared {
-        Some(p) => p,
-        None => {
-            local_prep = prepare_subject_strands(subject_plus, n_mask);
-            &local_prep
-        }
-    };
-    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
-        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
-
-    let masked_query_buf_u;
-    let masked_query_u: &[u8] = if params.dust {
-        let mut v = query.to_vec();
-        dust_mask(&mut v, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
-        masked_query_buf_u = v;
-        &masked_query_buf_u
-    } else {
-        query
-    };
-
-    let mut ungapped = Vec::new();
-    if ql.c1_start > 0 {
-        collect_ungapped_combined(
-            query, masked_query_u, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-            ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-    } else {
-        collect_ungapped(
-            query, masked_query_u, q_len, subject_plus, &packed_plus[3..], s_len,
-            Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-        collect_ungapped(
-            query, masked_query_u, q_len, subj_rc, &packed_minus[3..], s_len,
-            Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-    }
-    let mut results = run_gapped_phase(
-        query, query_id, subject_plus, subj_rc, subject_id,
-        q_len, s_len, ungapped, params, matrix, ungap_out,
-        ql.lut_word_length(), n_mask, prep,
-    );
-    if chunk_offset > 0 {
-        for r in &mut results {
-            r.hsp.q_start += chunk_offset;
-            r.hsp.q_end   += chunk_offset;
-        }
-    }
-    results
+    search_one_subject(ql, query, query_id, subject_plus, subject_id, params, matrix,
+                       chunk_offset, n_mask, prepared, &mut DiscardSeeds, ungap_out)
 }
 
 /// Search one query against one subject sequence (plus and minus strands).
@@ -1020,9 +917,7 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
     let n = results.len();
     if n == 0 { return; }
 
-    // (q_start, q_end, score) — sorted by q_start for binary search.
-    let mut accepted: Vec<(u32, u32, i32)> = Vec::new();
-    let mut max_accepted_span: u32 = 0;
+    let mut accepted: SpanIndex<i32> = SpanIndex::new();
     let mut keep = vec![true; n];
 
     for i in 0..n {
@@ -1043,42 +938,34 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
             continue;
         }
 
-        let upper = accepted.partition_point(|a| a.0 < qe_i);
-        let min_start = qs_i.saturating_sub(max_accepted_span);
+        // At mask level 0 an HSP that only touches a better one is masked too:
+        // NCBI's overlap is then 0 and 0 >= 0.  At any higher level touching
+        // cannot mask, so only real overlaps are examined.
+        let touching = mask_level == 0;
+        let hi = if touching { qe_i } else { qe_i - 1 };
 
-        let mut masked = false;
-        let mut idx = upper;
-        while idx > 0 {
-            idx -= 1;
-            let (qs_j, qe_j, sc_j) = accepted[idx];
-            if qs_j < min_start {
-                break;
-            }
-            if qe_j <= qs_i {
-                continue;
+        let masked = accepted.any(qs_i, hi, |qs_j, qe_j, sc_j| {
+            if qe_j < qs_i || (qe_j == qs_i && !touching) {
+                return false;
             }
             // Mirror NCBI s_HSPQueryRangeIsMasklevelContained: skip only if accepted
             // entry has strictly lower score (in_score > tree_hsp->score → return 0).
             if sc_j < sc_i {
-                continue;
+                return false;
             }
             let ovlp = (qe_j.min(qe_i) as i64) - (qs_j.max(qs_i) as i64);
-            // NCBI: (Int4)(100*(double)ovlp/span) >= masklevel
-            if ovlp * 100 / q_span_i >= mask_level as i64 {
-                masked = true;
-                break;
-            }
-        }
+            // NCBI s_HSPQueryRangeIsMasklevelContained (blast_itree.c):
+            // (Int4)(100*((double)ovlp/span)) >= masklevel -- the division in
+            // double first.  Integer ovlp*100/span differs where the double
+            // quotient rounds down, e.g. 29/100 -> 28.999..., at levels 29, 57, 58.
+            let perc = (100.0 * (ovlp as f64 / q_span_i as f64)) as i64;
+            perc >= mask_level as i64
+        });
 
         if masked {
             keep[i] = false;
         } else {
-            let pos = accepted.partition_point(|a| a.0 < qs_i);
-            accepted.insert(pos, (qs_i, qe_i, sc_i));
-            let span = (qe_i - qs_i) as u32;
-            if span > max_accepted_span {
-                max_accepted_span = span;
-            }
+            accepted.insert(qs_i, qe_i, sc_i);
         }
     }
 
@@ -1098,10 +985,20 @@ pub fn apply_mask_level(results: &mut Vec<AlignResult>, mask_level: u32, subject
 /// function sorts on the score keys only.  `oid` is the index in `subject_names`; unknown names get
 /// oid 0, as in `apply_mask_level`.
 pub fn sort_hit_list_order(results: &mut [AlignResult], subject_names: &[String]) {
-    let oid_map: std::collections::HashMap<&str, usize> = subject_names.iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
+    sort_hit_list_order_by_oid(results, &subject_oids(subject_names));
+}
+
+/// Subject name -> position in the database (its OID), for
+/// [`sort_hit_list_order_by_oid`].  Build it once per run, not per query.
+pub fn subject_oids(subject_names: &[String]) -> std::collections::HashMap<&str, usize> {
+    subject_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect()
+}
+
+/// [`sort_hit_list_order`] with the name -> OID map built in advance.
+pub fn sort_hit_list_order_by_oid(
+    results: &mut [AlignResult],
+    oid_map: &std::collections::HashMap<&str, usize>,
+) {
     // (top score, oid) per subject, keyed by owned name so the map does not
     // borrow `results` while we sort it.
     let mut rank: std::collections::HashMap<String, (i32, usize)> = std::collections::HashMap::new();
@@ -1119,236 +1016,36 @@ pub fn sort_hit_list_order(results: &mut [AlignResult], subject_names: &[String]
     });
 }
 
-/// Phase 1: scan and collect all passing ungapped hits for one strand.
-///
-/// Mirrors NCBI's BlastNaWordFinder loop: seed scan → exact extension →
-/// diagonal tracker → ungapped extension → save.
-///
-/// `subject`        — BLASTNA (1 byte/base) with sentinels; used for ungapped extension.
-/// `packed_subject` — NCBI2NA packed (4 bases/byte) starting at base-0 byte
-///                    (i.e., `seq_blk.compressed_nuc_seq()` = `packed[3..]`).
-fn collect_ungapped<S: SeedOut>(
-    query: &[u8],
-    ext_query: &[u8],
-    q_len: u32,
-    subject: &[u8],
-    packed_subject: &[u8],
-    s_len: u32,
-    strand: Strand,
-    lookup: &NaLookup,
-    params: &SearchParams,
-    matrix: &ScoreMatrix,
-    seed_out: &mut S,
-    ungapped: &mut Vec<UngappedRecord>,
-) {
-    let _ = (q_len, matrix);
 
-    let s_real = subject.len().saturating_sub(2);
-    let lw   = lookup.lut_word_length() as usize;
-    let step = lookup.scan_step() as usize;
+/// Per-thread scratch for collect_ungapped_combined; `put_back` returns it.
+struct ScanScratch {
+    batch: Vec<BlastOffsetPair>,
+    diag_hash: BlastDiagHash,
+}
 
-    // scan_start: for minus strand match NCBI's context-1 start offset so
-    // that covered subject positions align with the plus-strand FWD scan.
-    let scan_start = match strand {
-        Strand::Plus  => 0usize,
-        Strand::Minus => {
-            if step <= 1 || s_real < lw { 0 } else { (s_real - lw) % step }
+thread_local! {
+    static SCAN_SCRATCH: std::cell::RefCell<Option<ScanScratch>> = const { std::cell::RefCell::new(None) };
+}
+
+impl ScanScratch {
+    /// This thread's scratch (or a new one), with at least `batch_len`
+    /// offset slots and an empty diagonal hash.
+    fn take(batch_len: usize) -> Self {
+        let mut sc = SCAN_SCRATCH.with(|c| c.borrow_mut().take()).unwrap_or_else(|| ScanScratch {
+            batch: Vec::new(),
+            diag_hash: BlastDiagHash::new(),
+        });
+        if sc.batch.len() < batch_len {
+            sc.batch.resize(batch_len, BlastOffsetPair::default());
         }
-    };
-
-    let end_range = s_real.saturating_sub(lw) as i32;
-    if scan_start as i32 > end_range {
-        return;
+        sc.diag_hash.clear();
+        sc
     }
+}
 
-    let ext_needed = params.word_size as i64 - lookup.lut_word_length() as i64;
-    let q_real_len = query.len().saturating_sub(2) as i64;
-    let s_real_len = subject.len().saturating_sub(2) as i64;
-    let lut_w      = lookup.lut_word_length() as i64;
-    // KA-derived cutoff when the matrix+gap combo has ALP params (set per-search
-    // in search_db_parallel); otherwise the historical fixed min_raw_gapped_score/2.
-    let ungapped_cutoff = params
-        .ungapped_cutoff
-        .unwrap_or(params.min_raw_gapped_score / 2);
-
-    // Batch must exceed longest_chain so max_hits = batch_size - longest_chain > 0.
-    // A batch smaller than longest_chain causes the scan to break with 0 hits at the
-    // first hit position and never advance scan_range — an infinite loop.
-    let batch_size = (4096usize).max(lookup.longest_chain() as usize + 4096);
-    let mut batch  = vec![BlastOffsetPair::default(); batch_size];
-
-    // -----------------------------------------------------------------------
-    // Plus strand: scan ascending FWD_s → dedup in ascending FWD_s (correct).
-    //
-    // Minus strand: scan ascending RC_s = descending FWD_s.  NCBI processes
-    // minus-strand hits in ascending FWD_s order (leftmost-FWD seed wins on
-    // each diagonal).  To reproduce that without a global O(n log n) sort:
-    //   • Pass 1 (scan loop): collect all exactly-extended seeds into a Vec.
-    //   • Pass 2: iterate the Vec in REVERSE (= descending RC_s = ascending FWD_s)
-    //     and apply the same FWD-ascending dedup + ungapped extension.
-    // This is O(n) vs the old O(n log n) sort while giving identical results.
-    // -----------------------------------------------------------------------
-    let mut minus_seeds: Vec<(u32, u32)> = if strand == Strand::Minus { Vec::new() } else { Vec::new() };
-
-    let mut diag_hash = BlastDiagHash::new();
-
-    let mut scan_range = [scan_start as i32, end_range];
-    loop {
-        let n = lookup.scan(packed_subject, &mut batch, batch_size as i32, &mut scan_range);
-
-        for i in 0..n as usize {
-            let q0 = batch[i].q_off as i64;
-            let s0 = batch[i].s_off as i64;
-
-            // Exact extension: extend the lut_width-mer to a full word_size match.
-            let (q_off, s_off) = if ext_needed > 0 {
-                // NCBI's combined-LUT context-1 scans the forward subject and extends
-                // "left" in the combined buffer first.  For context-1 (RC query), "left"
-                // in the combined buffer corresponds to going RIGHT in forward-query space.
-                // Rust scans RC(subject) with the forward LUT, so "left" in Rust's scan
-                // means going LEFT in forward-query space — the opposite direction.
-                // Mirror NCBI: for minus strand try right (= NCBI ext_left, anchor-shifting)
-                // first; for plus strand try left first.
-                // NCBI: mask_at_hash=TRUE — masked query for exact word extension.
-                let (ext_left, ext_right) = if strand == Strand::Minus {
-                    // Minus strand: right extension (higher FWD-q, lower FWD-s) mirrors NCBI's
-                    // ext_left (left in ctx1 = right in FWD-q).  Try it first so that when
-                    // bases are available on both sides we land on the same seed as NCBI.
-                    let mut ext_right = 0i64;
-                    while ext_right < ext_needed {
-                        let qi = q0 + lut_w + ext_right;
-                        let si = s0 + lut_w + ext_right;
-                        if qi >= q_real_len || si >= s_real_len { break; }
-                        let qb = ext_query[1 + qi as usize];
-                        let sb = subject[1 + si as usize];
-                        if qb >= 4 || qb != sb { break; }
-                        ext_right += 1;
-                    }
-                    let mut ext_left = 0i64;
-                    while ext_left + ext_right < ext_needed {
-                        let qi = q0 - ext_left - 1;
-                        let si = s0 - ext_left - 1;
-                        if qi < 0 || si < 0 { break; }
-                        let qb = ext_query[1 + qi as usize];
-                        let sb = subject[1 + si as usize];
-                        if qb >= 4 || qb != sb { break; }
-                        ext_left += 1;
-                    }
-                    (ext_left, ext_right)
-                } else {
-                    // Plus strand: left extension (lower FWD-q, lower FWD-s) mirrors NCBI ext_left.
-                    let mut ext_left = 0i64;
-                    while ext_left < ext_needed {
-                        let qi = q0 - ext_left - 1;
-                        let si = s0 - ext_left - 1;
-                        if qi < 0 || si < 0 { break; }
-                        let qb = ext_query[1 + qi as usize];
-                        let sb = subject[1 + si as usize];
-                        if qb >= 4 || qb != sb { break; }
-                        ext_left += 1;
-                    }
-                    let mut ext_right = 0i64;
-                    while ext_left + ext_right < ext_needed {
-                        let qi = q0 + lut_w + ext_right;
-                        let si = s0 + lut_w + ext_right;
-                        if qi >= q_real_len || si >= s_real_len { break; }
-                        let qb = ext_query[1 + qi as usize];
-                        let sb = subject[1 + si as usize];
-                        if qb >= 4 || qb != sb { break; }
-                        ext_right += 1;
-                    }
-                    (ext_left, ext_right)
-                };
-                if ext_left + ext_right < ext_needed { continue; }
-                // Anchor position: plus strand shifts left by ext_left; minus strand
-                // shifts right by ext_right (= NCBI ext_left, the anchor-shifting direction).
-                // The stored (q_off, s_off) is the anchor used for diagonal tracking and
-                // ungapped extension; FWD-normalized seed left end = q_off - ext_needed (minus)
-                // or q_off (plus).
-                if strand == Strand::Minus {
-                    ((q0 + ext_right) as u32, (s0 + ext_right) as u32)
-                } else {
-                    ((q0 - ext_left) as u32, (s0 - ext_left) as u32)
-                }
-            } else {
-                (batch[i].q_off, batch[i].s_off)
-            };
-
-            match strand {
-                Strand::Minus => {
-                    // Defer dedup/extension: collect seeds for reverse-order pass below.
-                    minus_seeds.push((q_off, s_off));
-                }
-                Strand::Plus => {
-                    // Plus: ascending FWD_s — dedup and extend inline.
-                    let diag = (s_off as i32).wrapping_sub(q_off as i32);
-                    let last_se = diag_hash.get(diag);
-                    if s_off < last_se { continue; }
-
-                    seed_out.push_seed(SeedRecord { q_off, s_off, strand: Strand::Plus });
-                    crate::diag_count!(COUNT_SEEDS);
-                    let raw_p = extend_ungapped(query, subject, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
-                    let s_end_store = if raw_p.score >= ungapped_cutoff { raw_p.s_end } else { s_off + params.word_size as u32 };
-                    diag_hash.insert(diag, s_end_store, s_off, 1 - params.word_size as i32);
-                    if raw_p.score < ungapped_cutoff { continue; }
-                    let ung = raw_p;
-                    crate::diag_count!(COUNT_UNGAPPED_HITS);
-                    ungapped.push(UngappedRecord {
-                        q_seed: q_off, s_seed: s_off,
-                        q_start: ung.q_start, q_end: ung.q_end,
-                        s_start: ung.s_start, s_end: ung.s_end,
-                        score: ung.score, strand,
-                    });
-                }
-            }
-        }
-
-        if scan_range[0] > end_range { break; }
-    }
-
-    // Minus-strand pass 2: process collected seeds in reverse (descending RC_s =
-    // ascending FWD_s), mirroring the old sorted-by-(diag,-s_off) dedup order.
-    // diag_hash tracks rightmost FWD_s_end covered on each diagonal (FWD-space dedup).
-    if strand == Strand::Minus {
-        // Extend in NCBI's native (RC_query, FWD_subject) frame — see the detailed note
-        // in collect_ungapped_combined.  `subject` here is the RC subject (subj_rc); its
-        // revcomp is the forward subject.  `query` is forward; its revcomp is RC_query.
-        let q_len_local = query.len().saturating_sub(2) as u32;
-        let query_rc_full = revcomp_blastna(query);
-        let subject_fwd = revcomp_blastna(subject);
-        for &(q_off, s_off) in minus_seeds.iter().rev() {
-            let diag = (s_off as i32).wrapping_sub(q_off as i32);
-            // FWD-space coords: s_off is RC position; FWD right end = s_len - s_off.
-            let fwd_s_start = s_len.saturating_sub(s_off + params.word_size as u32);
-            let fwd_s_end   = s_len - s_off;
-            let last_fwd_se = diag_hash.get(diag);
-            if fwd_s_start < last_fwd_se { continue; }
-
-            let s_seed = s_len.saturating_sub(s_off + params.word_size as u32);
-            seed_out.push_seed(SeedRecord { q_off, s_off: s_seed, strand: Strand::Minus });
-            crate::diag_count!(COUNT_SEEDS);
-            let qn = q_len_local - 1 - q_off;
-            let sn = s_len - 1 - s_off;
-            let raw_ncbi = extend_ungapped(&query_rc_full, &subject_fwd, qn, sn, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
-            let raw_m = UngappedResult {
-                score:   raw_ncbi.score,
-                q_start: q_len_local - raw_ncbi.q_end,
-                q_end:   q_len_local - raw_ncbi.q_start,
-                s_start: s_len - raw_ncbi.s_end,
-                s_end:   s_len - raw_ncbi.s_start,
-            };
-            let fwd_se_store = if raw_ncbi.score >= ungapped_cutoff { raw_ncbi.s_end } else { fwd_s_end };
-            diag_hash.insert(diag, fwd_se_store, fwd_s_start, 1 - params.word_size as i32);
-            if raw_m.score < ungapped_cutoff { continue; }
-            let ung = raw_m;
-            crate::diag_count!(COUNT_UNGAPPED_HITS);
-            ungapped.push(UngappedRecord {
-                q_seed: q_off, s_seed: s_off,
-                q_start: ung.q_start, q_end: ung.q_end,
-                s_start: ung.s_start, s_end: ung.s_end,
-                score: ung.score, strand,
-            });
-        }
+impl ScanScratch {
+    fn put_back(self) {
+        SCAN_SCRATCH.with(|c| *c.borrow_mut() = Some(self));
     }
 }
 
@@ -1365,6 +1062,7 @@ fn collect_ungapped<S: SeedOut>(
 #[allow(clippy::too_many_arguments)]
 fn collect_ungapped_combined<S: SeedOut>(
     query: &[u8],
+    query_rc_full: &[u8],
     ext_query: &[u8],
     q_len: u32,
     subject_plus: &[u8],
@@ -1379,11 +1077,8 @@ fn collect_ungapped_combined<S: SeedOut>(
     seed_out: &mut S,
     ungapped: &mut Vec<UngappedRecord>,
 ) {
-    let _ = (q_len, matrix);
-
     let s_real = subject_plus.len().saturating_sub(2);
     let lw    = lookup.lut_word_length() as i64;
-    let step  = lookup.scan_step() as usize;
 
     let end_range = s_real.saturating_sub(lw as usize) as i32;
     if end_range < 0 { return; }
@@ -1396,25 +1091,29 @@ fn collect_ungapped_combined<S: SeedOut>(
     // (FWD_query, RC_subject) frame is score-equivalent but NOT decision-equivalent: the
     // adaptive-xdrop right extension scores bases in a different order, so X_current
     // tightens at different points and the committed endpoint can differ (bug #36).
-    let query_rc_full = revcomp_blastna(query);
     // KA-derived cutoff when the matrix+gap combo has ALP params (set per-search
-    // in search_db_parallel); otherwise the historical fixed min_raw_gapped_score/2.
+    // in search_db_parallel); otherwise NCBI's cutoff_score_max.
     let ungapped_cutoff = params
         .ungapped_cutoff
-        .unwrap_or(params.min_raw_gapped_score / 2);
+        .unwrap_or_else(|| params.cutoff_score_max());
     let c1 = c1_start as i64;
     let fn_ = fwd_n as i64;
 
     let batch_size = (4096usize).max(lookup.longest_chain() as usize + 4096);
-    let mut batch  = vec![BlastOffsetPair::default(); batch_size];
+    // The offset buffer and the diagonal hash are reused per thread: 3.0.12
+    // allocated and zeroed both for every subject, which was half of all the
+    // work for a short query against many subjects.  The scanner writes
+    // batch[0..n) before anything reads it, and a cleared hash is a new one.
+    let mut scratch = ScanScratch::take(batch_size);
+    let batch: &mut [BlastOffsetPair] = &mut scratch.batch[..batch_size];
 
     // Single shared hash table for both strands, matching NCBI's ewp->hash_table which
     // covers both context-0 (plus) and context-1 (minus) seeds in one 512-bucket table.
-    let mut diag_hash = BlastDiagHash::new();
+    let diag_hash = &mut scratch.diag_hash;
 
     let mut scan_range = [0i32, end_range];
     loop {
-        let n = lookup.scan(packed_fwd_subject, &mut batch, batch_size as i32, &mut scan_range);
+        let n = lookup.scan(packed_fwd_subject, batch, batch_size as i32, &mut scan_range);
 
         for i in 0..n as usize {
             let q0_combined = batch[i].q_off as i64;
@@ -1466,7 +1165,7 @@ fn collect_ungapped_combined<S: SeedOut>(
                 seed_out.push_seed(SeedRecord { q_off, s_off, strand: Strand::Plus });
                 crate::diag_count!(COUNT_SEEDS);
                 // NCBI: mask_at_hash=TRUE — unmasked query for ungapped extension scoring.
-                let raw_plus = extend_ungapped(query, subject_plus, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
+                let raw_plus = extend_ungapped(query, subject_plus, q_off, s_off, matrix, params.xdrop_ungap, i32::MIN).unwrap();
                 let s_end_store = if raw_plus.score >= ungapped_cutoff { raw_plus.s_end } else { s_off + params.word_size as u32 };
                 diag_hash.insert(diag, s_end_store, s_off, 1 - params.word_size as i32);
                 if raw_plus.score < ungapped_cutoff { continue; }
@@ -1548,7 +1247,7 @@ fn collect_ungapped_combined<S: SeedOut>(
                 // adjacent regions, diverging from NCBI and dedup-suppressing real seeds (#36).
                 let qn = q_len - 1 - q_off;
                 let sn = s_len - 1 - s_off;
-                let raw_ncbi = extend_ungapped(&query_rc_full, subject_plus, qn, sn, matrix, params.xdrop_ungap, i32::MIN, true).unwrap();
+                let raw_ncbi = extend_ungapped(query_rc_full, subject_plus, qn, sn, matrix, params.xdrop_ungap, i32::MIN).unwrap();
                 // Map (RC_q, FWD_s) result back to (FWD_q, RC_s) for UngappedRecord storage.
                 let raw_minus = UngappedResult {
                     score:   raw_ncbi.score,
@@ -1574,7 +1273,39 @@ fn collect_ungapped_combined<S: SeedOut>(
 
         if scan_range[0] > end_range { break; }
     }
-    let _ = step; // scan_step is encoded in the packed subject scan; kept for parity with collect_ungapped
+    scratch.put_back();
+}
+
+/// Sort ungapped hits as NCBI does before the preliminary gapped stage.
+fn sort_ungapped_like_ncbi(ungapped: &mut [UngappedRecord], q_len: u32, s_len: u32) {
+    // Mirrors Blast_InitHitListSortByScore / score_compare_match in blast_extend.c.
+    // NCBI sorts by combined-query q_start, which for plus strand = FWD q_start (< q_len)
+    // and for minus strand = c1_offset + (q_len - FWD_q_end) (>> q_len).  This naturally
+    // places all plus-strand hits before all minus-strand hits in the q_start tiebreaker.
+    // We replicate that by mapping: plus → q_start, minus → (q_len+1) + (q_len - q_end).
+    // NCBI also stores s_start in FWD-subject space (from the FWD scan), so we FWD-normalize.
+    ungapped.sort_unstable_by(|a, b| {
+        let a_ss = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
+        let b_ss = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
+        let a_qk = match a.strand { Strand::Plus => a.q_start as u64,
+                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(a.q_end as u64) };
+        let b_qk = match b.strand { Strand::Plus => b.q_start as u64,
+                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(b.q_end as u64) };
+        // s_seed ASC: word-hit position in FWD-subject coords — matches NCBI's effective
+        // insertion order (left-to-right scan) for hits with otherwise equal sort keys.
+        let a_sk = match a.strand { Strand::Plus => a.s_seed, Strand::Minus => s_len - a.s_seed };
+        let b_sk = match b.strand { Strand::Plus => b.s_seed, Strand::Minus => s_len - b.s_seed };
+        b.score.cmp(&a.score)
+            .then_with(|| a_ss.cmp(&b_ss))
+            .then_with(|| {
+                let la = a.s_end - a.s_start;
+                let lb = b.s_end - b.s_start;
+                lb.cmp(&la)
+            })
+            .then_with(|| a_qk.cmp(&b_qk))
+            .then_with(|| a_sk.cmp(&b_sk))
+    });
+
 }
 
 /// Phase 2a inner loop: for each pre-sorted ungapped hit, run preliminary gapped alignment
@@ -1593,12 +1324,11 @@ fn run_phase2a_inner(
     params: &SearchParams,
     matrix: &ScoreMatrix,
     lut_word_length: u32,
-    _chunk_offset: u32,
+    ws: &mut AlignWorkspace,
 ) -> Vec<PrelimHsp> {
     let mut accepted_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, sa_len + 1);
     let mut accepted_minus = BlastIntervalTree::new(0, qa_len + 1, 0, sa_len + 1);
     let mut prelim_hsps: Vec<PrelimHsp> = Vec::new();
-    let mut ws = AlignWorkspace::new();
 
     for ung in ungapped {
         let (cand_s_start, cand_s_end) = match ung.strand {
@@ -1615,56 +1345,15 @@ fn run_phase2a_inner(
             continue;
         }
 
-        let (q_seed_prelim, s_seed_prelim, q_seed_tb, s_seed_tb) = match ung.strand {
-            Strand::Plus => {
-                let (tb_q, tb_s) = if ung.s_end >= ung.s_seed + 8 {
-                    (ung.q_seed + 3, ung.s_seed + 3)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                let offset_adj = 4 - (tb_s % 4);
-                let mut pre_s = tb_s + offset_adj;
-                let mut pre_q = tb_q + offset_adj;
-                if pre_s >= sa_len || pre_q >= qa_len {
-                    pre_s -= 4;
-                    pre_q -= 4;
-                }
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-            Strand::Minus => {
-                let lw_u32 = lut_word_length as u32;
-                // NCBI gapped_start = rc_q_off + 3 (DynProg path adds 3).
-                // In FWD-genome: q_seed = q0 + ext_right, so q_seed + lw - 4 = rc_q_off + 3 - ext_right.
-                // Using q_seed (not q0_raw) correctly accounts for the extension shift.
-                //
-                // The +3 shift applies iff the ungapped alignment extends ≥8 bases to the RIGHT
-                // of the saved seed in FORWARD-subject space (NCBI blast_gapalign.c:4109
-                // `s_end >= init_hsp->s_off + 8`).  Mapping the (FWD_query, RC_subject) ungapped
-                // record to FWD-subject: saved seed = sa_len - ung.s_seed - lw, ungapped end =
-                // sa_len - ung.s_start.  The old condition `ung.s_end >= ung.s_seed + 8` tested
-                // the RC-subject end against the RC-subject anchor (wrong frame/direction) — see
-                // the matching fix and rationale in run_gapped_phase (bug #38).
-                let s_off_saved_fwd = sa_len - ung.s_seed - lw_u32;
-                let s_end_fwd       = sa_len - ung.s_start;
-                let (tb_q, tb_s) = if s_end_fwd >= s_off_saved_fwd + 8 {
-                    (ung.q_seed + lw_u32 - 4, ung.s_seed + lw_u32 - 4)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                let fwd_te_seed = sa_len - 1 - tb_s;
-                let offset_adj = 4 - (fwd_te_seed % 4);
-                let pre_s = tb_s.saturating_sub(offset_adj);
-                let pre_q = tb_q.saturating_sub(offset_adj);
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-        };
+        let (q_pivot, s_pivot, q_seed_tb, s_seed_tb) =
+            prelim_pivot(ung, qa_len, sa_len, lut_word_length);
 
         // NCBI: mask_at_hash=TRUE for blastn/rmblastn — DUST only affects lookup table,
         // not gapped alignment. Use unmasked query for Phase 2a.
         let (pq_seq, ps_seq, pq_seed, ps_seed) = if ung.strand == Strand::Minus {
-            (query_rc, subject_plus, qa_len - 1 - q_seed_prelim, sa_len - 1 - s_seed_prelim)
+            (query_rc, subject_plus, q_pivot, s_pivot)
         } else {
-            (query, subject_plus, q_seed_prelim, s_seed_prelim)
+            (query, subject_plus, q_pivot, s_pivot)
         };
         let phase2a_xdrop = params.xdrop_gap.min(ung.score);
         crate::diag_count!(COUNT_PRELIM_GAPPED);
@@ -1686,7 +1375,11 @@ fn run_phase2a_inner(
             }
         };
 
-        if prelim_score < params.min_raw_gapped_score {
+        // NCBI keeps a preliminary HSP iff score >= cutoff_score_min
+        // (blast_traceback.c:857), at least 1.  With --min-raw-gapped-score 0
+        // 3.0.12 kept score-0, zero-length prelims, which came out as hits
+        // like "0 q1 3940 3939".
+        if prelim_score < params.gapped_cutoff() {
             continue;
         }
 
@@ -1726,15 +1419,36 @@ pub fn run_phase2b(
     query: &[u8],
     query_rc: &[u8],
     query_id: &str,
-    subject_plus: &[u8],
+    subject: &PreparedSubject,
+    subject_id: &str,
+    prelim_hsps: Vec<PrelimHsp>,
+    params: &SearchParams,
+    matrix: &ScoreMatrix,
+    n_mask: &[u8],
+) -> Vec<AlignResult> {
+    traceback_phase(query, query_rc, query_id, subject, subject_id, prelim_hsps,
+                    params, matrix, n_mask, &mut AlignWorkspace::new())
+}
+
+/// Phase 2b for one subject: traceback of the preliminary HSPs, the
+/// common-endpoint cut and purge, and the final containment pass.  Shared by
+/// the single-chunk pipeline (run_gapped_phase) and the chunked one
+/// (run_phase2b).
+#[allow(clippy::too_many_arguments)]
+fn traceback_phase(
+    query: &[u8],
+    query_rc: &[u8],
+    query_id: &str,
+    subject: &PreparedSubject,
     subject_id: &str,
     mut prelim_hsps: Vec<PrelimHsp>,
     params: &SearchParams,
     matrix: &ScoreMatrix,
     n_mask: &[u8],
+    ws: &mut AlignWorkspace,
 ) -> Vec<AlignResult> {
     let qa_len = (query.len() - 2) as u32;
-    let s_len  = (subject_plus.len() - 2) as u32;
+    let s_len  = (subject.align.len() - 2) as u32;
     let sa_len = s_len;
 
     // query_rc (reverse-complement of the FULL query) is computed once by the caller
@@ -1743,19 +1457,11 @@ pub fn run_phase2b(
     // memory note on the chr22×longlib footprint).
     // CRandom bases at N/IUPAC positions are used only for seeding/ungapped extension.
     // For gapped alignment and improve_seed, NCBI scores ambiguous positions using the
-    // original ambiguity code (14=N, or 4-13 for S/M/R/Y/K/W etc.).
-    let subject_align_vec: Vec<u8> = if n_mask.is_empty() {
-        subject_plus.to_vec()
-    } else {
-        let mut s = subject_plus.to_vec();
-        for (i, &code) in n_mask.iter().enumerate() {
-            if code != 0 { s[i + 1] = code; }
-        }
-        s
-    };
-    let subject_plus: &[u8] = &subject_align_vec;
-    let subj_rc  = revcomp_blastna(subject_plus);
-    let mut ws   = AlignWorkspace::new();
+    // original ambiguity code (14=N, or 4-13 for S/M/R/Y/K/W etc.): the subject's
+    // cached `align` view and its reverse complement (3.0.12 rebuilt both per call).
+    debug_assert_eq!(subject.n_mask_rc.len(), n_mask.len(), "n_mask is not this subject's");
+    let subject_plus: &[u8] = &subject.align;
+    let subj_rc: &[u8] = &subject.align_rc;
 
     // ScoreCompareHSPs sort: score DESC, FWD s_start ASC, FWD s_end DESC,
     // query.offset ASC, query.end DESC.  NCBI coordinate transform per strand:
@@ -1826,7 +1532,7 @@ pub fn run_phase2b(
         let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
             let tq = qa_len - 1 - new_q_seed;
             let ts = sa_len - 1 - new_s_seed;
-            (&query_rc[..], subject_plus, tq, ts)
+            (query_rc, subject_plus, tq, ts)
         } else {
             (query, subject_plus, new_q_seed, new_s_seed)
         };
@@ -1836,7 +1542,7 @@ pub fn run_phase2b(
             tq_seq, ts_seq, tq_seed, ts_seed,
             params.gap_open, params.gap_extend,
             params.xdrop_gap_final,
-            matrix, &mut ws,
+            matrix, ws,
         );
         if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
             if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
@@ -1882,7 +1588,8 @@ pub fn run_phase2b(
         if params.complexity_adjust {
             match apply_complexity_adjust(
                 score, query, q_start, &edit_script, matrix,
-                params.min_raw_gapped_score,
+                // NCBI compares with cutoffs[ctx].cutoff_score (see gapped_cutoff)
+                params.gapped_cutoff(), phsp.strand == Strand::Minus,
             ) {
                 Some(adj) => score = adj,
                 None => { continue; }
@@ -1952,9 +1659,7 @@ pub fn run_phase2b(
         let rc_core  = &subj_rc[1..subj_rc.len() - 1];
         // Re-extraction for minus strand uses rc_core (reversed), so n_mask must be
         // reversed and each IUPAC code complemented to match the RC strand orientation.
-        let n_mask_rc_gapped: Vec<u8> = if n_mask.is_empty() { Vec::new() } else {
-            n_mask.iter().rev().map(|&c| if c == 0 { 0 } else { BLASTNA_COMPLEMENT[c as usize] }).collect()
-        };
+        let n_mask_rc_gapped: &[u8] = &subject.n_mask_rc;
 
         for slot in arr[extra_start..].iter_mut() {
             let mut r = match slot.take() { Some(r) => r, None => continue };
@@ -1969,7 +1674,7 @@ pub fn run_phase2b(
                 r.hsp.s_start as usize
             };
             let b_core = if is_minus { rc_core } else { src_core };
-            let b_mask_r = if is_minus { &n_mask_rc_gapped[..] } else { n_mask };
+            let b_mask_r = if is_minus { n_mask_rc_gapped } else { n_mask };
             let (q_seq, s_seq) = extract_aligned(q_core, b_core, a_start, b_start, &r.hsp.edit_script, b_mask_r);
 
             let delete = reevaluate_gapped(
@@ -1980,11 +1685,11 @@ pub fn run_phase2b(
                 params.gap_open,
                 params.gap_extend,
                 // NCBI Blast_HSPReevaluateWithAmbiguitiesGapped uses cutoff_score
-                // (= cutoffs[context].cutoff_score = min_raw_gapped_score for rmblastn)
-                // both for the run-restart logic and the final keep/delete decision
+                // (see SearchParams::gapped_cutoff) both for the run-restart
+                // logic and the final keep/delete decision
                 // (s_UpdateReevaluatedHSP: keep iff score >= cutoff_score).  Cut
                 // secondaries that re-score below this are deleted, not kept.
-                params.min_raw_gapped_score,
+                params.gapped_cutoff(),
                 is_minus,
                 q_core,
                 a_start,
@@ -2056,27 +1761,22 @@ pub fn run_phase2b(
     results
 }
 
-/// Phase 1 (ungapped) + Phase 2a (preliminary gapped) for one chunk × subject pair.
+/// Seeding, ungapped extension and Phase 2a (preliminary gapped alignment) for
+/// one chunk x subject pair of a multi-chunk query.
 ///
-/// Returns preliminary HSPs in **global** coordinates: q_start, q_end, q_seed are
-/// offset by `chunk_offset`; s coords are in strand-native subject space (unchanged).
-/// Call [`merge_chunk_prelims`] to combine adjacent-chunk results, then [`run_phase2b`]
-/// with the full query for the final traceback.
-/// Phase 2a: seeding (word extension + ungapped extension) + preliminary gapped alignment.
+/// Returns preliminary HSPs in **global** coordinates: q_start, q_end and q_seed
+/// are offset by `chunk_offset`; s coords are in strand-native subject space.
+/// The caller (main.rs) merges adjacent chunks' prelims, then runs
+/// [`run_phase2b`] with the full query.
 ///
-/// NCBI applies DUST masking as soft masking: the masked query is used for seeding
-/// (LUT + word extension check + ungapped extension scoring) AND for preliminary gapped
-/// Phase 2a: preliminary gapped alignment for multi-chunk searches.
-///
-/// `query`        — original unmasked chunk; used for Phase 2a gapped alignment (mask_at_hash=TRUE).
-/// `masked_query` — DUST-masked chunk; used for seeding (LUT lookup, word extension, ungapped scoring).
-///                  When dust=false, pass the same slice as query.
+/// `query`        — unmasked chunk; ungapped and gapped extension read it (NCBI mask_at_hash).
+/// `masked_query` — DUST-masked chunk, as `ql` was built from; exact word extension reads it.
+///                  When dust is off, pass the same slice as `query`.
 pub fn search_phase2a(
     ql: &QueryLookup,
     query: &[u8],
     masked_query: &[u8],
     subject_plus: &[u8],
-    _subject_id: &str,
     params: &SearchParams,
     matrix: &ScoreMatrix,
     chunk_offset: u32,
@@ -2089,7 +1789,7 @@ pub fn search_phase2a(
         return Vec::new();
     }
 
-    // Subject RC + NCBI2NA-packed strands for the scan: borrow from the shared
+    // Subject RC and the NCBI2NA-packed plus strand: borrow from the shared
     // per-subject cache when supplied, else compute locally (identical bytes).
     let local_prep;
     let prep: &PreparedSubject = match prepared {
@@ -2100,58 +1800,23 @@ pub fn search_phase2a(
             &local_prep
         }
     };
-    let (subj_rc, packed_plus, packed_minus): (&[u8], &[u8], &[u8]) =
-        (&prep.rc, &prep.packed_plus, &prep.packed_minus);
+    let (subj_rc, packed_plus): (&[u8], &[u8]) = (&prep.rc, &prep.packed_plus);
 
     let mut ungapped = Vec::new();
-    if ql.c1_start > 0 {
-        collect_ungapped_combined(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
-            ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-    } else {
-        collect_ungapped(
-            query, masked_query, q_len, subject_plus, &packed_plus[3..], s_len,
-            Strand::Plus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-        collect_ungapped(
-            query, masked_query, q_len, subj_rc, &packed_minus[3..], s_len,
-            Strand::Minus, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
-        );
-    }
+    collect_ungapped_combined(
+        query, ql.query_rc(query), masked_query, q_len, subject_plus, &packed_plus[3..], subj_rc, s_len,
+        ql.c1_start, ql.fwd_n, &ql.lookup, params, matrix, &mut DiscardSeeds, &mut ungapped,
+    );
 
-    // Same sort as run_gapped_phase (Blast_InitHitListSortByScore).
-    ungapped.sort_unstable_by(|a, b| {
-        let a_ss = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
-        let b_ss = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
-        let a_qk = match a.strand {
-            Strand::Plus  => a.q_start as u64,
-            Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(a.q_end as u64),
-        };
-        let b_qk = match b.strand {
-            Strand::Plus  => b.q_start as u64,
-            Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(b.q_end as u64),
-        };
-        let a_sk = match a.strand { Strand::Plus => a.s_seed, Strand::Minus => s_len - a.s_seed };
-        let b_sk = match b.strand { Strand::Plus => b.s_seed, Strand::Minus => s_len - b.s_seed };
-        b.score.cmp(&a.score)
-            .then_with(|| a_ss.cmp(&b_ss))
-            .then_with(|| {
-                let la = a.s_end - a.s_start;
-                let lb = b.s_end - b.s_start;
-                lb.cmp(&la)
-            })
-            .then_with(|| a_qk.cmp(&b_qk))
-            .then_with(|| a_sk.cmp(&b_sk))
-    });
+    sort_ungapped_like_ncbi(&mut ungapped, q_len, s_len);
 
-    let query_rc = revcomp_blastna(query);
+    let query_rc = ql.query_rc(query);
     let qa_len   = q_len;
     let sa_len   = s_len;
 
     let mut prelims = run_phase2a_inner(
-        query, &query_rc, subject_plus, qa_len, sa_len, &ungapped,
-        params, matrix, ql.lut_word_length(), chunk_offset,
+        query, query_rc, subject_plus, qa_len, sa_len, &ungapped,
+        params, matrix, ql.lut_word_length(), &mut AlignWorkspace::new(),
     );
 
     if chunk_offset > 0 {
@@ -2165,6 +1830,70 @@ pub fn search_phase2a(
     prelims
 }
 
+/// The Phase 2a pivot and the Phase 2b traceback seed for an ungapped hit,
+/// as NCBI computes them (blast_gapalign.c):
+/// - the +3 gapped_start shift when the ungapped alignment reaches at least 8
+///   bases right of the saved seed in forward-subject space
+///   (`s_end >= init_hsp->s_off + 8`), and
+/// - offset_adjustment, which rounds the start up to the next 4-base subject
+///   boundary, pulled back by 4 if that passes the end of either sequence
+///   (s_BlastDynProgNtGappedAlignment, `q_length > length` guard).
+///
+/// Returns (pivot_q, pivot_s, tb_q, tb_s).  The pivot is the q_length /
+/// s_length that gapped_extend_score_only takes, in the frame it runs in:
+/// forward for plus, NCBI's (RC query, forward subject) frame for minus.
+/// tb_* are in the record frame (forward query; RC subject for minus).
+///
+/// The single-chunk and the chunked pipelines used to carry a copy each, and
+/// the chunked copy still had the earlier minus formula, which differs when
+/// the +3 shift does not apply (review 3.1; e.g. identity.matrix).
+fn prelim_pivot(ung: &UngappedRecord, qa_len: u32, sa_len: u32, lw: u32) -> (u32, u32, u32, u32) {
+    match ung.strand {
+        Strand::Plus => {
+            let (tb_q, tb_s) = if ung.s_end >= ung.s_seed + 8 {
+                (ung.q_seed + 3, ung.s_seed + 3)
+            } else {
+                (ung.q_seed, ung.s_seed)
+            };
+            // Round the pivot to the next 4-base subject boundary.
+            let offset_adj = 4 - (tb_s % 4);
+            let mut pre_s = tb_s + offset_adj;
+            let mut pre_q = tb_q + offset_adj;
+            if pre_s >= sa_len || pre_q >= qa_len {
+                pre_s -= 4;
+                pre_q -= 4;
+            }
+            (pre_q, pre_s, tb_q, tb_s)
+        }
+        Strand::Minus => {
+            // The +3 condition in forward-subject space (bug #38): the record
+            // stores (forward query, RC subject), so the saved seed is
+            // sa_len - s_seed - lw and the ungapped end sa_len - s_start.
+            let s_off_saved_fwd = sa_len - ung.s_seed - lw;
+            let s_end_fwd = sa_len - ung.s_start;
+            let extends = s_end_fwd >= s_off_saved_fwd + 8;
+            let (tb_q, tb_s) = if extends {
+                (ung.q_seed + lw - 4, ung.s_seed + lw - 4)
+            } else {
+                (ung.q_seed, ung.s_seed)
+            };
+            // The pivot in NCBI's own frame, so the guard trims from the high
+            // end as NCBI's does (an RC-frame formula underflowed at the
+            // subject boundary, bug #42's neighbour).
+            let shift = if extends { 3 } else { 0 };
+            let q_off_n = (qa_len - ung.q_seed - lw) + shift; // RC query, word start (+3)
+            let s_off_n = (sa_len - ung.s_seed - lw) + shift; // forward subject, word start (+3)
+            let oa = 4 - (s_off_n % 4);
+            let (mut q_len_piv, mut s_len_piv) = (q_off_n + oa, s_off_n + oa);
+            if q_len_piv > qa_len || s_len_piv > sa_len {
+                q_len_piv -= 4;
+                s_len_piv -= 4;
+            }
+            (q_len_piv, s_len_piv, tb_q, tb_s)
+        }
+    }
+}
+
 /// Phase 2: preliminary gapped + traceback.
 ///
 /// Phase 2a (BLAST_GetGappedScore): sorts ungapped hits by score descending, runs
@@ -2175,9 +1904,9 @@ pub fn search_phase2a(
 /// alignment with traceback using xdrop_gap_final (100).
 fn run_gapped_phase<U: UngapOut>(
     query: &[u8],
+    query_rc: &[u8],
     query_id: &str,
     subject_plus: &[u8],
-    _subj_rc: &[u8],
     subject_id: &str,
     q_len: u32,
     s_len: u32,
@@ -2191,39 +1920,9 @@ fn run_gapped_phase<U: UngapOut>(
 ) -> Vec<AlignResult> {
     // N/IUPAC handling: NCBI uses CRandom (2-bit scan) for Phase 2a (score-only filter)
     // and the original ambiguity code for Phase 2b (full traceback + improve_seed + reevaluate).
-    // Phase 2a uses the original subject_plus/subj_rc parameters (CRandom at ambig positions).
-    // Phase 2b uses the align views below (original BLASTNA code at ambig positions),
-    // borrowed from the per-subject cache (built with this same n_mask).
-    let subject_align: &[u8] = &prep.align;
-    let subj_rc_align: &[u8] = &prep.align_rc;
-
-    // Mirrors Blast_InitHitListSortByScore / score_compare_match in blast_extend.c.
-    // NCBI sorts by combined-query q_start, which for plus strand = FWD q_start (< q_len)
-    // and for minus strand = c1_offset + (q_len - FWD_q_end) (>> q_len).  This naturally
-    // places all plus-strand hits before all minus-strand hits in the q_start tiebreaker.
-    // We replicate that by mapping: plus → q_start, minus → (q_len+1) + (q_len - q_end).
-    // NCBI also stores s_start in FWD-subject space (from the FWD scan), so we FWD-normalize.
-    ungapped.sort_unstable_by(|a, b| {
-        let a_ss = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
-        let b_ss = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
-        let a_qk = match a.strand { Strand::Plus => a.q_start as u64,
-                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(a.q_end as u64) };
-        let b_qk = match b.strand { Strand::Plus => b.q_start as u64,
-                                    Strand::Minus => (q_len as u64 + 1) + (q_len as u64).saturating_sub(b.q_end as u64) };
-        // s_seed ASC: word-hit position in FWD-subject coords — matches NCBI's effective
-        // insertion order (left-to-right scan) for hits with otherwise equal sort keys.
-        let a_sk = match a.strand { Strand::Plus => a.s_seed, Strand::Minus => s_len - a.s_seed };
-        let b_sk = match b.strand { Strand::Plus => b.s_seed, Strand::Minus => s_len - b.s_seed };
-        b.score.cmp(&a.score)
-            .then_with(|| a_ss.cmp(&b_ss))
-            .then_with(|| {
-                let la = a.s_end - a.s_start;
-                let lb = b.s_end - b.s_start;
-                lb.cmp(&la)
-            })
-            .then_with(|| a_qk.cmp(&b_qk))
-            .then_with(|| a_sk.cmp(&b_sk))
-    });
+    // Phase 2a gets subject_plus (CRandom bases at ambiguous positions); Phase 2b
+    // reads prep's align views (the original codes), built with this same n_mask.
+    sort_ungapped_like_ncbi(&mut ungapped, q_len, s_len);
 
     // Emit ungapped hits (sorted, FWD-normalized) for collection and optional debug dump.
     for ung in &ungapped {
@@ -2238,512 +1937,23 @@ fn run_gapped_phase<U: UngapOut>(
         });
     }
 
-    // Interval trees for Phase 2a containment (one per strand, mirrors NCBI BlastIntervalTree).
-    // Tree range = [0, query_non_sentinel_length + 1] matching NCBI's Blast_IntervalTreeInit.
-    let q_tree_end = (query.len() - 2) as u32 + 1;
-    let mut accepted_plus  = BlastIntervalTree::new(0, q_tree_end, 0, s_len + 1);
-    let mut accepted_minus = BlastIntervalTree::new(0, q_tree_end, 0, s_len + 1);
-    let mut prelim_hsps: Vec<PrelimHsp> = Vec::new();
-    let mut ws = AlignWorkspace::new();
+    // No ungapped hits, no prelims, no results (most subjects of a short
+    // query against a large library).
+    if ungapped.is_empty() {
+        return Vec::new();
+    }
 
-    // For minus-strand gapped alignment, use NCBI orientation (RC-query, FWD-subject) so the
-    // seed always lands in the LEFT (reverse) extension, matching BLAST_GappedAlignmentWithTraceback.
-    // Results are converted back to FWD-genomic + RC-subject before storage.
-    // NCBI: mask_at_hash=TRUE — masked query only affects lookup table, not gapped alignment.
-    let query_rc        = revcomp_blastna(query);
+    // Phase 2a, then 2b, sharing one workspace (the chunked pipeline runs
+    // the same two functions with a cross-chunk merge in between).
     let qa_len = (query.len() - 2) as u32;   // non-sentinel bases in query
     let sa_len = (subject_plus.len() - 2) as u32; // non-sentinel bases in subject
-
-    // Phase 2a: preliminary gapped alignment with xdrop_gap (mirrors BLAST_GetGappedScore).
-    for ung in &ungapped {
-        // Normalize candidate s coords to plus-strand for the interval tree query.
-        let (cand_s_start, cand_s_end) = match ung.strand {
-            Strand::Plus  => (ung.s_start, ung.s_end),
-            Strand::Minus => (s_len - ung.s_end, s_len - ung.s_start),
-        };
-        let plus = ung.strand == Strand::Plus;
-        let contained = {
-            let tree = if plus { &accepted_plus } else { &accepted_minus };
-            tree.contains(ung.q_start, ung.q_end, cand_s_start, cand_s_end,
-                          ung.score, plus, MIN_DIAG_SEP)
-        };
-        if contained {
-            continue;
-        }
-
-        // NCBI shifts the seed +3 before Phase 2a if the ungapped extension extends ≥8
-        // bases past the word-start (blast_gapalign.c lines 4041-4044).  It then rounds
-        // the Phase 2a pivot to the next 4-base subject boundary inside
-        // s_BlastDynProgNtGappedAlignment (offset_adjustment = 4 - (s_off % 4)).
-        // This rounding changes the prelim alignment boundaries, which in turn affects the
-        // search range used by BlastGetStartForGappedAlignmentNucl (improve_seed) in Phase
-        // 2b.  We must replicate the rounding so our improve_seed search covers the same
-        // region, even though 1-byte-per-base alignment doesn't require it algorithmically.
-        //
-        // Phase 2a uses (q_seed_prelim, s_seed_prelim) — the rounded pivot.
-        // Phase 2b uses (q_seed_tb, s_seed_tb) — the unrounded seed (stored as gapped_start).
-        //
-        // For plus strand: both +3 shift and 4-base rounding apply to Phase 2a.
-        //   offset_adj = 4 - ((s_seed + 3) % 4)  (always 1..=4)
-        //   prelim seed = (q_seed + 3 + offset_adj, s_seed + 3 + offset_adj)
-        //   tb seed     = (q_seed + 3, s_seed + 3)
-        //
-        // For minus strand: NCBI context-1 FWD-TE shifts correspond to RC-TE shifts in
-        //   the opposite direction.
-        //   NCBI Phase 2b seed (context-1): (q_off+3, s_off+3) → Rust FWD: (q_seed+wm4, s_seed+wm4).
-        //   NCBI Phase 2a rounding in FWD-TE: offset_adj = 4 - ((sa_len-1-s_seed_tb) % 4).
-        //   In RC-TE this subtracts offset_adj: prelim_s = s_seed_tb - offset_adj.
-        let (q_seed_prelim, s_seed_prelim, q_seed_tb, s_seed_tb) = match ung.strand {
-            Strand::Plus => {
-                let (tb_q, tb_s) = if ung.s_end >= ung.s_seed + 8 {
-                    (ung.q_seed + 3, ung.s_seed + 3)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                // Round Phase 2a pivot to next 4-base subject boundary (offset_adjustment).
-                let offset_adj = 4 - (tb_s % 4);
-                let mut pre_s = tb_s + offset_adj;
-                let mut pre_q = tb_q + offset_adj;
-                // Bound check mirrors NCBI: if pivot overshoots, pull back by 4.
-                if pre_s >= sa_len || pre_q >= qa_len {
-                    pre_s -= 4;
-                    pre_q -= 4;
-                }
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-            Strand::Minus => {
-                let lw_u32 = lut_word_length as u32;
-                // NCBI's +3 gapped_start shift (blast_gapalign.c:4109) applies iff the ungapped
-                // alignment extends ≥8 bases to the RIGHT of the saved seed in FORWARD-subject
-                // space: `s_end >= init_hsp->s_off + 8`, where init_hsp->s_off is the saved seed
-                // (FWD-subject) and s_end is the ungapped end (FWD-subject).  Rust stores the
-                // ungapped record in (FWD_query, RC_subject) coords, so map to FWD-subject:
-                //   saved seed FWD_s = sa_len - ung.s_seed - lw   (== NCBI init_hsp->s_off)
-                //   ungapped end FWD_s = sa_len - ung.s_start
-                // The previous condition `ung.s_end >= ung.s_seed + 8` tested the RC-subject end
-                // against the RC-subject anchor — the wrong frame AND the wrong direction.  It
-                // happened to agree with NCBI for most hits but gave the wrong answer when the
-                // ungapped extension to the right (FWD_s) of the seed landed within 8 bases of
-                // the boundary, dropping the +3 shift → traceback gapped_start 3bp off → 1bp
-                // gap-placement shift in homopolymer runs whenever improve_seed early-returns
-                // (bug #38).  This is the minus-strand analog of the plus branch's natural
-                // FWD-subject condition above.
-                let s_off_saved_fwd = sa_len - ung.s_seed - lw_u32; // saved seed, FWD-subject
-                let s_end_fwd       = sa_len - ung.s_start;         // ungapped end, FWD-subject
-                let extends = s_end_fwd >= s_off_saved_fwd + 8;
-                let (tb_q, tb_s) = if extends {
-                    (ung.q_seed + lw_u32 - 4, ung.s_seed + lw_u32 - 4)
-                } else {
-                    (ung.q_seed, ung.s_seed)
-                };
-                // Phase 2a seed: mirror NCBI's s_BlastDynProgNtGappedAlignment exactly, in
-                // NCBI's own (RC_query, FWD_subject) frame.  NCBI takes the ungapped seed
-                // offsets (with the +3 gapped_start shift above), then
-                // `offset_adjustment = 4 - (s_off % 4)` shifts the start UP to the next 4-base
-                // subject boundary (so the packed-nucleotide left extension starts on a byte
-                // boundary), with a guard that subtracts 4 when the shifted start would run past
-                // the END of either sequence.
-                //
-                // Computing the pivot in this FWD frame (rather than the mirror RC_subject
-                // frame) is essential: NCBI's guard trims from the HIGH end, so the pivot can
-                // never fall below 0.  The previous RC-frame formula applied the guard in the
-                // wrong direction and underflowed for seeds at the subject boundary
-                // (ung.s_seed≈0), producing a negative seed → out-of-bounds panic (mirslib,
-                // word_size 6).  For all non-boundary seeds this yields the identical pivot.
-                let shift = if extends { 3 } else { 0 };
-                let q_off_n = (qa_len - ung.q_seed - lw_u32) + shift; // RC_q word-left (+3)
-                let s_off_n = (sa_len - ung.s_seed - lw_u32) + shift; // FWD_s word-left (+3)
-                let oa = 4 - (s_off_n % 4); // offset_adjustment ∈ [1,4]
-                let mut q_len_piv = q_off_n + oa;
-                let mut s_len_piv = s_off_n + oa;
-                if q_len_piv > qa_len || s_len_piv > sa_len {
-                    q_len_piv -= 4;
-                    s_len_piv -= 4;
-                }
-                // Since bug #42, gapped_extend_score_only uses the pivot as NCBI's
-                // q_length/s_length directly — the EXCLUSIVE left bound / FIRST base of the
-                // right extension (left = [0, pivot)).  So the prelim pivot in NCBI's
-                // (RC_q, FWD_s) frame must equal q_len_piv / s_len_piv.  The caller maps
-                // back via `qa_len-1-pre_q` / `sa_len-1-pre_s`, so store the FWD-frame
-                // complement that yields pivot == q_len_piv: `qa_len-1-q_len_piv`.  (The
-                // plus branch already passes q_length directly; before #42 this used
-                // `qa_len-q_len_piv` to give pivot q_length-1, matching the old pivot-in-left
-                // split — that one-base offset became a latent minus-only bug at #42, only
-                // visible at the prelim-filter boundary, e.g. cc L2d_3end 181-vs-179.)
-                let pre_q = qa_len - 1 - q_len_piv;
-                let pre_s = sa_len - 1 - s_len_piv;
-                (pre_q, pre_s, tb_q, tb_s)
-            }
-        };
-
-        // Preliminary gapped alignment anchored at seed, with smaller xdrop_gap.
-        // Minus strand: use NCBI orientation (RC-query, FWD-TE) so seed lands in LEFT.
-        // NCBI: mask_at_hash=TRUE — DUST only affects lookup table, not gapped alignment.
-        let (pq_seq, ps_seq, pq_seed, ps_seed) = if ung.strand == Strand::Minus {
-            (&query_rc[..], subject_plus, qa_len - 1 - q_seed_prelim, sa_len - 1 - s_seed_prelim)
-        } else {
-            (query, subject_plus, q_seed_prelim, s_seed_prelim)
-        };
-        // NCBI caps Phase 2a xdrop at min(xdrop_gap, ungapped_score):
-        // blast_gapalign.c s_BlastDynProgNtGappedAlignment lines 2970-2972.
-        let phase2a_xdrop = params.xdrop_gap.min(ung.score);
-        crate::diag_count!(COUNT_PRELIM_GAPPED);
-        let prelim = gapped_extend_score_only(
-            pq_seq, ps_seq, pq_seed, ps_seed,
-            params.gap_open, params.gap_extend,
-            phase2a_xdrop,
-            matrix, &mut ws.dp_score,
-        );
-
-        let (prelim_score, q_start, q_end, s_start, s_end) = match prelim {
-            None => {
-                continue;
-            }
-            Some((sc, q0, q1, s0, s1)) => {
-                if ung.strand == Strand::Minus {
-                    // RC-query + FWD-TE → FWD-genomic + RC-TE
-                    (sc, qa_len - q1, qa_len - q0, sa_len - s1, sa_len - s0)
-                } else {
-                    (sc, q0, q1, s0, s1)
-                }
-            }
-        };
-
-        if prelim_score < params.min_raw_gapped_score {
-            continue;
-        }
-
-        // Normalize subject coordinates to plus-strand for the interval tree.
-        let (norm_s_start, norm_s_end) = match ung.strand {
-            Strand::Plus => (s_start, s_end),
-            Strand::Minus => (s_len - s_end, s_len - s_start),
-        };
-
-        // Add to interval tree using PRELIMINARY (compact) boundaries.
-        {
-            let tree = if ung.strand == Strand::Plus { &mut accepted_plus } else { &mut accepted_minus };
-            tree.add(ITreeHsp { q_start, q_end, s_start: norm_s_start, s_end: norm_s_end, score: prelim_score }, plus);
-        }
-
-        prelim_hsps.push(PrelimHsp {
-            q_seed: q_seed_tb,
-            s_seed: s_seed_tb,
-            q_start,
-            q_end,
-            s_start,  // in strand's subject space
-            s_end,
-            score: prelim_score,
-            strand: ung.strand,
-        });
-    }
-
-    // Mirrors Blast_HSPListPurgeHSPsWithCommonEndpoints (called in blast_engine.c between
-    // Phase 2a and Phase 2b). Removes prelim HSPs that share the same start or end
-    // coordinates, keeping only the best-scoring one in each group.
-    purge_prelim_common_endpoints(&mut prelim_hsps, s_len);
-
-    // Phase 2b: traceback with xdrop_gap_final (mirrors Blast_TracebackFromHSPList).
-    // NCBI sorts the preliminary HSP list by ScoreCompareHSPs: score DESC, then
-    // subject.offset ASC (FWD s_start), subject.end DESC, query.offset ASC, query.end DESC.
-    // NCBI coordinate transform per strand:
-    //   plus:  query.offset = FWD_qs,        query.end = FWD_qe
-    //   minus: query.offset = qlen - FWD_qe, query.end = qlen - FWD_qs
-    prelim_hsps.sort_by(|a, b| {
-        let fwd_sa = match a.strand { Strand::Plus => a.s_start, Strand::Minus => s_len - a.s_end };
-        let fwd_sb = match b.strand { Strand::Plus => b.s_start, Strand::Minus => s_len - b.s_end };
-        let fwd_ea = match a.strand { Strand::Plus => a.s_end, Strand::Minus => s_len - a.s_start };
-        let fwd_eb = match b.strand { Strand::Plus => b.s_end, Strand::Minus => s_len - b.s_start };
-        let q_off_a = match a.strand { Strand::Plus => a.q_start, Strand::Minus => qa_len - a.q_end };
-        let q_off_b = match b.strand { Strand::Plus => b.q_start, Strand::Minus => qa_len - b.q_end };
-        let q_end_a = match a.strand { Strand::Plus => a.q_end, Strand::Minus => qa_len - a.q_start };
-        let q_end_b = match b.strand { Strand::Plus => b.q_end, Strand::Minus => qa_len - b.q_start };
-        b.score.cmp(&a.score)
-            .then_with(|| fwd_sa.cmp(&fwd_sb))
-            .then_with(|| fwd_eb.cmp(&fwd_ea))
-            .then_with(|| q_off_a.cmp(&q_off_b))
-            .then_with(|| q_end_b.cmp(&q_end_a))
-    });
-
-    // Interval trees for Phase 2b containment (mirrors NCBI BlastIntervalTree in
-    // Blast_TracebackFromHSPList — same structure as Phase 2a, separate per strand).
-    let mut tb_accepted_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, s_len + 1);
-    let mut tb_accepted_minus = BlastIntervalTree::new_rc(0, qa_len + 1, 0, s_len + 1);
-    let mut results: Vec<AlignResult> = Vec::new();
-
-    for phsp in &prelim_hsps {
-        // Containment check: is the preliminary HSP enclosed by an already-accepted
-        // traceback HSP? Mirrors BlastIntervalTreeContainsHSP in Blast_TracebackFromHSPList.
-        let (ps_start, ps_end) = match phsp.strand {
-            Strand::Plus  => (phsp.s_start, phsp.s_end),
-            Strand::Minus => (s_len - phsp.s_end, s_len - phsp.s_start),
-        };
-        let plus2 = phsp.strand == Strand::Plus;
-        let prelim_contained = {
-            let tree = if plus2 { &tb_accepted_plus } else { &tb_accepted_minus };
-            let (cq_start, cq_end) = if plus2 {
-                (phsp.q_start, phsp.q_end)
-            } else {
-                (qa_len - phsp.q_end, qa_len - phsp.q_start)
-            };
-            tree.contains(cq_start, cq_end, ps_start, ps_end,
-                          phsp.score, plus2, MIN_DIAG_SEP)
-        };
-        if prelim_contained {
-            continue;
-        }
-
-        // improve_seed still operates in FWD-genomic + RC-TE space (PrelimHsp coords).
-        // NCBI: mask_at_hash=TRUE — unmasked query for improve_seed and Phase 2b traceback.
-        let sa_for_seed = if phsp.strand == Strand::Minus {
-            &subj_rc_align[1..subj_rc_align.len() - 1]
-        } else {
-            &subject_align[1..subject_align.len() - 1]
-        };
-        let qa_for_seed = &query[1..query.len() - 1];
-
-        let (new_q_seed, new_s_seed) = improve_seed(
-            qa_for_seed, sa_for_seed,
-            phsp.q_seed, phsp.s_seed,
-            phsp.q_start, phsp.q_end,
-            phsp.s_start, phsp.s_end,
-            phsp.strand == Strand::Minus,
-        );
-        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
-            eprintln!("RUST_IMPROVE strand={:?} prelim q=[{},{}] s=[{},{}] seed=({},{}) -> ({},{})",
-                phsp.strand, phsp.q_start, phsp.q_end, phsp.s_start, phsp.s_end,
-                phsp.q_seed, phsp.s_seed, new_q_seed, new_s_seed);
-        }
-
-        // Full traceback: minus strand uses NCBI orientation (RC-query, FWD-TE) so seed is in LEFT.
-        let (tq_seq, ts_seq, tq_seed, ts_seed) = if phsp.strand == Strand::Minus {
-            let tq = qa_len - 1 - new_q_seed;
-            let ts = sa_len - 1 - new_s_seed;
-            (&query_rc[..], &subject_align[..], tq, ts)
-        } else {
-            (query, &subject_align[..], new_q_seed, new_s_seed)
-        };
-
-        crate::diag_count!(COUNT_FINAL_GAPPED);
-        let gapped = gapped_extend_bidirectional(
-            tq_seq, ts_seq, tq_seed, ts_seed,
-            params.gap_open, params.gap_extend,
-            params.xdrop_gap_final,
-            matrix, &mut ws,
-        );
-        if crate::diag_enabled!("RMBLAST_DUMP_IMPROVE") {
-            if let Some((sc, q0, q1, s0, s1, _)) = &gapped {
-                eprintln!("RUST_TB seed=({},{}) -> score={} q=[{},{}] s=[{},{}]",
-                    tq_seed, ts_seed, sc, q0, q1, s0, s1);
-            }
-        }
-        let (mut score, q_start, q_end, s_start, s_end, mut edit_script, q_bases, s_bases) = match gapped {
-            None => continue,
-            Some((sc, q0, q1, s0, s1, es)) => {
-                if phsp.strand == Strand::Minus {
-                    let (qb, sb) = extract_aligned(
-                        &query_rc[1..query_rc.len() - 1],
-                        &subject_align[1..subject_align.len() - 1],
-                        q0 as usize,
-                        s0 as usize,
-                        &es,
-                        n_mask,
-                    );
-                    let (fqs, fqe, fss, fse) = (qa_len - q1, qa_len - q0, sa_len - s1, sa_len - s0);
-                    (sc, fqs, fqe, fss, fse, es,
-                     revcomp_blastna(&qb), revcomp_blastna(&sb))
-                } else {
-                    let (qb, sb) = extract_aligned(
-                        &query[1..query.len() - 1],
-                        &subject_align[1..subject_align.len() - 1],
-                        q0 as usize,
-                        s0 as usize,
-                        &es,
-                        n_mask,
-                    );
-                    (sc, q0, q1, s0, s1, es, qb, sb)
-                }
-            }
-        };
-        if phsp.strand == Strand::Minus {
-            edit_script.reverse();
-        }
-
-        // Score filter: complexity_adjust only. NCBI does not re-apply min_raw_gapped_score
-        // after Phase 2b traceback — hits that passed Phase 2a are kept regardless of final score.
-        if params.complexity_adjust {
-            match apply_complexity_adjust(
-                score, query, q_start, &edit_script, matrix,
-                params.min_raw_gapped_score,
-            ) {
-                Some(adj) => score = adj,
-                None => {
-                    continue;
-                }
-            }
-        }
-
-        // Normalize subject coordinates to plus-strand for output.
-        let (report_q_start, report_q_end, report_s_start, report_s_end) = match phsp.strand {
-            Strand::Plus => (q_start, q_end, s_start, s_end),
-            Strand::Minus => (q_start, q_end, s_len - s_end, s_len - s_start),
-        };
-
-        crate::diag_count!(COUNT_FINAL_HITS);
-
-        // Add traceback result to the interval tree so subsequent prelim HSPs
-        // can be checked against it.
-        {
-            let tree = if phsp.strand == Strand::Plus { &mut tb_accepted_plus } else { &mut tb_accepted_minus };
-            let (tree_qs, tree_qe) = if phsp.strand == Strand::Plus {
-                (report_q_start, report_q_end)
-            } else {
-                (qa_len - report_q_end, qa_len - report_q_start)
-            };
-            tree.add(ITreeHsp { q_start: tree_qs, q_end: tree_qe,
-                                s_start: report_s_start, s_end: report_s_end, score }, true);
-        }
-
-        let q_iupac = blastna_to_iupac_aligned(&q_bases);
-        let s_iupac = blastna_to_iupac_aligned(&s_bases);
-        // subject is ancestral (repeat consensus), query is derived (genome) — matches NCBI
-        let stats = compute_align_stats(&q_iupac, &s_iupac, false);
-
-        results.push(AlignResult {
-            hsp: Hsp {
-                score,
-                q_start: report_q_start,
-                q_end: report_q_end,
-                q_len,
-                s_start: report_s_start,
-                s_end: report_s_end,
-                s_len,
-                strand: phsp.strand,
-                edit_script,
-                q_seq: q_bases,
-                s_seq: s_bases,
-            },
-            query_id: query_id.to_string(),
-            subject_id: subject_id.to_string(),
-            stats,
-        });
-    }
-
-    // NCBI PurgeHSPsWithCommonEndpoints (blast_traceback.c lines 638-687):
-    // First pass (purge=FALSE): cut secondaries and reevaluate via
-    // Blast_HSPReevaluateWithAmbiguitiesGapped.  Second pass (purge=TRUE): delete.
-    {
-        // NCBI blast_traceback.c:658/688 — purge(FALSE) cut pass, re-trace the cut
-        // remainders (arr[extra_start..]) in array order, PurgeNull, purge(TRUE).
-        let mut arr: Vec<Option<AlignResult>> =
-            std::mem::take(&mut results).into_iter().map(Some).collect();
-        let extra_start = purge_hsps_with_common_endpoints(&mut arr, false);
-
-        let q_core   = &query[1..query.len() - 1];
-        let src_core = &subject_align[1..subject_align.len() - 1];
-        let rc_core  = &subj_rc_align[1..subj_rc_align.len() - 1];
-        let n_mask_rc_2b: &[u8] = &prep.n_mask_rc;
-
-        for slot in arr[extra_start..].iter_mut() {
-            let mut r = match slot.take() { Some(r) => r, None => continue };
-            let is_minus = r.hsp.strand == Strand::Minus;
-            let a_start = r.hsp.q_start as usize;
-            let b_start = if is_minus {
-                (sa_len - r.hsp.s_end) as usize
-            } else {
-                r.hsp.s_start as usize
-            };
-            let b_core = if is_minus { rc_core } else { src_core };
-            let b_mask_2b = if is_minus { &n_mask_rc_2b[..] } else { n_mask };
-            let (q_seq, s_seq) = extract_aligned(q_core, b_core, a_start, b_start, &r.hsp.edit_script, b_mask_2b);
-
-            let delete = reevaluate_gapped(
-                &mut r.hsp,
-                &q_seq,
-                &s_seq,
-                matrix,
-                params.gap_open,
-                params.gap_extend,
-                // NCBI Blast_HSPReevaluateWithAmbiguitiesGapped uses cutoff_score
-                // (= cutoffs[context].cutoff_score = min_raw_gapped_score for rmblastn)
-                // both for the run-restart logic and the final keep/delete decision
-                // (s_UpdateReevaluatedHSP: keep iff score >= cutoff_score).  Cut
-                // secondaries that re-score below this are deleted, not kept.
-                params.min_raw_gapped_score,
-                is_minus,
-                q_core,
-                a_start,
-                b_core,
-                b_start,
-            );
-            if delete { continue; }
-
-            // Rebuild q_seq/s_seq/stats for the trimmed region.
-            let a_start2 = r.hsp.q_start as usize;
-            let b_start2 = if is_minus {
-                (sa_len - r.hsp.s_end) as usize
-            } else {
-                r.hsp.s_start as usize
-            };
-            let (q2, s2) = extract_aligned(q_core, b_core, a_start2, b_start2, &r.hsp.edit_script, b_mask_2b);
-            let q_iupac2 = blastna_to_iupac_aligned(&q2);
-            let s_iupac2 = blastna_to_iupac_aligned(&s2);
-            r.stats = compute_align_stats(&q_iupac2, &s_iupac2, false);
-            r.hsp.q_seq = q2;
-            r.hsp.s_seq = s2;
-
-            *slot = Some(r);
-        }
-
-        results = arr.into_iter().flatten().collect();
-
-        let mut arr2: Vec<Option<AlignResult>> =
-            std::mem::take(&mut results).into_iter().map(Some).collect();
-        purge_hsps_with_common_endpoints(&mut arr2, true);
-        results = arr2.into_iter().flatten().collect();
-    }
-
-    // NCBI Phase 2c: third containment check (blast_traceback.c lines 678-692).
-    // Sort traceback results by score descending, then for each result drop it if
-    // its BOTH endpoints fall inside a higher-scoring (or equal) already-accepted
-    // result on the same strand.  Mirrors BlastIntervalTreeContainsHSP, which
-    // requires BOTH spatial containment AND diagonal proximity (MB_HSP_CLOSE):
-    // at least one endpoint must be within MIN_DIAG_SEP diagonals of the accepted
-    // hit.  Sub-alignments on different diagonals are NOT removed.
-    // Sort traceback results by ScoreCompareHSPs (NCBI coordinate space):
-    // score DESC, s_start ASC, s_end DESC, query.offset ASC, query.end DESC.
-    // For minus strand: query.offset = qlen - FWD_qe (ASC → FWD_qe DESC),
-    //                   query.end   = qlen - FWD_qs (DESC → FWD_qs ASC).
-    results.sort_by(|a, b| {
-        let q_off_a = match a.hsp.strand { Strand::Plus => a.hsp.q_start, Strand::Minus => qa_len - a.hsp.q_end };
-        let q_off_b = match b.hsp.strand { Strand::Plus => b.hsp.q_start, Strand::Minus => qa_len - b.hsp.q_end };
-        let q_end_a = match a.hsp.strand { Strand::Plus => a.hsp.q_end, Strand::Minus => qa_len - a.hsp.q_start };
-        let q_end_b = match b.hsp.strand { Strand::Plus => b.hsp.q_end, Strand::Minus => qa_len - b.hsp.q_start };
-        b.hsp.score.cmp(&a.hsp.score)
-            .then_with(|| a.hsp.s_start.cmp(&b.hsp.s_start))
-            .then_with(|| b.hsp.s_end.cmp(&a.hsp.s_end))
-            .then_with(|| q_off_a.cmp(&q_off_b))
-            .then_with(|| q_end_b.cmp(&q_end_a))
-    });
-    // Phase 2c containment: interval trees per strand (mirrors Phase 2a structure).
-    let mut final_plus  = BlastIntervalTree::new(0, qa_len + 1, 0, s_len + 1);
-    let mut final_minus = BlastIntervalTree::new(0, qa_len + 1, 0, s_len + 1);
-    results.retain(|r| {
-        let plus3 = r.hsp.strand == Strand::Plus;
-        let contained = {
-            let tree = if plus3 { &final_plus } else { &final_minus };
-            tree.contains(r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end,
-                          r.hsp.score, plus3, MIN_DIAG_SEP)
-        };
-        if !contained {
-            let tree = if plus3 { &mut final_plus } else { &mut final_minus };
-            tree.add_simple(ITreeHsp { q_start: r.hsp.q_start, q_end: r.hsp.q_end,
-                                s_start: r.hsp.s_start, s_end: r.hsp.s_end,
-                                score: r.hsp.score });
-        }
-        !contained
-    });
-
-    results
+    let mut ws = AlignWorkspace::new();
+    let prelim_hsps = run_phase2a_inner(
+        query, query_rc, subject_plus, qa_len, sa_len, &ungapped,
+        params, matrix, lut_word_length, &mut ws,
+    );
+    traceback_phase(query, query_rc, query_id, prep, subject_id, prelim_hsps,
+                    params, matrix, n_mask, &mut ws)
 }
 
 /// Remove prelim HSPs that share a start or end point with a higher-scoring prelim HSP.
@@ -2792,10 +2002,6 @@ fn purge_prelim_common_endpoints(prelim_hsps: &mut Vec<PrelimHsp>, sa_len: u32) 
         idx.sort_unstable_by(|&a, &b| {
             let ha = &prelim_hsps[a];
             let hb = &prelim_hsps[b];
-            // NCBI s_QueryOffsetCompareHSPs: after (ctx, q_off, s_off, score DESC),
-            // tiebreaker is query.end DESC.  For plus strand, query.end = FWD_qe → DESC.
-            // For minus strand, NCBI query.end = qlen - FWD_qs → DESC means SMALLER
-            // FWD_qs (more leftward start) wins, so we sort ASC on q_end_key (= FWD_qs).
             // NCBI s_QueryOffsetCompareHSPs: after (ctx, q_off, s_off, score DESC),
             // tiebreaker is query.end DESC.  For plus strand, query.end = FWD_qe → DESC.
             // For minus strand, NCBI query.end = qlen - FWD_qs → DESC means SMALLER
@@ -3460,9 +2666,13 @@ fn cut_start_secondary(primary: &AlignResult, sec: &mut AlignResult) -> bool {
         Strand::Minus => {
             let dq = sec.hsp.q_end.saturating_sub(primary.hsp.q_start);
             let ds = primary.hsp.s_end.saturating_sub(sec.hsp.s_start);
+            let old_q_end = sec.hsp.q_end;
             let old_s_start = sec.hsp.s_start;
-            let (ok, _gq, gs) = cut_ops_back(&mut sec.hsp.edit_script.ops, dq, ds);
-            if ok { sec.hsp.q_end = primary.hsp.q_start; sec.hsp.s_start = old_s_start + gs; }
+            let (ok, gq, gs) = cut_ops_back(&mut sec.hsp.edit_script.ops, dq, ds);
+            // gq is the query span actually cut, which can exceed dq at a gap
+            // (as the plus branch uses it); 3.0.12 set q_end = primary.q_start,
+            // right only when gq == dq (review 3.6).
+            if ok { sec.hsp.q_end = old_q_end - gq; sec.hsp.s_start = old_s_start + gs; }
         }
     }
     !sec.hsp.edit_script.ops.is_empty()
@@ -3878,7 +3088,8 @@ mod tests {
     /// array order.
     #[test]
     fn purge_common_endpoints_matches_shift_to_end_layout() {
-        fn fingerprint(arr: &[Option<AlignResult>]) -> Vec<Option<(i32, u32, u32, u32, u32, Strand, Vec<(EditOp, u32)>)>> {
+        type Fingerprint = (i32, u32, u32, u32, u32, Strand, Vec<(EditOp, u32)>);
+        fn fingerprint(arr: &[Option<AlignResult>]) -> Vec<Option<Fingerprint>> {
             arr.iter().map(|o| o.as_ref().map(|r| (
                 r.hsp.score, r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end,
                 r.hsp.strand, r.hsp.edit_script.ops.clone(),
@@ -4017,7 +3228,7 @@ mod tests {
         let mut got: Vec<(i32, u32, u32, u32, u32)> = hsps.iter()
             .map(|h| (h.score, h.q_start, h.q_end, h.s_start, h.s_end))
             .collect();
-        got.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        got.sort_unstable_by_key(|g| std::cmp::Reverse(g.0));
         assert_eq!(got[0], (1044, 2,   322, 7,   292));
         assert_eq!(got[1], (160,  88,  182, 2,   96));
         assert_eq!(got[2], (110,  278, 341, 197, 260));
@@ -4044,7 +3255,7 @@ mod tests {
         let mut got: Vec<(i32, u32, u32, u32, u32)> = results.iter()
             .map(|r| (r.hsp.score, r.hsp.q_start, r.hsp.q_end, r.hsp.s_start, r.hsp.s_end))
             .collect();
-        got.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        got.sort_unstable_by_key(|g| std::cmp::Reverse(g.0));
         assert_eq!(got[0], (1044, 2,   322, 7,   292));
         assert_eq!(got[1], (160,  88,  182, 2,   96));
         assert_eq!(got[2], (110,  278, 341, 197, 260));
@@ -4092,6 +3303,114 @@ mod tests {
         assert_eq!(q_start_set, expected);
     }
 
+    /// NCBI's overlap percentage divides in double first: 29 of 50 bases is
+    /// (Int4)(100 * 0.58) = 57, not 2900/50 = 58, so at mask level 58 the
+    /// weaker HSP survives.  And at mask level 0 an HSP that only touches a
+    /// better one is masked (overlap 0, 0 >= 0); at 1 it is not.
+    #[test]
+    fn mask_level_percent_and_touching_like_ncbi() {
+        // better [0,50), weaker [21,71): overlap 29 of the weaker's 50
+        let mk = || vec![make_result(100, 0, 50, 0, 50), make_result(90, 21, 71, 21, 71)];
+        let mut r = mk();
+        apply_mask_level(&mut r, 58, &[]);
+        assert_eq!(r.len(), 2, "57% overlap must not mask at level 58");
+        let mut r = mk();
+        apply_mask_level(&mut r, 57, &[]);
+        assert_eq!(r.len(), 1);
+
+        let touch = || vec![make_result(100, 0, 50, 0, 50), make_result(90, 50, 100, 50, 100)];
+        let mut r = touch();
+        apply_mask_level(&mut r, 0, &[]);
+        assert_eq!(r.len(), 1, "touching masks at level 0");
+        let mut r = touch();
+        apply_mask_level(&mut r, 1, &[]);
+        assert_eq!(r.len(), 2);
+    }
+
+    /// A match that ends on the subject's last base is found, on both strands,
+    /// for every subject length mod 4 and a range of word sizes: the scanners
+    /// read the packed subject's last word, which must sit inside the buffer
+    /// (see blast_compress_blastna_sequence's tail pad).
+    #[test]
+    fn match_at_subject_end_found_for_every_length() {
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut base = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; b"ACGT"[(x % 4) as usize] };
+        let query: Vec<u8> = (0..64).map(|_| base()).collect();
+        let rc: Vec<u8> = query.iter().rev().map(|&b| match b { b'A' => b'T', b'C' => b'G', b'G' => b'C', _ => b'A' }).collect();
+        let q = dna_to_blastna_sentinels(&query);
+        let matrix = blastn_1m3_matrix();
+        for &ws in &[4usize, 5, 7, 8, 11, 12, 14, 16, 20, 28] {
+            let params = SearchParams { word_size: ws, min_raw_gapped_score: ws as i32, dust: false, ..Default::default() };
+            for len in ws..ws + 48 {
+                let k = len.min(48);
+                for minus in [false, true] {
+                    let mut subj: Vec<u8> = (0..len - k).map(|_| base()).collect();
+                    // plus: subject ends with query[..k]; minus: with revcomp(query[64-k..])
+                    if minus { subj.extend_from_slice(&rc[..k]); } else { subj.extend_from_slice(&query[..k]); }
+                    let s = dna_to_blastna_sentinels(&subj);
+                    let hits = search_query_vs_subject(&q, "q", &s, "s", &params, &matrix);
+                    let want = if minus { Strand::Minus } else { Strand::Plus };
+                    let at_end = hits.iter().any(|h| h.hsp.strand == want && if minus {
+                        h.hsp.s_start == 0 || h.hsp.s_end == len as u32 } else { h.hsp.s_end == len as u32 });
+                    assert!(at_end, "ws {ws} len {len} minus {minus}: no hit at the subject end; hits {:?}",
+                        hits.iter().map(|h| (h.hsp.strand, h.hsp.q_start, h.hsp.q_end, h.hsp.s_start, h.hsp.s_end)).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    /// Random HSPs in a small query range (so overlaps, touches and both
+    /// strands are common), distinct scores so the sort is score order.
+    fn random_hsps(n: usize, seed: u64) -> Vec<AlignResult> {
+        let mut x = seed;
+        let mut rnd = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let mut scores: Vec<i32> = (0..n as i32).map(|i| 1000 + 7 * i).collect();
+        for i in (1..n).rev() { scores.swap(i, (rnd() % (i as u64 + 1)) as usize); }
+        (0..n).map(|i| {
+            let qs = (rnd() % 2000) as u32;
+            let len = [1u32, 2, 50, 100, 400, 1500][(rnd() % 6) as usize];
+            let mut r = make_result(scores[i], qs, qs + len, 0, len);
+            r.hsp.q_len = 4000;
+            if rnd() % 2 == 0 { r.hsp.strand = Strand::Minus; }
+            r
+        }).collect()
+    }
+
+    /// apply_mask_level against a brute-force reading of NCBI's rule: in
+    /// score order, an HSP is masked if any kept, at-least-as-good HSP covers
+    /// (int)(100 * (overlap / span)) >= level of its query span, minus-strand
+    /// coordinates shifted by +1, touching counting only at level 0.
+    #[test]
+    fn mask_level_matches_brute_force() {
+        for seed in 1..=20u64 {
+            for &level in &[0u32, 1, 29, 57, 58, 80, 99] {
+                let input = random_hsps(600, seed.wrapping_mul(0x9E3779B97F4A7C15));
+                let mut want: Vec<AlignResult> = Vec::new();
+                let mut sorted = input.clone();
+                sorted.sort_by_key(|r| std::cmp::Reverse(r.hsp.score));
+                let range = |r: &AlignResult| {
+                    let d = (r.hsp.strand == Strand::Minus) as u32;
+                    (r.hsp.q_start + d, r.hsp.q_end + d)
+                };
+                for r in sorted {
+                    let (qs, qe) = range(&r);
+                    let span = (qe - qs) as f64;
+                    let masked = want.iter().any(|k| {
+                        let (ks, ke) = range(k);
+                        let ovlp = ke.min(qe) as i64 - ks.max(qs) as i64;
+                        (ovlp > 0 || (ovlp == 0 && level == 0))
+                            && (100.0 * (ovlp as f64 / span)) as i64 >= level as i64
+                    });
+                    if !masked { want.push(r); }
+                }
+                let mut got = input.clone();
+                apply_mask_level(&mut got, level, &[]);
+                let key = |v: &[AlignResult]| v.iter().map(|r| r.hsp.score).collect::<Vec<_>>();
+                assert_eq!(key(&got), key(&want), "seed {seed} level {level}");
+            }
+        }
+    }
+
     // Port of NCBI's nuclwordfinder_unit_test.cpp (testExtend).
     //
     // Runs Phase 1 (scan + exact extension + ungapped DP) against real sequences:
@@ -4121,21 +3440,6 @@ mod tests {
         let q_len   = query_dna.len() as u32;
         let s_len   = subj_dna.len() as u32;
 
-        let packed = {
-            let n = subject.len().saturating_sub(2);
-            let mut blk = seqblk_from_blastna(&subject[1..1 + n]);
-            blast_compress_blastna_sequence(&mut blk);
-            blk.packed
-        };
-
-        let query_bases = &query[1..1 + q_len as usize];
-        let lut = NaLookup::Small(blast_na_lookup_table_new(
-            query_bases,
-            &[(0, q_len as i32 - 1)],
-            19, // word_length
-            8,  // lut_word_length
-        ));
-
         let params = SearchParams {
             word_size: 19,
             xdrop_ungap: 11,
@@ -4144,12 +3448,18 @@ mod tests {
             ..Default::default()
         };
         let matrix = blastn_1m3_matrix();
+        let _ = (q_len, s_len);
 
-        let mut ungapped = Vec::new();
-        collect_ungapped(
-            &query, &query, q_len, &subject, &packed[3..], s_len,
-            Strand::Plus, &lut, &params, &matrix, &mut DiscardSeeds, &mut ungapped,
+        // The combined (both-strand) table, as the engine builds it; with
+        // 2 x 2338 entries the width is 8, as in the NCBI test, so the scan
+        // stride (12) is the same.  The NCBI test's hits are plus strand.
+        let (ql, _) = build_query_lookup(&query, &params);
+        assert_eq!(ql.lut_word_length(), 8);
+        let mut hits = Vec::new();
+        search_with_query_lookup_ungapped(
+            &ql, &query, "q", &subject, "s", &params, &matrix, 0, &mut hits, &[], None,
         );
+        let ungapped: Vec<UngappedHit> = hits.into_iter().filter(|h| h.strand == Strand::Plus).collect();
 
         let exp_q: [u32; 5] = [233, 1037, 263, 1911, 1782];
         let exp_s: [u32; 5] = [0, 66, 27, 811, 940];

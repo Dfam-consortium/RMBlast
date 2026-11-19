@@ -37,6 +37,7 @@ pub fn gap_decay_divisor(decayrate: f64, nsegs: u32) -> f64 {
 /// BLAST_Cutoffs (blast_stat.c:4603): calculate the cutoff score S and the
 /// highest expected score E. `s` and `e` are in/out as in the C interface;
 /// returns Err(()) when the Karlin block holds the -1 sentinel.
+#[allow(clippy::result_unit_err)] // NCBI's int status: the only failure carries no detail
 pub fn blast_cutoffs(
     s: &mut i32,
     e: &mut f64,

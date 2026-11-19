@@ -1,7 +1,7 @@
 //! rmblastn — Rust port of NCBI rmblastn (BLAST 2.17.0)
 //!
-//! Nucleotide BLAST with custom substitution matrices, UCSC 2bit database
-//! support, and RepeatMasker-specific output fields.
+//! Nucleotide BLAST with custom substitution matrices, a FASTA or UCSC 2bit
+//! database, and RepeatMasker-specific output fields.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufWriter, Write};
@@ -13,14 +13,14 @@ use rayon::prelude::*;
 use rmblast_lib::matrix::ScoreMatrix;
 use rmblast_lib::hits::Strand;
 use rmblast_lib::ka_stats::{self, KaContext, MatrixCliOverrides, RmStats};
-use rmblast_lib::options::{MtMode, SearchParams, SeedMode};
+use rmblast_lib::options::{MtMode, SearchParams};
 use rmblast_lib::output::{
     outfmt_needs_stats, parse_outfmt, write_tabular, write_pairwise_program_header,
     write_pairwise_results, write_pairwise_footer, AlignResult, OutField,
 };
-use rmblast_lib::search::{apply_mask_level, sort_hit_list_order, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
+use rmblast_lib::search::{apply_mask_level, sort_hit_list_order_by_oid, subject_oids, build_query_lookup, build_query_lookup_premask, mask_query_for_alignment, search_with_query_lookup, search_phase2a, run_phase2b, PrelimHsp};
 use rmblast_lib::search::engine::{cull_prelims, resurrect_prelims, PrelimCullParams};
-use rmblast_lib::seq::{FastaReader, SubjectDb};
+use rmblast_lib::seq::{check_seq_len, FastaReader, FastaRecord, SubjectDb};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Argument-normalization shim for NCBI single-dash compatibility
@@ -104,7 +104,7 @@ where
 #[derive(Parser, Debug)]
 #[command(
     name = "rmblastn",
-    version,
+    version = env!("RMBLAST_VERSION"), // "<version> (<commit>[-dirty])", build.rs
     about = "RepeatMasker BLAST — Rust port of NCBI rmblastn",
     after_help = "\
 ARGUMENT SYNTAX NOTES:
@@ -126,7 +126,9 @@ ARGUMENT SYNTAX NOTES:
 "
 )]
 struct Args {
-    /// UCSC 2bit database file
+    /// Database: a FASTA file (preferred) or a UCSC .2bit file, told apart by
+    /// extension (.fa .fasta .fas .fna .fn / .2bit), else by a leading '>'.
+    /// .2bit folds IUB codes other than N to N.
     #[arg(long)]
     db: String,
 
@@ -138,56 +140,69 @@ struct Args {
     #[arg(long, default_value = "")]
     matrix: String,
 
-    /// Gap open penalty
-    #[arg(long, default_value_t = 4)]
+    /// Gap open penalty, 0 to 1000000 (required: NCBI rmblastn's default of 0
+    /// is rejected; NCBI also accepts negative values, we don't)
+    #[arg(long, allow_hyphen_values = true, value_parser = gap_cost::<0>)]
     gapopen: i32,
 
-    /// Gap extend penalty
-    #[arg(long, default_value_t = 4)]
+    /// Gap extend penalty, 1 to 1000000 (required, as for --gapopen; NCBI
+    /// rejects 0 and accepts negative values)
+    #[arg(long, allow_hyphen_values = true, value_parser = gap_cost::<1>)]
     gapextend: i32,
 
-    /// Word size for seeding
-    #[arg(long, default_value_t = 8)]
+    /// Word size for seeding (>= 4; default 11, as in NCBI)
+    #[arg(long, default_value_t = 11, allow_hyphen_values = true,
+          value_parser = at_least::<usize, 4>)]
     word_size: usize,
 
-    /// X-dropoff for ungapped extension
-    #[arg(long, default_value_t = 20)]
+    /// X-dropoff for ungapped extension (>= 0)
+    #[arg(long, default_value_t = 20, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     xdrop_ungap: i32,
 
-    /// X-dropoff for gapped extension
-    #[arg(long, default_value_t = 30)]
+    /// X-dropoff for gapped extension (>= 0)
+    #[arg(long, default_value_t = 30, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     xdrop_gap: i32,
 
-    /// X-dropoff for final gapped extension
-    #[arg(long, default_value_t = 100)]
+    /// X-dropoff for final gapped extension (>= 0)
+    #[arg(long, default_value_t = 100, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     xdrop_gap_final: i32,
 
     /// Cutoff for the preliminary gapped stage. NOT a floor on the reported
     /// score: traceback re-aligns under --xdrop-gap-final and may score lower,
     /// and that lower score is reported (matches NCBI rmblastn). Post-filter if
     /// you need a hard floor.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true,
+          value_parser = at_least::<i32, 0>)]
     min_raw_gapped_score: i32,
 
     /// Use complexity adjusted scoring (bare flag, no value required)
     #[arg(long, action = clap::ArgAction::SetTrue)]
     complexity_adjust: bool,
 
-    /// Filter query with DUST: 'yes' to enable, 'no' to disable.
-    /// NCBI also accepts 'level window linker' (e.g. '20 64 1'); custom
-    /// parameters are accepted but ignored — only yes/no is acted on.
+    /// Filter query with DUST: yes|true to enable, no|false to disable.
+    /// NCBI also accepts 'level window linker' (e.g. '20 64 1'); custom DUST
+    /// parameters are not supported here and are rejected.
     #[arg(long, default_value = "yes")]
     dust: String,
 
-    /// Number of threads
-    #[arg(long, default_value_t = 1)]
+    /// Number of threads (>= 1)
+    #[arg(long, default_value_t = 1, allow_hyphen_values = true,
+          value_parser = at_least::<usize, 1>)]
     num_threads: usize,
 
     /// Threading mode: 0 = split by DB, 1 = split by queries
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, allow_hyphen_values = true,
+          value_parser = clap::value_parser!(u8).range(0..=1))]
     mt_mode: u8,
 
-    /// Output format: 0 = pairwise (default, matches NCBI rmblastn), 6 [fields...] = tabular.
+    /// Output format: 0 = pairwise (the default, as in NCBI), or "6 <fields>"
+    /// = tabular with these fields: score perc_sub perc_query_gap perc_db_gap
+    /// qseqid qstart qend qlen sstrand sseqid sstart send slen kdiv cpg_kdiv
+    /// transi transv cpg_sites qseq sseq evalue bitscore.  Other formats, a
+    /// bare 6 and other field names are refused.
     #[arg(long, default_value = "0")]
     outfmt: String,
 
@@ -206,20 +221,11 @@ struct Args {
     #[arg(long)]
     gilist: Option<String>,
 
-    /// Lookup-table seeding strategy: combined (NCBI-faithful) or separate (efficient).
-    ///
-    /// combined: indexes k-mers from both forward and RC query in one table, matching
-    ///   NCBI's BlastMBLookupTableNew exactly (including ~2× wasted context-1 hits).
-    ///   DUST is applied to the query before LUT construction.
-    ///
-    /// separate: indexes only forward-query k-mers; minus-strand seeding uses the
-    ///   same LUT against the revcomp subject.  No wasted context-1 hits.
-    ///   DUST is applied to the query before LUT construction.
-    #[arg(long, default_value = "combined")]
-    seed_mode: String,
 
-    /// Write all merged Phase 2a prelim HSPs to this file before Phase 2b runs.
-    /// Format: sseqid TAB strand TAB qstart TAB qend TAB sstart TAB send TAB score
+    /// Debugging: write each multi-chunk query's (1,999,800 bp or longer) merged Phase 2a
+    /// prelim HSPs to this file before Phase 2b, queries appended in order.
+    /// Columns: sseqid strand qstart qend sstart send score qseed sseed (tab
+    /// separated).  Not available with --mt-mode 1.
     #[arg(long)]
     dump_prelims: Option<String>,
 
@@ -230,25 +236,29 @@ struct Args {
     /// fraction of heavily-overlapped, mostly low-scoring hits (chr22
     /// benchmark: balanced ~0.2% of annotated bp).  Modes: off (default),
     /// conservative, balanced, aggressive.  Active only for multi-chunk
-    /// queries (>1 Mbp) with mask_level < 100.
+    /// queries (1,999,800 bp or longer: NCBI splits at 2 x (1 Mbp - 100)) with mask_level < 100.
     #[arg(long, default_value = "off")]
     prelim_cull: String,
 
     /// Karlin-Altschul lambda override for E-value statistics of a matrix
     /// absent from the baked table (NCBI -matrix_lambda; needs _k and _alpha too)
-    #[arg(long, alias = "matrix_lambda", default_value_t = 0.0)]
+    #[arg(long, alias = "matrix_lambda", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_nonnegative)]
     matrix_lambda: f64,
 
     /// Karlin-Altschul K override (NCBI -matrix_k)
-    #[arg(long, alias = "matrix_k", default_value_t = 0.0)]
+    #[arg(long, alias = "matrix_k", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_nonnegative)]
     matrix_k: f64,
 
     /// Karlin-Altschul alpha override (NCBI -matrix_alpha; H = lambda/alpha)
-    #[arg(long, alias = "matrix_alpha", default_value_t = 0.0)]
+    #[arg(long, alias = "matrix_alpha", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_nonnegative)]
     matrix_alpha: f64,
 
     /// Karlin-Altschul beta override for the length adjustment (NCBI -matrix_beta)
-    #[arg(long, alias = "matrix_beta", default_value_t = 0.0, allow_hyphen_values = true)]
+    #[arg(long, alias = "matrix_beta", default_value_t = 0.0, allow_hyphen_values = true,
+          value_parser = parse_finite)]
     matrix_beta: f64,
 
     /// Expect-value threshold: drop HSPs with E-value above this.  By
@@ -256,7 +266,7 @@ struct Args {
     /// statistics then come from the full source hierarchy: baked table,
     /// -matrix_* overrides, # KARLIN comment, or ALP fit).  Under
     /// --ncbi-compat this defaults to 10, matching NCBI.
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_evalue)]
     evalue: Option<f64>,
 
     /// Emulate NCBI rmblastn 2.17.1 E-value behavior exactly: statistics
@@ -268,6 +278,67 @@ struct Args {
     /// benchmarks and legacy pipelines.
     #[arg(long, alias = "ncbi_compat", action = clap::ArgAction::SetTrue)]
     ncbi_compat: bool,
+}
+
+/// An integer option with a lower bound, e.g. `--word-size` (>= 4).
+fn at_least<T: TryFrom<i64>, const MIN: i64>(s: &str) -> Result<T, String> {
+    let v: i64 = s.parse().map_err(|_| format!("'{s}' is not an integer"))?;
+    if v < MIN {
+        return Err(format!("must be at least {MIN}"));
+    }
+    T::try_from(v).map_err(|_| format!("'{s}' is too large"))
+}
+
+/// Gap costs are capped so the DP stays far from overflow: scores run down to
+/// MININT (INT4_MIN/2, as in NCBI) minus a gap cost, and gap costs near 2^30
+/// made 3.0.12 loop forever.  Real gap costs are tens.
+const MAX_GAP_COST: i64 = 1_000_000;
+
+fn gap_cost<const MIN: i64>(s: &str) -> Result<i32, String> {
+    let v: i32 = at_least::<i32, MIN>(s)?;
+    if v as i64 > MAX_GAP_COST {
+        return Err(format!("must be at most {MAX_GAP_COST}"));
+    }
+    Ok(v)
+}
+
+fn parse_finite(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        _ => Err(format!("'{s}' is not a finite number")),
+    }
+}
+
+/// 0 means "not given" for the -matrix_* overrides; negative is an error.
+fn parse_nonnegative(s: &str) -> Result<f64, String> {
+    let v = parse_finite(s)?;
+    if v < 0.0 {
+        return Err(format!("'{s}' must not be negative"));
+    }
+    Ok(v)
+}
+
+fn parse_evalue(s: &str) -> Result<f64, String> {
+    let v = parse_finite(s)?;
+    if v <= 0.0 {
+        // NCBI: "expect value or cutoff score must be greater than zero"
+        return Err(format!("'{s}': the expect value must be greater than zero"));
+    }
+    Ok(v)
+}
+
+/// `--dust`: yes/no (NCBI's spelling) or true/false (this port's).  NCBI's
+/// 'level window linker' form is rejected rather than silently run with the
+/// default parameters, which is what earlier versions did.
+fn parse_dust(s: &str) -> Result<bool> {
+    match s {
+        "yes" | "true" => Ok(true),
+        "no" | "false" => Ok(false),
+        _ if s.split_whitespace().count() == 3 => anyhow::bail!(
+            "--dust '{s}': custom DUST parameters (level window linker) are not supported; \
+             use yes or no"),
+        _ => anyhow::bail!("--dust '{s}': expected yes, no, true or false"),
+    }
 }
 
 /// Resolve a `--db` argument to an existing file path.
@@ -307,22 +378,15 @@ enum OutputFormat {
 
 fn parse_output_format(s: &str) -> Result<OutputFormat> {
     let trimmed = s.trim();
-    if trimmed == "0" || trimmed.is_empty() {
+    if trimmed == "0" {
         return Ok(OutputFormat::Pairwise);
     }
-    let first_token = trimmed.split_whitespace().next().unwrap_or("");
-    if first_token == "0" {
-        return Ok(OutputFormat::Pairwise);
+    if trimmed.split_whitespace().next() == Some("0") {
+        anyhow::bail!("--outfmt '{}': format 0 (pairwise) takes no fields", s);
     }
-    // Attempt tabular parse (format 6 or bare field list).
-    let fields = parse_outfmt(trimmed);
-    if fields.is_empty() {
-        anyhow::bail!(
-            "--outfmt '{}' is not recognized; use '0' for pairwise or '6 <fields>' for tabular",
-            s
-        );
-    }
-    Ok(OutputFormat::Tabular(fields))
+    parse_outfmt(trimmed)
+        .map(OutputFormat::Tabular)
+        .map_err(|e| anyhow::anyhow!("--outfmt '{}': {}", s, e))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -455,6 +519,14 @@ fn main() -> Result<()> {
     if args.matrix.is_empty() {
         anyhow::bail!("--matrix is required");
     }
+    if let Some(path) = &args.dump_prelims {
+        if args.mt_mode == 1 {
+            anyhow::bail!("--dump-prelims is not available with --mt-mode 1");
+        }
+        // Created (emptied) once here; each multi-chunk query appends to it.
+        std::fs::File::create(path)
+            .with_context(|| format!("creating --dump-prelims file '{path}'"))?;
+    }
 
     let matrix_path = match find_matrix_path(&args.matrix, &MatrixEnv::from_env()) {
         Some(p) => p,
@@ -469,12 +541,8 @@ fn main() -> Result<()> {
     let matrix = ScoreMatrix::from_file(&matrix_path)
         .with_context(|| format!("loading matrix '{}'", matrix_path))?;
 
-    let seed_mode = match args.seed_mode.as_str() {
-        "separate" | "separate-strands" | "SeparateStrands" => SeedMode::SeparateStrands,
-        _ => SeedMode::Combined,
-    };
 
-    let dust = !matches!(args.dust.to_lowercase().as_str(), "no" | "false" | "0");
+    let dust = parse_dust(&args.dust)?;
 
     let params = SearchParams {
         gap_open: args.gapopen,
@@ -493,8 +561,7 @@ fn main() -> Result<()> {
         // treats >= 100 as a no-op, so fold every disabling spelling onto 101.
         mask_level: if args.mask_level < 0 { 101 } else { args.mask_level as u32 },
         num_threads: args.num_threads,
-        mt_mode: if args.mt_mode == 1 { MtMode::SplitByQueries } else { MtMode::SplitByDb },
-        seed_mode,
+        mt_mode: if args.mt_mode == 1 { MtMode::SplitByQueries } else { MtMode::SplitByDb }, // 0 or 1 (checked)
     };
 
     let output_format = parse_output_format(&args.outfmt)?;
@@ -509,21 +576,30 @@ fn main() -> Result<()> {
         .with_context(|| format!("opening database '{}'", db_path))?;
 
     let gilist = load_gilist(args.gilist.as_deref())?;
-    let subject_names: Vec<String> = db.sequences().iter()
-        .map(|s| s.name.clone())
-        .filter(|n| gilist.as_ref().map_or(true, |gl| gl.contains(n.as_str())))
-        .collect();
-
-    if subject_names.is_empty() {
-        return Ok(());
+    // The subjects to search, and the database statistics for the pairwise
+    // header/footer, in one pass (3.0.12 summed the letters with a
+    // Vec::contains per sequence: 28 s of startup at 100k sequences).
+    let mut subject_names: Vec<String> = Vec::new();
+    let mut total_db_letters: u64 = 0;
+    for s in db.sequences() {
+        if gilist.as_ref().is_none_or(|gl| gl.contains(s.name.as_str())) {
+            total_db_letters += s.dna_size as u64;
+            subject_names.push(s.name.clone());
+        }
     }
 
-    // Compute database statistics for pairwise header/footer.
+    // An empty database is an error (NCBI's makeblastdb refuses to build
+    // one); 3.0.12 exited 0 without a word.  A gilist that selects nothing is
+    // a valid search with no hits, but say so.
+    if db.sequences().is_empty() {
+        anyhow::bail!("database '{}' contains no sequences", db_path);
+    }
+    if subject_names.is_empty() {
+        eprintln!("Warning: [rmblastn] the gilist '{}' matches no sequence in the database; \
+                   nothing to search", args.gilist.as_deref().unwrap_or(""));
+    }
     let n_db_seqs = subject_names.len();
-    let total_db_letters: u64 = db.sequences().iter()
-        .filter(|s| subject_names.contains(&s.name))
-        .map(|s| s.dna_size as u64)
-        .sum();
+    let subject_oid = subject_oids(&subject_names);
 
     // Average DB sequence length (NCBI BlastSeqSrcGetAvgSeqLen: integer-truncated
     // total residues / number of sequences).  Feeds the Karlin-Altschul ungapped
@@ -575,6 +651,13 @@ fn main() -> Result<()> {
             if args.ncbi_compat { " (--ncbi-compat 2.17.1 emulation)" } else { "" },
             ka_ctx.source.describe()
         );
+        if ka_ctx.source == ka_stats::KaSource::BakedTable {
+            eprintln!(
+                "#   Karlin-Altschul parameters for '{}' at gap costs {}/{} taken from the \
+                 built-in table by matrix file name; the matrix contents are not checked",
+                ka_stats::matrix_basename(&args.matrix), args.gapopen, args.gapextend
+            );
+        }
         if ka_ctx.kbp_gap.is_valid() {
             eprintln!(
                 "#   lambda={:.10} K={:.10} H={:.10}",
@@ -633,7 +716,7 @@ fn main() -> Result<()> {
         prelim_cull
     };
 
-    let query_reader: Box<dyn std::io::Read> = if args.query == "-" {
+    let query_reader: Box<dyn std::io::Read + Send> = if args.query == "-" {
         Box::new(std::io::stdin())
     } else {
         Box::new(
@@ -652,20 +735,25 @@ fn main() -> Result<()> {
             .context("writing pairwise header")?;
     }
 
+    let mut n_queries = 0usize;
     match params.mt_mode {
         MtMode::SplitByDb => {
             for qrec in query_reader {
                 let qrec = qrec.context("reading query FASTA")?;
+                n_queries += 1;
+                check_seq_len(&qrec.id, qrec.len()).map_err(anyhow::Error::msg)?;
                 let full_q_len = qrec.len() as u32;
                 let mut results = search_db_parallel(
                     &qrec.seq, &qrec.id, &subject_names, &db, &params, &matrix,
                     avg_subj_length, args.dump_prelims.as_deref(), prelim_cull,
                     reap_for_query(full_q_len as i32),
                 );
-                sort_hit_list_order(&mut results, &subject_names);
+                sort_hit_list_order_by_oid(&mut results, &subject_oid);
                 match &output_format {
                     OutputFormat::Pairwise => {
-                        write_pairwise_results(&mut out, &results, &qrec.defline, full_q_len)
+                        let mask = pairwise_query_mask(&qrec.seq, &params);
+                        write_pairwise_results(&mut out, &results, &qrec.defline, full_q_len,
+                            &|id| db.defline(id), &mask)
                             .context("writing pairwise results")?;
                     }
                     OutputFormat::Tabular(fields) => {
@@ -683,7 +771,11 @@ fn main() -> Result<()> {
             // as soon as all earlier queries' are written, so output order is
             // unchanged.  A dispatcher thread hands the queries out in input
             // order and does not hand out one more than `window` ahead of the
-            // next one to write; memory then holds about `window` queries'
+            // next one to write.  It also reads each query from the file just
+            // before handing it out, and the job sends the query back with its
+            // results, so memory holds about `window` queries and their
+            // results (3.0.12 read the whole query file first).  As in mode 0,
+            // a malformed record is reported after the queries before it.
             // results instead of every query's.
             //
             // The holding back happens on the dispatcher, outside the pool,
@@ -694,26 +786,33 @@ fn main() -> Result<()> {
             // next -- a deadlock (3.0.10 did that).
             use std::collections::BTreeMap;
             use std::sync::atomic::{AtomicBool, Ordering};
-            use std::sync::{mpsc, Condvar, Mutex};
+            use std::sync::{mpsc, Arc, Condvar, Mutex};
 
-            let all_queries: Vec<_> = query_reader
-                .collect::<Result<Vec<_>, _>>()
-                .context("reading query FASTA")?;
-            let n = all_queries.len();
             let workers = rayon::current_num_threads();
             let window = 4 * workers.max(4);
             // queries written so far, and the dispatcher's wake-up
             let written = (Mutex::new(0usize), Condvar::new());
             let stop = AtomicBool::new(false);
-            let (tx, rx) = mpsc::channel::<(usize, Vec<AlignResult>)>();
-            let (queries, subjects, db, params, matrix, reap) =
-                (&all_queries, &subject_names, &db, &params, &matrix, &reap_for_query);
+            // A job sends Err if its search panicked.  Rayon would hold that
+            // panic until the scope ends, and the writer would wait forever
+            // for the missing query, so the job catches it and the writer
+            // turns it into an error exit.
+            type Job = (usize, Arc<FastaRecord>, std::thread::Result<Vec<AlignResult>>);
+            let (tx, rx) = mpsc::channel::<Job>();
+            #[cfg(feature = "diagnostics")]
+            let panic_at = test_panic_at_query();
+            let (subjects, oids, db, params, matrix, reap) =
+                (&subject_names, &subject_oid, &db, &params, &matrix, &reap_for_query);
             let (written, stop) = (&written, &stop);
-            std::thread::scope(|ts| -> Result<()> {
-                ts.spawn(move || {
+            let mut query_reader = query_reader;
+            let query_reader = &mut query_reader;
+            n_queries = std::thread::scope(|ts| -> Result<usize> {
+                // Returns the number of queries read, or the read error.
+                let dispatcher = ts.spawn(move || -> Result<usize> {
                     // in_place_scope: this loop runs here, outside the pool
-                    rayon::in_place_scope(|s| {
-                        for i in 0..n {
+                    rayon::in_place_scope(|s| -> Result<usize> {
+                        let mut i = 0usize;
+                        loop {
                             {
                                 let (lock, cvar) = written;
                                 let mut w = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -724,33 +823,61 @@ fn main() -> Result<()> {
                             if stop.load(Ordering::Relaxed) {
                                 break;
                             }
+                            let q = match query_reader.next() {
+                                None => break,
+                                Some(q) => q.context("reading query FASTA")?,
+                            };
+                            check_seq_len(&q.id, q.len()).map_err(anyhow::Error::msg)?;
+                            let q = Arc::new(q);
                             let tx = tx.clone();
                             s.spawn(move |_| {
                                 if stop.load(Ordering::Relaxed) {
                                     return;
                                 }
-                                let q = &queries[i];
-                                let mut qr = search_db_parallel(
-                                    &q.seq, &q.id, subjects, db, params, matrix,
-                                    avg_subj_length, None, prelim_cull,
-                                    reap(q.len() as i32),
-                                );
-                                sort_hit_list_order(&mut qr, subjects);
-                                let _ = tx.send((i, qr));
+                                let qr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    #[cfg(feature = "diagnostics")]
+                                    if panic_at == Some(i) {
+                                        panic!("RMBLAST_TEST_PANIC_AT_QUERY={i}");
+                                    }
+                                    let mut qr = search_db_parallel(
+                                        &q.seq, &q.id, subjects, db, params, matrix,
+                                        avg_subj_length, None, prelim_cull,
+                                        reap(q.len() as i32),
+                                    );
+                                    sort_hit_list_order_by_oid(&mut qr, oids);
+                                    qr
+                                }));
+                                let _ = tx.send((i, q, qr));
                             });
+                            i += 1;
                         }
                         drop(tx);
-                    });
+                        Ok(i)
+                    })
                 });
-                let mut pending: BTreeMap<usize, Vec<AlignResult>> = BTreeMap::new();
+                // However this thread leaves -- a write error, a failed
+                // search, or a panic in here -- tell the dispatcher to stop, or
+                // the scope would wait on it forever.  The lock orders the
+                // store before the dispatcher's next check.
+                struct StopOnExit<'a>(&'a AtomicBool, &'a (Mutex<usize>, Condvar));
+                impl Drop for StopOnExit<'_> {
+                    fn drop(&mut self) {
+                        let _w = self.1 .0.lock().unwrap_or_else(|e| e.into_inner());
+                        self.0.store(true, Ordering::Relaxed);
+                        self.1 .1.notify_all();
+                    }
+                }
+                let _stop_on_exit = StopOnExit(stop, written);
+                let mut pending: BTreeMap<usize, (Arc<FastaRecord>, Vec<AlignResult>)> = BTreeMap::new();
                 let mut k = 0usize;
-                let mut write_ready = |pending: &mut BTreeMap<usize, Vec<AlignResult>>| -> Result<()> {
-                    while let Some(results) = pending.remove(&k) {
-                        let q = &queries[k];
+                let mut write_ready = |pending: &mut BTreeMap<usize, (Arc<FastaRecord>, Vec<AlignResult>)>| -> Result<()> {
+                    while let Some((q, results)) = pending.remove(&k) {
                         match &output_format {
                             OutputFormat::Pairwise => {
                                 let qlen = q.len() as u32;
-                                write_pairwise_results(&mut out, &results, &q.defline, qlen)
+                                let mask = pairwise_query_mask(&q.seq, params);
+                                write_pairwise_results(&mut out, &results, &q.defline, qlen,
+                                    &|id| db.defline(id), &mask)
                                     .context("writing pairwise results")?;
                             }
                             OutputFormat::Tabular(fields) => {
@@ -766,21 +893,31 @@ fn main() -> Result<()> {
                     }
                     Ok(())
                 };
-                for (i, results) in rx.iter() {
-                    pending.insert(i, results);
-                    if let Err(e) = write_ready(&mut pending) {
-                        // let the dispatcher and the jobs wind down, then report
-                        // the write error (the lock orders the store before the
-                        // dispatcher's next check)
-                        let _w = written.0.lock().unwrap_or_else(|e| e.into_inner());
-                        stop.store(true, Ordering::Relaxed);
-                        written.1.notify_all();
-                        return Err(e);
+                for (i, q, results) in rx.iter() {
+                    match results {
+                        Ok(results) => {
+                            pending.insert(i, (q, results));
+                        }
+                        Err(payload) => {
+                            let msg = payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".to_string());
+                            anyhow::bail!("search of query '{}' failed: {}", q.id, msg);
+                        }
                     }
+                    // on a write error, _stop_on_exit winds the dispatcher down
+                    write_ready(&mut pending)?;
                 }
-                Ok(())
+                // The channel closes once the dispatcher stops and every job
+                // it started has sent, so all queries it read are written.
+                dispatcher.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
             })?;
         }
+    }
+
+    // NCBI prints the same warning (and exits 0) for a query file with no records.
+    if n_queries == 0 {
+        eprintln!("Warning: [rmblastn] Query is Empty!");
     }
 
     // Print the pairwise footer once (after all queries).
@@ -806,13 +943,33 @@ fn main() -> Result<()> {
 /// Print the stage counters when RMBLAST_DP_STATS or RMBLAST_DEBUG_COUNTERS is
 /// set. Without the `diagnostics` feature there are no counters, and this
 /// prints a note instead so the variables are not silently ignored.
+/// The query's DUST intervals (0-based, inclusive), which pairwise output
+/// prints in lower case as NCBI does; empty with dust off.
+fn pairwise_query_mask(query: &[u8], params: &SearchParams) -> Vec<(u32, u32)> {
+    if !params.dust {
+        return Vec::new();
+    }
+    let mut q = query.to_vec();
+    rmblast_lib::filter::dust::dust_mask(&mut q, rmblast_lib::filter::dust::DUST_WINDOW,
+        rmblast_lib::filter::dust::DUST_LEVEL, rmblast_lib::filter::dust::DUST_LINKER, 14)
+        .into_iter().map(|(s, e)| (s as u32, e as u32)).collect()
+}
+
+/// Test hook: `RMBLAST_TEST_PANIC_AT_QUERY=<n>` makes the search of the n-th
+/// query (0-based) panic in `--mt-mode 1`, to test that a failed job ends the
+/// run instead of hanging it.  Only in a `diagnostics` build.
+#[cfg(feature = "diagnostics")]
+fn test_panic_at_query() -> Option<usize> {
+    std::env::var("RMBLAST_TEST_PANIC_AT_QUERY").ok().and_then(|v| v.parse().ok())
+}
+
 #[cfg(feature = "diagnostics")]
 fn diagnostics_report() {
     use std::sync::atomic::Ordering;
     if std::env::var_os("RMBLAST_DEBUG_COUNTERS").is_some() {
         eprintln!(
-            "REVERSE_FBI_CLAMPED={} IMPROVE_SEED_NEGATIVE_OFFSET={}",
-            rmblast_lib::search::gapped::REVERSE_FBI_CLAMPED.load(Ordering::Relaxed),
+            "REVERSE_BAND_AT_END={} IMPROVE_SEED_NEGATIVE_OFFSET={}",
+            rmblast_lib::search::gapped::REVERSE_BAND_AT_END.load(Ordering::Relaxed),
             rmblast_lib::search::engine::IMPROVE_SEED_NEGATIVE_OFFSET.load(Ordering::Relaxed),
         );
     }
@@ -1037,12 +1194,12 @@ fn search_db_parallel(
 
     // Single-chunk path: use original run_gapped_phase pipeline (unchanged).
     if effective_num_chunks <= 1 {
+        static CULL_NOTE: std::sync::Once = std::sync::Once::new();
         if prelim_cull.is_some() {
-            eprintln!(
-                "Note: --prelim-cull applies only to multi-chunk queries (>1 Mbp); \
-                 running the faithful pipeline for '{}'.",
-                query_id
-            );
+            CULL_NOTE.call_once(|| eprintln!(
+                "Note: --prelim-cull applies only to multi-chunk queries (1,999,800 bp or \
+                 longer); shorter ones (first: '{query_id}') run the faithful pipeline."
+            ));
         }
         let (chunk_lookup, _) = build_query_lookup(query, params);
         let mut results: Vec<AlignResult> = subject_names
@@ -1121,35 +1278,40 @@ fn search_db_parallel(
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
                 let prep = db.get_prepared(name).ok();
-                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, name, params, matrix, chunk_start as u32, prep.as_deref())
+                search_phase2a(&chunk_lookup, &chunk, &masked_chunk, &seq, params, matrix, chunk_start as u32, prep.as_deref())
             })
             .collect();
 
         let split_point = chunk_start as u32;
         if k == 0 {
-            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims.into_iter()) {
+            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims) {
                 *acc = new;
             }
         } else {
-            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims.into_iter()) {
+            for (acc, new) in accumulated_prelims.iter_mut().zip(chunk_prelims) {
                 merge_chunk_prelims(acc, new, split_point);
             }
         }
     }
 
     // Optional: dump all merged prelim HSPs before Phase 2b (for phase-attribution analysis).
+    // main created the file; a failure here is reported but does not stop
+    // the search.
     if let Some(path) = dump_prelims {
         use std::io::Write as IoWrite;
-        let f = std::fs::File::create(path)
-            .expect("cannot create dump-prelims file");
-        let mut bw = std::io::BufWriter::new(f);
-        for (name, prelims) in subject_names.iter().zip(accumulated_prelims.iter()) {
-            for p in prelims {
-                let strand = if p.strand == rmblast_lib::hits::Strand::Plus { "plus" } else { "minus" };
-                writeln!(bw, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    name, strand, p.q_start, p.q_end, p.s_start, p.s_end, p.score, p.q_seed, p.s_seed)
-                    .expect("write prelim");
+        let written = std::fs::OpenOptions::new().append(true).open(path).and_then(|f| {
+            let mut bw = std::io::BufWriter::new(f);
+            for (name, prelims) in subject_names.iter().zip(accumulated_prelims.iter()) {
+                for p in prelims {
+                    let strand = if p.strand == rmblast_lib::hits::Strand::Plus { "plus" } else { "minus" };
+                    writeln!(bw, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        name, strand, p.q_start, p.q_end, p.s_start, p.s_end, p.score, p.q_seed, p.s_seed)?;
+                }
             }
+            bw.flush()
+        });
+        if let Err(e) = written {
+            eprintln!("warning: --dump-prelims '{path}': {e}");
         }
     }
 
@@ -1206,12 +1368,12 @@ fn search_db_parallel(
             .zip(per_subject.into_par_iter())
             .flat_map(|(name, prelims)| {
                 if prelims.is_empty() { return vec![]; }
-                let seq = match db.get_full_sequence_blastna(name) {
-                    Ok(s) => s,
+                let prep = match db.get_prepared(name) {
+                    Ok(p) => p,
                     Err(e) => { eprintln!("warning: skipping {}: {}", name, e); return vec![]; }
                 };
                 let n_mask = db.get_n_mask(name);
-                let mut r = run_phase2b(query, query_rc, query_id, &seq, name, prelims, params, matrix, &n_mask);
+                let mut r = run_phase2b(query, query_rc, query_id, &prep, name, prelims, params, matrix, &n_mask);
                 for h in &mut r { h.hsp.q_len = full_q_len_u32; }
                 r
             })
@@ -1478,7 +1640,7 @@ mod cli_tests {
     // masks every other HSP and only the self-hits survive.
 
     fn parse(argv: &[&str]) -> Args {
-        let mut full = vec!["rmblastn", "--db", "d", "--query", "q"];
+        let mut full = vec!["rmblastn", "--db", "d", "--query", "q", "--gapopen", "20", "--gapextend", "5"];
         full.extend_from_slice(argv);
         Args::parse_from(normalize_arg_iter(
             full.iter().map(|s| std::ffi::OsString::from(*s)),
@@ -1505,7 +1667,8 @@ mod cli_tests {
 
         // NCBI caps the option at 101; anything higher is a usage error.
         assert!(Args::try_parse_from(normalize_arg_iter(
-            ["rmblastn", "--db", "d", "--query", "q", "-mask_level", "102"]
+            ["rmblastn", "--db", "d", "--query", "q", "--gapopen", "20", "--gapextend", "5",
+             "-mask_level", "102"]
                 .iter()
                 .map(|s| std::ffi::OsString::from(*s))
         ))

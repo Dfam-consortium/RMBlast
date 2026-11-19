@@ -1,44 +1,10 @@
 //! Search parameters mirroring the rmblastn CLI options in scope.
 
-/// Gap alignment algorithm to use (always ALIGN_EX for rmblastn with matrix scoring).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GapAlignAlgo {
-    AlignEx,
-}
-
 /// Threading mode (mirrors NCBI -mt_mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MtMode {
     SplitByDb,
     SplitByQueries,
-}
-
-/// Lookup-table seeding strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeedMode {
-    /// NCBI-faithful combined LUT: both forward and RC query k-mers in one table.
-    ///
-    /// Matches NCBI's BlastMBLookupTableNew behavior exactly, including:
-    /// - lut_width chosen with approx_entries = 2 × query_len (both strands counted).
-    /// - DUST applied to the query before LUT construction (masked positions excluded).
-    ///
-    /// Known efficiency flaw (shared with NCBI): ~half the raw hits are from context-1
-    /// (RC-query) k-mers and always fail the exact-match extension step for
-    /// non-palindromic sequences, wasting ~2× seeding work.
-    ///
-    /// Known edge-case bug (shared with NCBI): if word_size == lut_width no exact
-    /// extension is needed, so context-1 hits are NOT filtered and produce alignments
-    /// at wrong query coordinates for palindromic k-mers.
-    Combined,
-
-    /// Efficient single-strand LUT: forward query k-mers only.
-    ///
-    /// lut_width chosen with approx_entries = query_len (one strand).
-    /// DUST applied to the query before LUT construction.
-    /// Minus-strand seeding still uses the forward-query LUT against the revcomp
-    /// subject (matching NCBI's minus-strand scan semantics without the wasted
-    /// context-1 hits).
-    SeparateStrands,
 }
 
 /// All tunable search parameters used by the alignment engine.
@@ -91,9 +57,29 @@ pub struct SearchParams {
     pub num_threads: usize,
     pub mt_mode: MtMode,
 
-    // Seeding strategy
-    pub seed_mode: SeedMode,
+}
 
+impl SearchParams {
+    /// The gapped HSP cutoff, NCBI's `hit_params->cutoffs[ctx].cutoff_score`.
+    /// With a positive --min-raw-gapped-score it is that value (rmblastn's
+    /// matrix-only scoring, BlastHitSavingParametersUpdate).  With 0 NCBI
+    /// derives it from E = 10, starting from 1: for a matrix without
+    /// Karlin-Altschul statistics that is exactly 1, and for one with them it
+    /// is the same E = 10 threshold the --ncbi-compat E-value cull applies.
+    /// So it is never below 1: 3.0.12 used 0 and kept score-0 remainders
+    /// (identity.matrix printed hits like q 3940-3939 with score 0).
+    pub fn gapped_cutoff(&self) -> i32 {
+        self.min_raw_gapped_score.max(1)
+    }
+
+    /// NCBI's `cutoff_score_max`, which caps the ungapped cutoff: half of a
+    /// positive --min-raw-gapped-score (matrix-only scoring), else the
+    /// E-derived gapped cutoff, which is at least 1 -- exactly 1 for a matrix
+    /// without Karlin-Altschul statistics (the RMBlast fallback in
+    /// BlastInitialWordParametersUpdate then uses it as the ungapped cutoff).
+    pub fn cutoff_score_max(&self) -> i32 {
+        if self.min_raw_gapped_score > 0 { self.min_raw_gapped_score / 2 } else { 1 }
+    }
 }
 
 impl Default for SearchParams {
@@ -113,7 +99,6 @@ impl Default for SearchParams {
             mask_level: 101,
             num_threads: 1,
             mt_mode: MtMode::SplitByDb,
-            seed_mode: SeedMode::Combined,
         }
     }
 }

@@ -16,11 +16,11 @@
 //!   * `-outfmt seqloc_*` / `maskinfo_*` (ASN.1 / XML)
 //!   * `-parse_seqids`
 //!
-//! Sequence identifiers are echoed back exactly as they appeared in the input
-//! defline.  NCBI instead re-generates them through its object manager, which for
-//! plain FASTA without `-parse_seqids` yields the same string; with
-//! `-parse_seqids` it emits a normalised Seq-id (`lcl|foo `), which is why that
-//! flag is refused here.
+//! Deflines are printed as NCBI prints them: NCBI regenerates them through
+//! `CDeflineGenerator`, which collapses spaces, cuts at a tab, strips trailing
+//! periods and decodes HTML entities (see `defline.rs`).  With
+//! `-parse_seqids` NCBI emits a normalised Seq-id (`lcl|foo `) instead, which
+//! is why that flag is refused here.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -32,6 +32,10 @@ use clap::Parser;
 use rmblast_lib::encoding::BLASTNA_TO_IUPAC;
 use rmblast_lib::filter::dust::{dustmasker_intervals, DUST_LEVEL, DUST_LINKER, DUST_WINDOW};
 use rmblast_lib::seq::FastaReader;
+
+mod defline;
+mod html_entities;
+use defline::ncbi_defline;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Argument-normalization shim for NCBI single-dash compatibility
@@ -69,7 +73,7 @@ fn normalize_args() -> Vec<std::ffi::OsString> {
 #[derive(Parser, Debug)]
 #[command(
     name = "dustmasker",
-    version,
+    version = env!("RMBLAST_VERSION"), // "<version> (<commit>[-dirty])", build.rs
     about = "Low complexity region masker based on Symmetric DUST algorithm",
     after_help = "\
 SCOPE:
@@ -78,7 +82,7 @@ SCOPE:
   with an error rather than producing near-miss output.
 
   Both single-dash (NCBI style) and double-dash long options are accepted.
-  Sequence identifiers are echoed verbatim from the input defline.
+  Deflines are printed as NCBI prints them.
 "
 )]
 struct Args {
@@ -137,7 +141,15 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let args = Args::parse_from(normalize_args());
+    // Usage errors exit 1, as in NCBI (clap's own default is 2).
+    let args = match Args::try_parse_from(normalize_args()) {
+        Ok(a) => a,
+        Err(e) if !e.use_stderr() => e.exit(), // --help, --version: exit 0
+        Err(e) => {
+            let _ = e.print();
+            std::process::exit(1);
+        }
+    };
 
     if args.parse_seqids {
         bail!(
@@ -191,27 +203,31 @@ fn run() -> Result<()> {
 
     let mut reader = FastaReader::new(input);
     while let Some(rec) = reader.next_record()? {
-        // NCBI skips zero-length bioseqs.
+        // NCBI aborts here ("FASTA-Reader: No residues given", exit 3).
         if rec.is_empty() {
-            continue;
+            bail!("record '{}' has no sequence", rec.id);
         }
+        let defline = ncbi_defline(&rec.defline);
         let bases = rec.bases();
         let masks = dustmasker_intervals(bases, args.window, args.level, args.linker);
 
         match outfmt {
             OutFmt::Interval => {
-                writeln!(output, ">{}", rec.defline)?;
+                write_defline(&mut output, &defline)?;
+                writeln!(output)?;
                 for &(s, e) in &masks {
                     writeln!(output, "{} - {}", s, e)?;
                 }
             }
             OutFmt::Acclist => {
                 for &(s, e) in &masks {
-                    writeln!(output, ">{}\t{}\t{}", rec.defline, s, e)?;
+                    write_defline(&mut output, &defline)?;
+                    writeln!(output, "\t{}\t{}", s, e)?;
                 }
             }
             OutFmt::Fasta => {
-                writeln!(output, ">{}", rec.defline)?;
+                write_defline(&mut output, &defline)?;
+                writeln!(output)?;
                 write_masked_fasta(&mut output, bases, &masks, args.hard_masking)?;
             }
         }
@@ -219,6 +235,11 @@ fn run() -> Result<()> {
 
     output.flush()?;
     Ok(())
+}
+
+fn write_defline(out: &mut dyn Write, defline: &[u8]) -> io::Result<()> {
+    out.write_all(b">")?;
+    out.write_all(defline)
 }
 
 /// Mirror of `CMaskWriterFasta::Print`: IUPAC sequence in 60-column lines with

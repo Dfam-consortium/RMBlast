@@ -102,7 +102,7 @@ pub fn compute_table_index(word: &[u8]) -> i32 {
 ///   - chain[0]     → num_hits
 ///   - chain[1..]   → hit offsets
 fn blast_lookup_add_word_hit(
-    thin_backbone:   &mut Vec<Vec<i32>>,
+    thin_backbone:   &mut [Vec<i32>],
     word:            &[u8],
     query_offset:    i32,
 ) {
@@ -126,7 +126,7 @@ fn blast_lookup_add_word_hit(
 ///
 /// Mirrors `void BlastLookupIndexQueryExactMatches(...)`.
 pub fn blast_lookup_index_query_exact_matches(
-    thin_backbone:   &mut Vec<Vec<i32>>,
+    thin_backbone:   &mut [Vec<i32>],
     word_length:     i32,
     lut_word_length: i32,
     query_sequence:  &[u8],
@@ -185,7 +185,7 @@ pub fn blast_lookup_index_query_exact_matches(
 /// Convert thin backbone into the compact thick backbone + overflow + pv.
 /// Consumes (clears) each non-empty thin_backbone chain.
 fn s_blast_na_lookup_finalize(
-    thin_backbone: &mut Vec<Vec<i32>>,
+    thin_backbone: &mut [Vec<i32>],
     lookup:        &mut BlastNaLookupTable,
 ) {
     lookup.thick_backbone =
@@ -227,9 +227,8 @@ fn s_blast_na_lookup_finalize(
 
         if num_hits <= NA_HITS_PER_CELL as i32 {
             let mut entries = [0i32; NA_HITS_PER_CELL];
-            for j in 0..num_hits as usize {
-                entries[j] = thin_backbone[i][j + 1];
-            }
+            let n = num_hits as usize;
+            entries[..n].copy_from_slice(&thin_backbone[i][1..n + 1]);
             lookup.thick_backbone[i].payload = NaLookupPayload::Entries(entries);
         } else {
             lookup.thick_backbone[i].payload =
@@ -280,12 +279,14 @@ pub fn choose_lut_width(word_size: usize, approx_entries: usize) -> usize {
             else if approx_entries < 900_000 { 11 }
             else                             { 12 }
         }
-        _ => {
-            // word_size ≥ 13
+        13.. => {
             if      approx_entries < 8_500   { 8 }
             else if approx_entries < 300_000 { 11 }
             else                             { 12 }
         }
+        // NCBI's switch has no case below 4 either: its CLI rejects them, and
+        // so does ours.  A width above the word size would make scan_step <= 0.
+        _ => panic!("word_size {word_size} is below the minimum of 4"),
     }
 }
 

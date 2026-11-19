@@ -10,7 +10,11 @@
 //!   st.transitions.  This port preserves that quirk for output compatibility.
 //!
 //! Pairwise output (outfmt 0):
-//!   Matches NCBI rmblastn default pairwise alignment format exactly.
+//!   NCBI rmblastn 2.17.1's default pairwise format, for a database built with
+//!   -parse_seqids (as RepeatMasker and RepeatModeler build them).  Checked
+//!   line for line against NCBI on the CLI fixtures; the one known difference
+//!   is "Posted date", which NCBI takes from the database build time and this
+//!   port from the database file's modification time, in UTC.
 
 use std::io::Write;
 
@@ -18,7 +22,108 @@ use crate::hits::{Hsp, Strand};
 use crate::stats::{blastna_to_iupac_aligned, AlignStats};
 
 // ── Program identity string ───────────────────────────────────────────────────
-pub const RMBLASTN_VERSION: &str = "RMBLASTN 2.17.0+";
+pub const RMBLASTN_VERSION: &str = "RMBLASTN 2.17.1+";
+
+/// `NStr::Int8ToString(n, fWithCommas)`: 11207 -> "11,207".
+pub fn with_commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `NStr::Wrap(str, width, fWrap_FlatFile)` (corelib/ncbistr.cpp) without a
+/// prefix, for text with no backspaces: breaks after a space, a comma or a
+/// hyphen, preferring spaces, and forces a break at `width` when there is
+/// none.  Used for the database title (width 68, kFormatLineLength).
+pub fn ncbi_wrap_flat(s: &str, width: usize) -> Vec<String> {
+    #[derive(PartialEq, PartialOrd, Clone, Copy)]
+    enum Score { Forced, Punct, Comma, Space, Newline }
+    let b = s.as_bytes();
+    let len = b.len();
+    let mut lines = Vec::new();
+    let mut pos = 0;
+    while pos < len {
+        let mut column = 0usize;
+        let mut best_pos = usize::MAX;
+        let mut best = Score::Forced;
+        let nl = s[pos..].find('\n').map_or(len, |i| pos + i);
+        let pos0 = if nl - pos <= width { nl } else { pos };
+        let mut pos2 = pos0;
+        while pos2 < len && column <= width {
+            let c = b[pos2];
+            let mut score = Score::Forced;
+            let mut score_pos = pos2;
+            if c == b'\n' {
+                best_pos = pos2;
+                best = Score::Newline;
+                break;
+            } else if c.is_ascii_whitespace() {
+                score = Score::Space;
+            } else if c == b',' && column < width && score_pos < len - 1 {
+                score = Score::Comma;
+                score_pos += 1;
+            } else if c == b'-' && score_pos < len - 1 && column < width {
+                score = Score::Punct;
+                score_pos += 1;
+            }
+            if score >= best && score_pos > pos0 {
+                best_pos = score_pos;
+                best = score;
+            }
+            pos2 += 1;
+            column += 1;
+        }
+        if best != Score::Newline && column <= width {
+            best_pos = len; // the rest fits
+        }
+        let best_pos = best_pos.min(len).max(pos + 1);
+        lines.push(s[pos..best_pos].to_string());
+        pos = best_pos;
+        if best == Score::Space {
+            while pos < len && b[pos] == b' ' {
+                pos += 1;
+            }
+            if pos < len && b[pos] == b'\n' {
+                pos += 1;
+            }
+        } else if best == Score::Newline {
+            pos += 1;
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// `s_WrapOutputLine` (objtools/align_format/showalign.cpp), used for the
+/// subject title: past every 60th character, break after the next whitespace
+/// (which stays on the line).  A long word is never broken.
+fn ncbi_wrap_title(s: &str) -> String {
+    const LINE_LEN: usize = 60;
+    if s.len() <= LINE_LEN {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + s.len() / LINE_LEN);
+    let mut do_wrap = false;
+    for (i, c) in s.char_indices() {
+        if i > 0 && i % LINE_LEN == 0 {
+            do_wrap = true;
+        }
+        out.push(c);
+        if do_wrap && c.is_ascii_whitespace() {
+            out.push('\n');
+            do_wrap = false;
+        }
+    }
+    out
+}
 
 // ── AlignResult ───────────────────────────────────────────────────────────────
 
@@ -66,8 +171,15 @@ pub enum OutField {
     Bitscore,
 }
 
+/// The field names `-outfmt 6` accepts, in the order the help lists them.
+pub const OUT_FIELD_NAMES: &[&str] = &[
+    "score", "perc_sub", "perc_query_gap", "perc_db_gap", "qseqid", "qstart", "qend",
+    "qlen", "sstrand", "sseqid", "sstart", "send", "slen", "kdiv", "cpg_kdiv", "transi",
+    "transv", "cpg_sites", "qseq", "sseq", "evalue", "bitscore",
+];
+
 impl OutField {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "score"          => Some(Self::Score),
             "perc_sub"       => Some(Self::PercSub),
@@ -103,12 +215,27 @@ pub fn outfmt_needs_stats(fields: &[OutField]) -> bool {
     fields.iter().any(|f| matches!(f, OutField::Evalue | OutField::Bitscore))
 }
 
-/// Parse an outfmt string like "6 score perc_sub ... qseq sseq" into a field list.
-/// The leading format number (e.g. "6") is skipped.
-pub fn parse_outfmt(s: &str) -> Vec<OutField> {
-    s.split_whitespace()
-        .filter(|t| t.parse::<u32>().is_err())
-        .filter_map(|t| OutField::from_str(t))
+/// Parse a tabular outfmt string, "6 score perc_sub ... qseq sseq", into its
+/// field list.  Anything this port does not implement is an error: another
+/// format number, a bare "6" (NCBI's default 12 columns are not implemented),
+/// or an unknown field name.  3.0.12 dropped unknown fields silently, shifting
+/// the columns, and treated "7 ..." and "10 ..." as 6.
+pub fn parse_outfmt(s: &str) -> Result<Vec<OutField>, String> {
+    let mut tokens = s.split_whitespace();
+    match tokens.next() {
+        Some("6") => {}
+        Some(fmt) => return Err(format!(
+            "output format '{fmt}' is not supported; use 0 (pairwise) or 6 <fields> (tabular)")),
+        None => return Err("empty output format".into()),
+    }
+    let fields: Vec<&str> = tokens.collect();
+    if fields.is_empty() {
+        return Err(format!(
+            "-outfmt 6 needs a field list; NCBI's default columns are not supported. Fields: {}",
+            OUT_FIELD_NAMES.join(" ")));
+    }
+    fields.iter().map(|f| OutField::parse(f).ok_or_else(|| format!(
+        "unknown -outfmt field '{f}'. Supported fields: {}", OUT_FIELD_NAMES.join(" "))))
         .collect()
 }
 
@@ -231,7 +358,7 @@ pub fn write_tabular<W: Write>(
             }
         }
     }
-    write!(w, "\n")?;
+    writeln!(w)?;
     Ok(())
 }
 
@@ -308,17 +435,21 @@ pub fn write_pairwise_program_header<W: Write>(
     total_letters: u64,
 ) -> std::io::Result<()> {
     write!(w, "{}\n\n\n", RMBLASTN_VERSION)?;
-    write!(w, "Reference: Robert M. Hubley, Arian Smit\n")?;
-    write!(w, "RMBlast - RepeatMasker Search Engine\n")?;
-    write!(w, "2010 <http://www.repeatmasker.org>\n")?;
-    write!(w, "\n")?;
-    write!(w, "Reference: Stephen F. Altschul, Thomas L. Madden, Alejandro A.\n")?;
-    write!(w, "Schaffer, Jinghui Zhang, Zheng Zhang, Webb Miller, and David J.\n")?;
-    write!(w, "Lipman (1997), \"Gapped BLAST and PSI-BLAST: a new generation of\n")?;
-    write!(w, "protein database search programs\", Nucleic Acids Res. 25:3389-3402.\n")?;
+    writeln!(w, "Reference: Robert M. Hubley, Arian Smit")?;
+    writeln!(w, "RMBlast - RepeatMasker Search Engine")?;
+    writeln!(w, "2010 <http://www.repeatmasker.org>")?;
+    writeln!(w)?;
+    writeln!(w, "Reference: Stephen F. Altschul, Thomas L. Madden, Alejandro A.")?;
+    writeln!(w, "Schaffer, Jinghui Zhang, Zheng Zhang, Webb Miller, and David J.")?;
+    writeln!(w, "Lipman (1997), \"Gapped BLAST and PSI-BLAST: a new generation of")?;
+    writeln!(w, "protein database search programs\", Nucleic Acids Res. 25:3389-3402.")?;
     write!(w, "\n\n\n")?;
-    write!(w, "Database: {}\n", db_name)?;
-    write!(w, "           {} sequences; {} total letters\n", n_seqs, total_letters)?;
+    write!(w, "Database: ")?;
+    for line in ncbi_wrap_flat(db_name, 68) {
+        writeln!(w, "{}", line)?;
+    }
+    writeln!(w, "           {} sequences; {} total letters",
+        with_commas(n_seqs as u64), with_commas(total_letters))?;
     write!(w, "\n\n\n")?;
     Ok(())
 }
@@ -336,23 +467,34 @@ pub fn write_pairwise_query_header<W: Write>(
     query_defline: &str,
     query_len: u32,
 ) -> std::io::Result<()> {
-    write!(w, "Query= {}\n\nLength={}\n\n", query_defline, query_len)?;
+    // NCBI trims a query's defline (CFastaReader), unlike a subject title
+    write!(w, "Query= {}\n\nLength={}\n\n", query_defline.trim_end(), query_len)?;
     Ok(())
 }
 
 /// Write the per-subject header block (before the first HSP for a subject).
 ///
 /// ```text
-/// >subject_id
+/// >subject_id title
 /// Length=N
 ///
 /// ```
+///
+/// As NCBI prints it for a -parse_seqids database: the id, one space, then
+/// the rest of the defline (after the id and one whitespace character)
+/// wrapped by `ncbi_wrap_title`.  An id-only defline gives ">id " with the
+/// trailing space, as in NCBI.
 pub fn write_pairwise_subject_header<W: Write>(
     w: &mut W,
     subject_id: &str,
+    subject_defline: Option<&str>,
     subject_len: u32,
 ) -> std::io::Result<()> {
-    write!(w, ">{} \nLength={}\n\n", subject_id, subject_len)?;
+    let title = subject_defline
+        .and_then(|d| d.strip_prefix(subject_id))
+        .map(|rest| { let mut c = rest.chars(); c.next(); c.as_str() })
+        .unwrap_or("");
+    write!(w, ">{} {}\nLength={}\n\n", subject_id, ncbi_wrap_title(title), subject_len)?;
     Ok(())
 }
 
@@ -361,7 +503,15 @@ pub fn write_pairwise_subject_header<W: Write>(
 /// Outputs the stats block, then the wrapped alignment rows (60 bases/row),
 /// then two blank lines (as required by NCBI's between-HSP and end-of-subject
 /// blank-line conventions).
-pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Result<()> {
+///
+/// `query_mask`: the query's DUST intervals (0-based, inclusive, sorted).
+/// Query bases inside them print in lower case, as NCBI prints filtered
+/// query regions.
+pub fn write_pairwise_hsp<W: Write>(
+    w: &mut W,
+    r: &AlignResult,
+    query_mask: &[(u32, u32)],
+) -> std::io::Result<()> {
     let h  = &r.hsp;
     let st = &r.stats;
 
@@ -377,19 +527,35 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
         Strand::Minus => "Plus/Minus",
     };
 
-    write!(w, " Score = {}\n", h.score)?;
-    write!(w, " Substitutions = {:.2}%, Query Gaps = {:.2}%, DB Gaps = {:.2}%\n",
+    writeln!(w, " Score = {}", h.score)?;
+    writeln!(w, " Substitutions = {:.2}%, Query Gaps = {:.2}%, DB Gaps = {:.2}%",
         st.perc_sub, st.perc_query_gap, st.perc_db_gap)?;
-    write!(w, " TransI/TransV = {}/{},  CpG_sites = {}\n",
+    writeln!(w, " TransI/TransV = {}/{},  CpG_sites = {}",
         st.transitions, st.transversions, st.cpg_sites)?;
-    write!(w, " Kimura Div = {:.2}%, Kimura Div CpG Adjusted = {:.2}%\n",
+    writeln!(w, " Kimura Div = {:.2}%, Kimura Div CpG Adjusted = {:.2}%",
         st.kdiv, st.cpg_kdiv)?;
-    write!(w, " Identities = {}/{} ({}%), Gaps = {}/{} ({}%)\n",
+    writeln!(w, " Identities = {}/{} ({}%), Gaps = {}/{} ({}%)",
         n_ident, aln_len, pct_ident, n_gaps, aln_len, pct_gaps)?;
     write!(w, " Strand={}\n\n", strand_str)?;
 
     // ── Alignment rows ────────────────────────────────────────────────────────
-    let q_iupac = blastna_to_iupac_aligned(&h.q_seq);
+    let mut q_iupac = blastna_to_iupac_aligned(&h.q_seq);
+    if !query_mask.is_empty() {
+        let mut q = h.q_start; // 0-based query position of the next base
+        let mut m = query_mask.partition_point(|&(_, e)| e < q);
+        for c in q_iupac.iter_mut() {
+            if *c == b'-' {
+                continue;
+            }
+            while m < query_mask.len() && query_mask[m].1 < q {
+                m += 1;
+            }
+            if m < query_mask.len() && query_mask[m].0 <= q {
+                c.make_ascii_lowercase();
+            }
+            q += 1;
+        }
+    }
     let s_iupac = blastna_to_iupac_aligned(&h.s_seq);
 
     // Column width for position numbers: digits of the maximum coordinate.
@@ -432,7 +598,7 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
         // Build the match indicator line.
         let match_line: Vec<u8> = q_row.iter().zip(s_row.iter()).map(|(&q, &s)| {
             if q == b'-' || s == b'-' { b' ' }
-            else if q.to_ascii_uppercase() == s.to_ascii_uppercase() { b'|' }
+            else if q.eq_ignore_ascii_case(&s) { b'|' }
             else { b' ' }
         }).collect();
 
@@ -441,17 +607,17 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
 
         write!(w, "Query  {:<width$}  ", q_row_start, width = pos_w)?;
         w.write_all(q_row)?;
-        write!(w, "  {}\n", q_row_end)?;
+        writeln!(w, "  {}", q_row_end)?;
 
         for _ in 0..prefix_spaces { w.write_all(b" ")?; }
         w.write_all(&match_line)?;
-        write!(w, "\n")?;
+        writeln!(w)?;
 
         write!(w, "Sbjct  {:<width$}  ", s_row_start, width = pos_w)?;
         w.write_all(s_row)?;
-        write!(w, "  {}\n", s_row_end)?;
+        writeln!(w, "  {}", s_row_end)?;
 
-        write!(w, "\n")?;   // blank line after each chunk
+        writeln!(w)?;   // blank line after each chunk
 
         q_pos += q_nongap;
         match h.strand {
@@ -463,7 +629,7 @@ pub fn write_pairwise_hsp<W: Write>(w: &mut W, r: &AlignResult) -> std::io::Resu
     }
 
     // One extra blank line → total 2 blank lines after last chunk.
-    write!(w, "\n")?;
+    writeln!(w)?;
 
     Ok(())
 }
@@ -492,56 +658,62 @@ pub fn write_pairwise_footer<W: Write>(
     gap_open: i32,
     gap_extend: i32,
 ) -> std::io::Result<()> {
-    // Two extra blank lines (the last HSP already contributed 2, giving 4 total).
-    write!(w, "\n\n")?;
-    write!(w, "  Database: {}\n", db_name)?;
-    if let Some(secs) = db_mtime_unix {
-        write!(w, "    Posted date:  {}\n", format_ncbi_date(secs))?;
+    // (each query block already ended with the blank lines NCBI puts here)
+    write!(w, "  Database: ")?;
+    for line in ncbi_wrap_flat(db_name, 68) {
+        writeln!(w, "{}", line)?;
     }
-    write!(w, "  Number of letters in database: {}\n", total_letters)?;
-    write!(w, "  Number of sequences in database:  {}\n", n_seqs)?;
+    if let Some(secs) = db_mtime_unix {
+        writeln!(w, "    Posted date:  {}", format_ncbi_date(secs))?;
+    }
+    writeln!(w, "  Number of letters in database: {}", with_commas(total_letters))?;
+    writeln!(w, "  Number of sequences in database:  {}", with_commas(n_seqs as u64))?;
     write!(w, "\n\n\n")?;
-    write!(w, "Matrix: blastn matrix 0 0\n")?;
-    write!(w, "Gap Penalties: Existence: {}, Extension: {:.2}\n",
+    writeln!(w, "Matrix: blastn matrix 0 0")?;
+    writeln!(w, "Gap Penalties: Existence: {}, Extension: {:.2}",
         gap_open, gap_extend as f64)?;
     Ok(())
 }
 
 /// Write all pairwise results for one query.  Results must be pre-sorted by score
 /// descending.  Subjects are output in order of first appearance (best-score-first).
-pub fn write_pairwise_results<W: Write>(
+///
+/// `subject_defline` gives a subject's full defline (None for a 2bit
+/// database, which stores only names); `query_mask` is the query's DUST
+/// intervals (see `write_pairwise_hsp`).  A query without hits gets NCBI's
+/// "***** No hits found *****" block.
+pub fn write_pairwise_results<'a, W: Write>(
     w: &mut W,
     results: &[AlignResult],
     query_defline: &str,
     query_len: u32,
+    subject_defline: &dyn Fn(&str) -> Option<&'a str>,
+    query_mask: &[(u32, u32)],
 ) -> std::io::Result<()> {
+    write_pairwise_query_header(w, query_defline, query_len)?;
     if results.is_empty() {
+        write!(w, "\n***** No hits found *****\n\n\n\n\n")?;
         return Ok(());
     }
 
-    write_pairwise_query_header(w, query_defline, query_len)?;
-
-    // Group by subject, preserving order of first appearance.
-    let mut seen_subjects: Vec<&str> = Vec::new();
+    // Group by subject, preserving order of first appearance, in one pass.
+    let mut order: Vec<&str> = Vec::new();
+    let mut groups: std::collections::HashMap<&str, Vec<&AlignResult>> = std::collections::HashMap::new();
     for r in results {
-        if !seen_subjects.contains(&r.subject_id.as_str()) {
-            seen_subjects.push(&r.subject_id);
-        }
+        groups.entry(r.subject_id.as_str())
+            .or_insert_with(|| { order.push(r.subject_id.as_str()); Vec::new() })
+            .push(r);
     }
 
-    for subj_id in seen_subjects {
-        let subj_results: Vec<&AlignResult> = results.iter()
-            .filter(|r| r.subject_id == subj_id)
-            .collect();
-        if subj_results.is_empty() { continue; }
-
-        let s_len = subj_results[0].hsp.s_len;
-        write_pairwise_subject_header(w, subj_id, s_len)?;
-
+    for subj_id in order {
+        let subj_results = &groups[subj_id];
+        write_pairwise_subject_header(w, subj_id, subject_defline(subj_id), subj_results[0].hsp.s_len)?;
         for r in subj_results {
-            write_pairwise_hsp(w, r)?;
+            write_pairwise_hsp(w, r, query_mask)?;
         }
     }
+    // NCBI ends each query's block with two more blank lines.
+    write!(w, "\n\n")?;
 
     Ok(())
 }
@@ -549,6 +721,46 @@ pub fn write_pairwise_results<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_commas_like_ncbi() {
+        for (n, want) in [(0, "0"), (17, "17"), (999, "999"), (1000, "1,000"),
+                          (11207, "11,207"), (3099734149, "3,099,734,149")] {
+            assert_eq!(with_commas(n), want);
+        }
+    }
+
+    /// NCBI 2.17.1's "Database:" lines for these titles (kFormatLineLength 68).
+    #[test]
+    fn database_title_wraps_like_ncbi() {
+        let path = "databases/repeat-libraries/2026-11-release/curated-families-with-long-names/db.fa";
+        assert_eq!(ncbi_wrap_flat(path, 68), [
+            "databases/repeat-libraries/2026-11-release/curated-families-with-",
+            "long-names/db.fa",
+        ]);
+        assert_eq!(ncbi_wrap_flat("db.fa", 68), ["db.fa"]);
+    }
+
+    /// NCBI 2.17.1's subject header for a -parse_seqids database: the title
+    /// breaks after the first whitespace past each 60th character, and a long
+    /// word (hyphens included) is never broken.
+    #[test]
+    fn subject_title_wraps_like_ncbi() {
+        let mut out = Vec::new();
+        let d = format!("id3 {}", "a very long description with many words ".repeat(4));
+        write_pairwise_subject_header(&mut out, "id3", Some(&d), 262).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(),
+            ">id3 a very long description with many words a very long description \n\
+             with many words a very long description with many words a \n\
+             very long description with many words \nLength=262\n\n");
+        let mut out = Vec::new();
+        let long = "id5 x averyveryveryveryveryveryveryveryveryveryveryveryverylongwordwithnospaces-and-hyphens-here-too";
+        write_pairwise_subject_header(&mut out, "id5", Some(long), 554).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!(">{long}\nLength=554\n\n"));
+        let mut out = Vec::new();
+        write_pairwise_subject_header(&mut out, "onlyid", Some("onlyid"), 302).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), ">onlyid \nLength=302\n\n");
+    }
 
     // Expected strings mirror C snprintf with the NCBI tabular format rules
     // (SetScores: GetScoreString + the %.2e override for [1e-180, 0.0009)).

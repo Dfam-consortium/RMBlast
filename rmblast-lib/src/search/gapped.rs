@@ -25,12 +25,11 @@ use crate::matrix::ScoreMatrix;
 #[cfg(feature = "diagnostics")]
 pub static TOTAL_DP_CELLS: AtomicU64 = AtomicU64::new(0);
 
-/// Diagnostic counter: number of times the REVERSE band pointer had to be clamped
-/// because `first_b_index` reached `n` (see `align_ex_score_only_inner`).  The clamp
-/// is behaviour-neutral — the inner loop runs zero times in that state — this counter
-/// only records how often the degenerate band state occurs.
+/// Diagnostic counter: REVERSE rows whose band starts at `first_b_index == n`
+/// (see `align_ex_score_only_inner`), where the inner loop runs zero times and
+/// the b pointer must not be formed below the slice.
 #[cfg(feature = "diagnostics")]
-pub static REVERSE_FBI_CLAMPED: AtomicU64 = AtomicU64::new(0);
+pub static REVERSE_BAND_AT_END: AtomicU64 = AtomicU64::new(0);
 
 /// Diagnostic counter: total score-only DP cells (subset of TOTAL_DP_CELLS).
 #[cfg(feature = "diagnostics")]
@@ -90,10 +89,18 @@ impl AlignWorkspace {
 
 }
 
+impl Default for AlignWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Score-only gapped alignment — no traceback storage (mirrors score_only=TRUE path).
 ///
 /// Returns (score, a_len, b_len). Much faster than `align_ex` when traceback not needed.
 /// Score-only gapped alignment (dispatch wrapper — picks monomorphised variant).
+///
+/// Every byte of `b[..n]` must be a BLASTNA code (0..=15); see the inner loop.
 pub fn align_ex_score_only(
     a: &[u8],
     b: &[u8],
@@ -201,7 +208,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
             if first_b_index < n {
                 unsafe { b.as_ptr().add(n - 1 - first_b_index) }
             } else {
-                crate::diag_count!(REVERSE_FBI_CLAMPED);
+                crate::diag_count!(REVERSE_BAND_AT_END);
                 b.as_ptr()
             }
         } else {
@@ -213,8 +220,16 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
         // Hot inner loop — no sentinel branch.
         let mut b_idx = first_b_index;
         while b_idx < inner_end {
+            // Unlike align_ex, b_base is not masked with & 15: that costs 2.3% of
+            // this loop.  Every b byte is BLASTNA (0..=15) by construction: the
+            // subject's packing (blast_compress_blastna_sequence) indexes a
+            // 16-entry table with each byte, so a larger one panics before any
+            // DP runs.  Calling this directly with other bytes is unsound.
             let b_base = unsafe { *b_cur as usize };
-            b_cur = if REVERSE { unsafe { b_cur.sub(1) } } else { unsafe { b_cur.add(1) } };
+            debug_assert!(b_base < 16, "b byte {b_base} is not a BLASTNA code");
+            // REVERSE steps below b after reading b[0]; `sub` may not form that
+            // pointer (3.0.12 did), `wrapping_sub` may, and it is never read.
+            b_cur = if REVERSE { b_cur.wrapping_sub(1) } else { unsafe { b_cur.add(1) } };
 
             let (score_gap_col, next_score) = unsafe {
                 let cell = dp.get_unchecked(b_idx);
@@ -323,7 +338,7 @@ fn align_ex_score_only_inner<const REVERSE: bool>(
 
 /// Score-only bidirectional gapped alignment (for preliminary extension — no traceback needed).
 ///
-/// Mirrors `gapped_extend_bidirectional` but uses `align_ex_score_only` to skip
+/// Mirrors `engine::gapped_extend_bidirectional` but uses `align_ex_score_only` to skip
 /// all traceback bookkeeping.  Returns `(score, q_start, q_end, s_start, s_end)`.
 ///
 /// Loop orientation matches NCBI `s_BlastAlignPackedNucl`: subject is the OUTER loop
@@ -688,20 +703,25 @@ fn traceback_flat(
     let mut b = end_b;
     let mut prev_op = SCRIPT_SUB;
 
-    while a > 0 || b > 0 {
-        if a >= row_info.len() {
-            push_rev(&mut ops_rev, EditOp::GapInQuery);
-            if b > 0 { b -= 1; }
-            continue;
-        }
+    // The DP records a row for every a the walk reaches and never points a
+    // step past a = 0 or b = 0, so each step lowers a + b by at least 1 and the
+    // walk takes at most end_a + end_b steps.  3.0.12 looped `while a > 0 ||
+    // b > 0`: had that invariant broken, a step saturating at 0 could repeat
+    // forever.  The step budget bounds the walk (a walk it cuts off panics
+    // below), and `row_info[a]` panics past the last row.
+    for _ in 0..end_a + end_b {
 
         let (byte_off, first_b) = row_info[a];
         let row_end = if a + 1 < row_info.len() { row_info[a + 1].0 } else { flat.len() };
 
+        // A cell outside the row's stored band reads as a gap in A.  The
+        // traceback never visits one (checked in debug builds).
         let raw_op = if b >= first_b {
             let byte_idx = byte_off + (b - first_b);
+            debug_assert!(byte_idx < row_end, "traceback: ({a}, {b}) past the end of its row");
             if byte_idx < row_end { flat[byte_idx] } else { SCRIPT_GAP_IN_A }
         } else {
+            debug_assert!(false, "traceback: ({a}, {b}) before the start of its row ({first_b})");
             SCRIPT_GAP_IN_A
         };
 
@@ -720,19 +740,26 @@ fn traceback_flat(
         prev_op = op;
 
         match op {
-            SCRIPT_GAP_IN_A => { push_rev(&mut ops_rev, EditOp::GapInQuery);   if b > 0 { b -= 1; } }
-            SCRIPT_GAP_IN_B => { push_rev(&mut ops_rev, EditOp::GapInSubject); if a > 0 { a -= 1; } }
+            SCRIPT_GAP_IN_A => { push_rev(&mut ops_rev, EditOp::GapInQuery);   b = b.saturating_sub(1); }
+            SCRIPT_GAP_IN_B => { push_rev(&mut ops_rev, EditOp::GapInSubject); a = a.saturating_sub(1); }
             _ =>               { push_rev(&mut ops_rev, EditOp::Sub);
-                                  if a > 0 { a -= 1; }
-                                  if b > 0 { b -= 1; } }
+                                  a = a.saturating_sub(1);
+                                  b = b.saturating_sub(1); }
         }
 
         if a == 0 && b == 0 { break; }
     }
+    if a != 0 || b != 0 { traceback_unfinished(end_a, end_b, a, b) }
 
     ops_rev.reverse();
     for (op, n) in ops_rev { result.push(op, n); }
     result
+}
+
+#[cold]
+#[inline(never)]
+fn traceback_unfinished(end_a: usize, end_b: usize, a: usize, b: usize) -> ! {
+    panic!("traceback from ({end_a}, {end_b}) did not reach (0, 0) in {} steps; stopped at ({a}, {b})", end_a + end_b)
 }
 
 fn push_rev(ops: &mut Vec<(EditOp, u32)>, op: EditOp) {
@@ -829,9 +856,91 @@ T -4  -4  -4   5
         let a = vec![0u8, 1, 2, 3, 0, 1, 2, 3];
         let s = vec![0u8, 1, 2, 3, 1, 2, 3];
         let r = align_ex(&a, &s, 8, 7, 4, 4, 50, &m, false, &mut w);
-        assert!(r.score > 0, "score={}", r.score);
-        assert!(r.a_len > 0);
-        assert!(r.b_len > 0);
+        // 7 matches (35) and one 1-base gap (open 4 + extend 4): 27, the
+        // best the oracle finds too.
+        assert_eq!((r.score, r.a_len, r.b_len), (27, 8, 7));
+        assert_eq!(r.score, best_anchored_score(&a, &s, &m, 4, 4));
+        assert_eq!(r.edit_script.ops, vec![(EditOp::Sub, 4), (EditOp::GapInSubject, 1), (EditOp::Sub, 3)]);
+    }
+
+    /// Best score of an alignment of a prefix of `a` with a prefix of `b`
+    /// (both starting at 0, ending anywhere, 0 for the empty one), with a gap
+    /// of k bases costing open + k * extend: an independent Gotoh DP.
+    fn best_anchored_score(a: &[u8], b: &[u8], m: &ScoreMatrix, open: i32, ext: i32) -> i32 {
+        const NEG: i64 = i64::MIN / 4;
+        let (oe, e) = ((open + ext) as i64, ext as i64);
+        let (la, lb) = (a.len(), b.len());
+        let mut h = vec![vec![NEG; lb + 1]; la + 1]; // best ending at (i, j)
+        let mut gx = vec![vec![NEG; lb + 1]; la + 1]; // ending in a gap consuming a
+        let mut gy = vec![vec![NEG; lb + 1]; la + 1]; // ending in a gap consuming b
+        h[0][0] = 0;
+        let mut best = 0i64;
+        for i in 0..=la {
+            for j in 0..=lb {
+                if i == 0 && j == 0 { continue; }
+                if i > 0 { gx[i][j] = (h[i - 1][j] - oe).max(gx[i - 1][j] - e); }
+                if j > 0 { gy[i][j] = (h[i][j - 1] - oe).max(gy[i][j - 1] - e); }
+                let diag = if i > 0 && j > 0 { h[i - 1][j - 1] + m.score(a[i - 1], b[j - 1]) as i64 } else { NEG };
+                h[i][j] = diag.max(gx[i][j]).max(gy[i][j]);
+                best = best.max(h[i][j]);
+            }
+        }
+        best as i32
+    }
+
+    /// align_ex finds the optimal anchored score when the x-dropoff cannot
+    /// prune; its edit script rescores to that score and consumes exactly
+    /// (a_len, b_len); the score-only aligner gives the same score; and the
+    /// REVERSE variants equal the forward ones on reversed sequences.
+    #[test]
+    fn align_ex_is_optimal_and_consistent() {
+        let m = mat();
+        let mut w = ws();
+        let mut dp = Vec::new();
+        let mut x = 0xA0761D6478BD642Fu64;
+        let mut rnd = move |n: u64| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x % n };
+        for trial in 0..3000 {
+            let la = 1 + rnd(40) as usize;
+            let a: Vec<u8> = (0..la).map(|_| rnd(4) as u8).collect();
+            // b: a mutated copy (substitutions, insertions, deletions)
+            let mut b = Vec::new();
+            for &c in &a {
+                match rnd(12) {
+                    0 => {}
+                    1 => { b.push(c); b.push(rnd(4) as u8); }
+                    2 => b.push(rnd(4) as u8),
+                    _ => b.push(c),
+                }
+            }
+            if b.is_empty() { b.push(0); }
+            let (open, ext) = [(4, 4), (20, 5), (8, 2), (1, 1)][trial % 4];
+            let want = best_anchored_score(&a, &b, &m, open, ext);
+
+            let r = align_ex(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, false, &mut w);
+            assert_eq!(r.score, want, "trial {trial}: a {a:?} b {b:?} gaps {open}/{ext}");
+            let (mut i, mut j, mut sc, mut prev) = (0usize, 0usize, 0i32, None);
+            for &(op, n) in &r.edit_script.ops {
+                for _ in 0..n {
+                    match op {
+                        EditOp::Sub => { sc += m.score(a[i], b[j]); i += 1; j += 1; }
+                        EditOp::GapInSubject => { sc -= if prev == Some(op) { ext } else { open + ext }; i += 1; }
+                        EditOp::GapInQuery => { sc -= if prev == Some(op) { ext } else { open + ext }; j += 1; }
+                    }
+                    prev = Some(op);
+                }
+            }
+            assert_eq!((i, j), (r.a_len, r.b_len), "trial {trial}: script length");
+            assert_eq!(sc, r.score, "trial {trial}: script rescored");
+
+            let (so, ..) = align_ex_score_only(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, false, &mut dp);
+            assert_eq!(so, want, "trial {trial}: score-only");
+
+            let (ra, rb): (Vec<u8>, Vec<u8>) = (a.iter().rev().copied().collect(), b.iter().rev().copied().collect());
+            let want_rev = best_anchored_score(&ra, &rb, &m, open, ext);
+            let rr = align_ex(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, true, &mut w);
+            let (rso, ..) = align_ex_score_only(&a, &b, a.len(), b.len(), open, ext, 1_000_000, &m, true, &mut dp);
+            assert_eq!((rr.score, rso), (want_rev, want_rev), "trial {trial}: reverse");
+        }
     }
 
     #[test]
@@ -878,8 +987,8 @@ T -4  -4  -4   5
         // degenerate state, so the test cannot silently stop covering the bug.
         // The counter only exists with the diagnostics feature.
         #[cfg(feature = "diagnostics")]
-        assert!(REVERSE_FBI_CLAMPED.load(std::sync::atomic::Ordering::Relaxed) > 0,
-                "no reverse-band clamp observed — test inputs no longer reach the bug");
+        assert!(REVERSE_BAND_AT_END.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "no band at first_b_index == n observed — test inputs no longer reach the case");
     }
 
     #[test]

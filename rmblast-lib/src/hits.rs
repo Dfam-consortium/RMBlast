@@ -51,27 +51,6 @@ impl EditScript {
         self.ops.push((op, count));
     }
 
-    /// Total aligned columns.
-    pub fn align_len(&self) -> u32 {
-        self.ops.iter().map(|(_, n)| n).sum()
-    }
-
-    /// Number of query bases consumed (Sub + GapInSubject).
-    pub fn query_consumed(&self) -> u32 {
-        self.ops.iter()
-            .filter(|(op, _)| *op != EditOp::GapInQuery)
-            .map(|(_, n)| n)
-            .sum()
-    }
-
-    /// Number of subject bases consumed (Sub + GapInQuery).
-    pub fn subject_consumed(&self) -> u32 {
-        self.ops.iter()
-            .filter(|(op, _)| *op != EditOp::GapInSubject)
-            .map(|(_, n)| n)
-            .sum()
-    }
-
     /// Reverse the order of ops in place (used to flip a left-extension script).
     pub fn reverse(&mut self) {
         self.ops.reverse();

@@ -3,7 +3,8 @@
 #
 # The Rust rmblastn binary reads the FASTA (or a UCSC 2bit) as its database,
 # not a BLAST database.  This wrapper:
-#   1. Converts the input FASTA to a .2bit file via faToTwoBit.
+#   1. Converts the input FASTA to a .2bit file via faToTwoBit, if it can be
+#      found (optional: searches read the FASTA).
 #   2. Places the source FASTA at the database base path when '-out' names
 #      something other than '-in' -- ../wrappers/rmblastn hands the Rust
 #      engine '-db <base>' and reads that FASTA directly, because 2bit
@@ -27,7 +28,18 @@
 # rounds, and the database must stay paired with the sequences it was built
 # from.
 
-FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
+# faToTwoBit: $UCSCTOOLS_DIR (as blastdbcmd uses), then PATH, then the old
+# default.  The .2bit is optional -- the rmblastn wrapper searches the FASTA,
+# and blastdbcmd reads the FASTA when there is no .2bit -- so without
+# faToTwoBit the database is still built, with a warning.
+find_fatotwobit() {
+    local c
+    for c in "${UCSCTOOLS_DIR:+$UCSCTOOLS_DIR/faToTwoBit}" "$(command -v faToTwoBit 2>/dev/null)" \
+             /usr/local/ucscTools/faToTwoBit; do
+        [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
 
 # Nucleotide BLAST DB extensions created by the real makeblastdb.  '.njs' is
 # in the list because RepeatModeler's Refiner cleans up after itself with
@@ -35,61 +47,84 @@ FATOTWOBIT=/usr/local/ucscTools/faToTwoBit
 # and prints an error for every one of the four that is missing.
 NUCL_EXTENSIONS=(ndb nhr nin njs nog nos not nsq ntf nto)
 
+die() { echo "[makeblastdb] Error: $*" >&2; exit 1; }
+
 in_file=""
 out_name=""
 dbtype="nucl"
 
+# The options RepeatMasker and RepeatModeler pass.  -parse_seqids,
+# -blastdb_version and -title change nothing for the Rust engine, which uses
+# the FASTA ids as they are.  Anything else -- notably -mask_data, whose
+# masking the Rust engine would silently not apply -- is refused.
 args=("$@")
 i=0
 while [ $i -lt ${#args[@]} ]; do
-    case "${args[$i]}" in
+    a="${args[$i]}"
+    case "$a" in
         -in)      i=$((i+1)); in_file="${args[$i]}" ;;
-        -in=*)               in_file="${args[$i]#*=}" ;;
+        -in=*)               in_file="${a#*=}" ;;
         -out)     i=$((i+1)); out_name="${args[$i]}" ;;
-        -out=*)              out_name="${args[$i]#*=}" ;;
+        -out=*)              out_name="${a#*=}" ;;
         -dbtype)  i=$((i+1)); dbtype="${args[$i]}" ;;
-        -dbtype=*)           dbtype="${args[$i]#*=}" ;;
+        -dbtype=*)           dbtype="${a#*=}" ;;
+        -parse_seqids|-hash_index) ;;
+        -blastdb_version|-title|-max_file_sz) i=$((i+1)) ;;
+        -blastdb_version=*|-title=*|-max_file_sz=*) ;;
+        -version)
+            echo "makeblastdb: RMBlast Rust port wrapper (no BLAST index is built)"
+            echo " Package: rmblast, see rmblastn -version"
+            exit 0 ;;
+        -h|-help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)  die "option not supported by this wrapper: $a" ;;
     esac
     i=$((i+1))
 done
 
-if [ -z "$in_file" ]; then
-    echo "[makeblastdb] Error: -in <file> is required" >&2
-    exit 1
-fi
-
-if [ ! -f "$in_file" ]; then
-    echo "[makeblastdb] Error: input file not found: $in_file" >&2
-    exit 1
-fi
+[ -n "$in_file" ] || die "-in <file> is required"
+[ -f "$in_file" ] || die "input file not found: $in_file"
+case "$dbtype" in
+    nucl) ;;
+    prot) die "-dbtype prot is not supported: the RMBlast Rust port is nucleotide only (use NCBI makeblastdb for protein databases)" ;;
+    *)    die "unknown -dbtype '$dbtype' (supported: nucl)" ;;
+esac
 
 base="${out_name:-$in_file}"
+created=()
 
-# Step 1: build the 2bit file used by the Rust rmblastn binary.
-if [ "$dbtype" = "nucl" ]; then
-    echo "[makeblastdb] Creating ${base}.2bit" >&2
-    "$FATOTWOBIT" "$in_file" "${base}.2bit"
-    if [ $? -ne 0 ]; then
-        echo "[makeblastdb] Error: faToTwoBit failed" >&2
-        exit 1
-    fi
+# Each file is written under a temporary name in its final directory and
+# renamed into place, so a search running during a rebuild sees the old
+# database or the new one, never a half-written file.
+tmp_of() { printf '%s.tmp.%s' "$1" "$$"; }
+cleanup() { rm -f -- "$(tmp_of "$base")" "$(tmp_of "$base.2bit")"; }
+trap cleanup EXIT
+
+# Step 1: the 2bit file (optional; see find_fatotwobit).
+if fa2bit="$(find_fatotwobit)"; then
+    "$fa2bit" "$in_file" "$(tmp_of "$base.2bit")" || die "faToTwoBit failed on $in_file"
+    mv -f -- "$(tmp_of "$base.2bit")" "$base.2bit" || die "cannot write $base.2bit"
+    created+=("$base.2bit")
+else
+    echo "[makeblastdb] Warning: faToTwoBit not found (set UCSCTOOLS_DIR or put it on PATH);" \
+         "no $base.2bit written.  Searches read the FASTA and do not need it." >&2
 fi
 
 # Step 2: put the source FASTA at the database base path when it is not
 # already there.  '-ef' compares device+inode, so './x.fa' vs 'x.fa' (and
 # symlinks to the same file) count as identical and are left alone.
 if [ ! "$in_file" -ef "$base" ]; then
-    if cp -f -- "$in_file" "$base"; then
-        echo "[makeblastdb] Copied $in_file -> $base (FASTA for the Rust engine)" >&2
-    else
-        echo "[makeblastdb] Error: failed to copy $in_file -> $base" >&2
-        exit 1
-    fi
+    cp -f -- "$in_file" "$(tmp_of "$base")" && mv -f -- "$(tmp_of "$base")" "$base" \
+        || die "failed to copy $in_file -> $base"
+    created+=("$base (copy of $in_file, the FASTA the Rust engine searches)")
 fi
 
-# Step 3: create dummy BLAST index files so callers see a complete-looking database.
+# Step 3: dummy BLAST index files so callers see a complete-looking database.
 for ext in "${NUCL_EXTENSIONS[@]}"; do
-    echo "dummy" > "${base}.${ext}"
+    echo "dummy" > "$(tmp_of "$base.$ext")" && mv -f -- "$(tmp_of "$base.$ext")" "$base.$ext" \
+        || die "cannot write $base.$ext"
 done
+created+=("dummy index files $base.{${NUCL_EXTENSIONS[*]}}")
 
-echo "[makeblastdb] Done: ${base}.2bit and dummy index files created" >&2
+printf '[makeblastdb] Done: %s\n' "${created[0]}" >&2
+for c in "${created[@]:1}"; do printf '[makeblastdb]       %s\n' "$c" >&2; done

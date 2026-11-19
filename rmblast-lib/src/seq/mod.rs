@@ -4,7 +4,7 @@ pub mod twobit;
 
 pub use fasta::{FastaRecord, FastaReader};
 pub use fasta_db::FastaDb;
-pub use twobit::{SeqInfo, TwoBitFile, TwoBitSeqIter};
+pub use twobit::{SeqInfo, TwoBitFile};
 
 use std::io::Read;
 use std::collections::HashMap;
@@ -13,6 +13,20 @@ use anyhow::Result;
 
 use crate::blast::util::{blast_compress_blastna_sequence, seqblk_from_blastna};
 use crate::encoding::{revcomp_blastna, BLASTNA_COMPLEMENT};
+
+/// The longest query or subject the engine accepts: its coordinates are i32,
+/// as NCBI's are Int4.  Longer sequences used to wrap and silently give no
+/// hits, so they are refused instead.
+pub const MAX_SEQ_LEN: usize = i32::MAX as usize;
+
+/// Err(message) if a sequence of `len` bases is longer than [`MAX_SEQ_LEN`].
+pub fn check_seq_len(id: &str, len: usize) -> std::result::Result<(), String> {
+    if len > MAX_SEQ_LEN {
+        return Err(format!(
+            "sequence '{id}' has {len} bases; the longest supported is {MAX_SEQ_LEN} (2^31 - 1)"));
+    }
+    Ok(())
+}
 
 /// Per-subject derived strands, shared across searches.
 ///
@@ -26,8 +40,6 @@ pub struct PreparedSubject {
     pub rc: Arc<[u8]>,
     /// Plus strand packed to NCBI2NA (3 padding bytes + 4 bases/byte).
     pub packed_plus: Arc<[u8]>,
-    /// Minus strand packed to NCBI2NA (3 padding bytes + 4 bases/byte).
-    pub packed_minus: Arc<[u8]>,
     /// Subject with original ambiguity codes restored from n_mask (the
     /// Phase 2b alignment view).  Aliases the plus sequence when n_mask is
     /// empty.
@@ -59,11 +71,6 @@ fn prepare_subject_strands_shared(
         blast_compress_blastna_sequence(&mut blk);
         blk.packed
     };
-    let packed_minus = {
-        let mut blk = seqblk_from_blastna(&rc[1..1 + n]);
-        blast_compress_blastna_sequence(&mut blk);
-        blk.packed
-    };
     let (align, align_rc, n_mask_rc) = if n_mask.is_empty() {
         let align = match plus_arc {
             Some(a) => a.clone(),
@@ -86,7 +93,6 @@ fn prepare_subject_strands_shared(
     PreparedSubject {
         rc,
         packed_plus: Arc::from(packed_plus),
-        packed_minus: Arc::from(packed_minus),
         align,
         align_rc,
         n_mask_rc,
@@ -201,7 +207,9 @@ impl SubjectDb {
         // across the decode calls.
         let names: Vec<String> = backend.sequences().iter().map(|s| s.name.clone()).collect();
         for (i, name) in names.iter().enumerate() {
-            name_to_index.insert(name.clone(), i);
+            // both backends reject duplicate names at load
+            let dup = name_to_index.insert(name.clone(), i);
+            debug_assert!(dup.is_none(), "duplicate subject name '{name}'");
             decoded.push(Arc::from(backend.decode(name)?));
             n_masks.push(Arc::from(backend.nmask(name)));
         }
@@ -236,6 +244,15 @@ impl SubjectDb {
     /// Metadata for all sequences in the database.
     pub fn sequences(&self) -> &[SeqInfo] {
         self.backend.sequences()
+    }
+
+    /// A subject's full defline (everything after '>'); None for a 2bit
+    /// database, which stores only names.
+    pub fn defline(&self, name: &str) -> Option<&str> {
+        match &self.backend {
+            SubjectBackend::Fasta(db) => db.defline(name),
+            SubjectBackend::TwoBit(_) => None,
+        }
     }
 
     /// Cheap `Arc` clone of the cached, already-decoded BLASTNA sequence

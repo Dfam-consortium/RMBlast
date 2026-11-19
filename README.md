@@ -41,7 +41,10 @@ quirk that changes results, the port reproduces it on purpose.
   from NCBI's hardcoded table. Build `rmblast-lib` with `--no-default-features`
   to skip it; E-value statistics then fall back to the sentinel.
 - For the wrapper scripts only: UCSC's `faToTwoBit`, `twoBitInfo`, and
-  `twoBitToFa` on `PATH`.
+  `twoBitToFa`, found in `$UCSCTOOLS_DIR`, then on `PATH`, then in
+  `/usr/local/ucscTools`. `makeblastdb` builds a usable database without
+  `faToTwoBit` (searches read the FASTA); `blastdbcmd` needs the other two only
+  for a `.2bit` database.
 
 ## Build and install
 
@@ -72,7 +75,13 @@ rmblast-<version>/
 
 Both wrapper directories find the binaries relative to themselves, so nothing
 needs editing after unpacking. `make dist` packages that same tree as a
-versioned tarball, which is what the tagged GitHub Actions release publishes.
+versioned tarball, which is what the tagged GitHub Actions release publishes;
+it stages the install under `./stage` and never writes to `PREFIX`.
+
+`rmblastn --version` names the commit it was built from, for example
+`rmblastn 3.1.0 (01cc4cc)`, with `-dirty` added when the tree had uncommitted
+changes. The wrappers print NCBI's `rmblastn: 3.1.0+`, which is what
+RepeatMasker and RepeatModeler parse.
 
 To bundle scoring matrices alongside the binaries, point `MATRIX_SRC` at a
 directory of `*.matrix` files: `make install PREFIX=/opt MATRIX_SRC=../matrices`.
@@ -96,7 +105,7 @@ rmblastn --query genome.fa --db library.fa \
 | `--mask-level` | Defaults to `-1` (off), matching NCBI. RepeatMasker passes `80` explicitly; RepeatModeler does not pass it at all. |
 | `--min-raw-gapped-score` | A cutoff for the preliminary gapped stage, not a floor on the reported score. Traceback can score lower, and that lower score is what gets reported, as in NCBI. Post-filter if you need a hard floor. |
 | `--evalue` / `--ncbi-compat` | By default nothing is culled on E-value. NCBI 2.17.1 silently drops hits with E > 10 whenever the matrix is in its baked table, and `--ncbi-compat` reproduces that. Pass it for parity benchmarks. |
-| `--outfmt` | `0` for pairwise, or `6` followed by field names. |
+| `--outfmt` | `0` for pairwise, or `6` followed by field names. Other formats (`7`, `10`, ...), a bare `6` (NCBI's default 12 columns) and field names not listed below are refused. |
 | `--mt-mode` | Which axis `--num-threads` splits on. See below. |
 
 Tabular fields: `score`, `perc_sub`, `perc_query_gap`, `perc_db_gap`, `qseqid`,
@@ -130,8 +139,9 @@ usually takes care of itself.
 
 An absolute path also works, which stock `rmblastn` rejects. That is the one
 place the lookup diverges, and the port tries it last, after every directory
-NCBI would have searched, so it can never shadow one of them. `PORTING_NOTES.md`
-§15.1 has the full order and the NCBI quirks inside it.
+NCBI would have searched, so it can never shadow one of them.
+`find_matrix_path` in `rmblastn/src/main.rs` has the full order and the NCBI
+quirks inside it.
 
 ## Using it with RepeatMasker and RepeatModeler
 
@@ -149,7 +159,18 @@ export PATH=/opt/rmblast-<version>/wrappers:$PATH
 The `makeblastdb` here never calls NCBI's. It converts the FASTA to `.2bit`,
 leaves a FASTA at the database base path for the engine to read, and writes
 placeholder index files so that callers checking for a BLAST database are
-satisfied.
+satisfied. Every file is written under a temporary name and renamed into place,
+so a search during a rebuild never reads a half-written database. It accepts the
+options RepeatMasker and RepeatModeler pass (`-in`, `-out`, `-dbtype nucl`,
+`-parse_seqids`, `-blastdb_version`, `-title`). It refuses `-dbtype prot` (the
+port is nucleotide only), `-mask_data` (the engine would not apply the masks)
+and any other option.
+
+The `rmblastn` wrapper passes every argument through unchanged, values
+included, except that it drops `-num_alignments`, points `-db` at the FASTA,
+and prints `-version` in NCBI's `rmblastn: X.Y.Z+` shape, which RepeatMasker
+and RepeatModeler parse. `bash tests/wrappers.sh` tests all of the wrappers,
+and compares against NCBI where it is installed.
 
 ### verify_wrappers/
 
@@ -180,6 +201,41 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   with E > 10 whenever the matrix is in its baked table; the port keeps them
   unless you pass `--evalue` or `--ncbi-compat`. On a matrix absent from that
   table, such as `comparison.matrix`, both engines cull nothing.
+- Pairwise output (`-outfmt 0`) is NCBI's line for line, for a database built
+  with `-parse_seqids` (as RepeatMasker and RepeatModeler build theirs), with
+  two exceptions. The "Database:" title is the `-db` path given to rmblastn,
+  where NCBI prints the `-in` path given to makeblastdb. "Posted date" is the
+  database file's modification time in UTC, where NCBI prints the build time
+  in local time. Without `-parse_seqids`, NCBI wraps a long subject defline
+  slightly differently, and an id-only defline has no trailing space.
+- The bare binary rejects `-num_alignments`; `wrappers/rmblastn` drops it.
+- NCBI 2.17.1 rejects `-xdrop_ungap` ("Attempt to cast to a wrong (Integer)
+  type") unless `-min_raw_gapped_score` is also given; the port accepts it on
+  its own.
+- Three small fidelity gaps remain, all far from RepeatMasker's parameters
+  (which always set a minimum score of 200 or more):
+  - At `-mask_level 0`, which HSPs a touching neighbour masks can differ,
+    because NCBI's choice depends on its interval-tree layout.
+  - With `identity.matrix` and no `--min-raw-gapped-score`, the port keeps a
+    minus-strand seed that NCBI's exact extension drops, so a few hits end a
+    little differently.
+  - With no minimum score at all, both programs report single-base HSPs; at
+    `-word_size 4`, one of those can carry the other strand label (1 line in
+    about 679,000 on the test fixtures).
+- Not ported, with no known effect on results:
+  - NCBI's small lookup table (`eSmallNaLookupTable`) and its specialised
+    megablast scanners: the port uses the standard table and the general
+    scanner for every width. Results match on every comparison suite; the
+    `identity.matrix` seed difference above may come from here.
+  - `AdjustSubjectRange`, which narrows the subject range NCBI extends over.
+- Not supported: `-searchsp` (the effective search space is always computed),
+  gzip-compressed input, and these NCBI spellings, all refused with an error:
+  negative gap costs, `-mt_mode 2`, and `-dust 'level window linker'`.
+- The built-in Karlin-Altschul table is looked up by the matrix file's name
+  and gap costs, as NCBI does; the matrix contents are not checked against it.
+  The same matrix under another name falls back to a startup ALP fit, whose
+  lambda can differ by about 1%. When E-values or bit scores are computed,
+  stderr says which source was used.
 - The whole database stays resident. NCBI streams database volumes; the port
   loads and decodes all of it, and caches the reverse complement and packed
   strands of every subject it touches at about 1.5 times that subject's size.
@@ -191,13 +247,20 @@ exceptions, and the places where the tools around it stop short of NCBI's:
   `interval`/`fasta`/`acclist`, and `-hard_masking`. Everything else, including
   `-infmt blastdb`, the ASN.1 and XML `-outfmt` variants, and `-parse_seqids`,
   exits non-zero with a "not ported" message rather than emitting near-miss
-  output. Sequence identifiers are echoed from the input defline; NCBI's title
-  cleanup strips spaces just inside parentheses, which is the only output
-  difference we have found on any tested input. `run_dustmasker_compare.sh`
-  checks what is implemented byte for byte against NCBI dustmasker 2.17.0,
-  across all three output formats.
+  output. Deflines are printed as NCBI prints them, through a port of NCBI's
+  title cleanup: spaces collapsed, the line cut at a tab, trailing periods
+  stripped, HTML entities decoded. Like NCBI, a final non-ASCII character is cut
+  to its first byte. The output matched NCBI dustmasker 2.17.0 byte for byte
+  across all three output formats, on 13,000 random deflines and on the
+  repository's own tests (`dustmasker/tests/`).
+  Where NCBI is lenient, this port refuses: an empty record (NCBI also aborts),
+  any character that is not a nucleotide code (NCBI drops it), and a negative
+  `-window` or `-linker` (NCBI clamps them).
 - The `blastdbcmd` and `blastdb_aliastool` wrappers cover what RepeatMasker and
-  RepeatModeler call, not the full tools. Unsupported options exit non-zero.
+  RepeatModeler call, not the full tools. Unsupported options exit non-zero, as
+  do a missing `-entry` and a batch with entries skipped (as in NCBI). A batch
+  interval that starts past the end of its sequence is skipped with an error;
+  NCBI silently returns the whole sequence for it.
 - `blastdbcmd` reads the `.2bit` our `makeblastdb` writes or a FASTA beside the
   database, never an NCBI BLAST index. For a database BuildDatabase built with
   the real NCBI `makeblastdb`, it therefore falls back to BuildDatabase's input
@@ -214,6 +277,7 @@ exceptions, and the places where the tools around it stop short of NCBI's:
 | `rmblastn/` | The `rmblastn` command-line front end |
 | `dustmasker/` | The `dustmasker` command-line front end |
 | `rmblast-stats/` | E-value and bit-score statistics, the vendored ALP sources, and the fitting tools that generated the baked tables |
+| `build-support/` | Shared build-script code: puts the git commit in `--version` |
 | `wrappers/`, `verify_wrappers/` | Caller-facing shims described above |
 
 ## Credits

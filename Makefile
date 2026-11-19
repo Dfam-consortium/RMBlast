@@ -10,9 +10,9 @@
 #
 # Examples:
 #   make                          # build (release)
-#   make install PREFIX=/opt      # -> /opt/rmblast-0.1.0/...
+#   make install PREFIX=/opt      # -> /opt/rmblast-<version>/...
 #   make install PREFIX=/opt MATRIX_SRC=../   # also install ../*.matrix
-#   make dist PREFIX=/tmp/stage   # build a versioned tarball
+#   make dist                     # build a versioned tarball (staged under ./stage)
 #   make version                  # print the workspace version from Cargo.toml
 
 PREFIX     ?= /usr/local
@@ -25,6 +25,9 @@ BIN         = rmblastn
 # replacement for the NCBI application of the same name (FASTA in, text out);
 # installing it shadows NCBI's copy for anything that finds it on PATH first.
 EXTRA_BINS  = dustmasker
+# The wrapper scripts that ship, by name: a file dropped into wrappers/ or
+# verify_wrappers/ does not end up in a release by accident.
+WRAPPERS    = rmblastn makeblastdb blastdbcmd blastdb_aliastool dustmasker
 MANIFEST    = Cargo.toml
 # Documentation shipped in a binary release.  Listed by name rather than globbed
 # as *.md, so that a maintainer note dropped at the top level does not silently
@@ -43,7 +46,7 @@ $(if $(VERSION),,$(error could not read version from $(MANIFEST)))
 # Versioned package root (DESTDIR-aware for staged packaging).
 PKGDIR = $(DESTDIR)$(PREFIX)/$(NAME)-$(VERSION)
 
-.PHONY: all build test version install uninstall dist clean
+.PHONY: all build test test-full version check-release install uninstall dist clean
 
 all: build
 
@@ -53,8 +56,23 @@ version:
 build:
 	$(CARGO) build --release
 
+# Before tagging a release (see the script for what it checks):
+#   make check-release TAG=X.Y.Z
+check-release: build
+	bash .github/scripts/check_release.sh $(VERSION) "$(TAG)" $(BIN) $(EXTRA_BINS)
+
 test:
 	$(CARGO) test --release
+
+# Also runs the #[ignore]d chr22 seed and ungapped-hit regression tests
+# (rmblast-lib/tests/), which compare against NCBI-derived references and add
+# about 40 s, the CLI tests that need the `diagnostics` test hooks (built in
+# their own target dir so target/release keeps the normal binary), and the
+# wrapper tests, which use target/release.
+test-full:
+	$(CARGO) test --release -- --include-ignored
+	CARGO_TARGET_DIR=target/diagnostics $(CARGO) test --release -p rmblastn --features diagnostics --test cli
+	bash tests/wrappers.sh
 
 # Install into a top-level <prefix>/<name>-<version>/ hierarchy.
 #
@@ -70,9 +88,9 @@ install: build
 	  $(INSTALL) -m 0755 target/release/$$b $(PKGDIR)/bin/$$b && echo "  bin       <- $$b"; \
 	done
 	$(INSTALL) -d $(PKGDIR)/wrappers
-	$(INSTALL) -m 0755 wrappers/* $(PKGDIR)/wrappers/
+	$(INSTALL) -m 0755 $(addprefix wrappers/,$(WRAPPERS)) $(PKGDIR)/wrappers/
 	$(INSTALL) -d $(PKGDIR)/verify_wrappers
-	$(INSTALL) -m 0755 $(filter-out %.md,$(wildcard verify_wrappers/*)) $(PKGDIR)/verify_wrappers/
+	$(INSTALL) -m 0755 $(addprefix verify_wrappers/,$(WRAPPERS)) $(PKGDIR)/verify_wrappers/
 	$(INSTALL) -m 0644 verify_wrappers/README.md $(PKGDIR)/verify_wrappers/
 	@for d in $(DOCS); do \
 	  $(INSTALL) -m 0644 $$d $(PKGDIR)/ && echo "  doc       <- $$d"; \
@@ -85,14 +103,20 @@ install: build
 	  echo "  matrices  (skipped: set MATRIX_SRC=<dir> to bundle *.matrix files)"; \
 	fi
 	@echo "Installed $(NAME) $(VERSION) -> $(PKGDIR)"
+	@for b in $(BIN) $(EXTRA_BINS); do echo "  $$($(PKGDIR)/bin/$$b --version)"; done
 
 uninstall:
 	rm -rf $(PKGDIR)
 
-# Versioned tarball of the installed hierarchy: <name>-<version>.tar.gz
-dist: install
-	tar -C $(DESTDIR)$(PREFIX) -czf $(NAME)-$(VERSION).tar.gz $(NAME)-$(VERSION)
-	@echo "Wrote $(NAME)-$(VERSION).tar.gz"
+# Versioned tarball <name>-<version>.tar.gz of the installed hierarchy, built
+# from a staging install: under DESTDIR if given (the release workflow passes
+# one), else ./stage.  It never installs into PREFIX itself, which defaults
+# to /usr/local.
+DIST_DESTDIR = $(if $(DESTDIR),$(DESTDIR),$(CURDIR)/stage)
+dist: build
+	$(MAKE) install DESTDIR=$(DIST_DESTDIR)
+	tar -C $(DIST_DESTDIR)$(PREFIX) -czf $(NAME)-$(VERSION).tar.gz $(NAME)-$(VERSION)
+	@echo "Wrote $(NAME)-$(VERSION).tar.gz (staged in $(DIST_DESTDIR)$(PREFIX))"
 
 clean:
 	$(CARGO) clean

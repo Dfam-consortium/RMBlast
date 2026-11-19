@@ -52,6 +52,10 @@
 # THIS IS A COMPATIBILITY HACK.  It reproduces what the callers parse, not the
 # whole of blastdbcmd.
 
+# A failed twoBitToFa must fail the command, not vanish into the pipe to
+# db_fasta (3.0.12 exited 0 with empty output).
+set -o pipefail
+
 UCSCTOOLS_DIR="${UCSCTOOLS_DIR:-/usr/local/ucscTools}"
 TWOBITINFO="$UCSCTOOLS_DIR/twoBitInfo"
 TWOBITTOFA="$UCSCTOOLS_DIR/twoBitToFa"
@@ -76,7 +80,9 @@ while [ $i -lt ${#args[@]} ]; do
         -out)         i=$((i+1)); out="${args[$i]}" ;;
         -info)        info=1 ;;
         # Accepted and ignored: irrelevant to a 2bit/FASTA "database".
-        -dbtype|-line_length|-ctrl_a|-target_only|-long_seqids) i=$((i+1)) ;;
+        -dbtype|-line_length)                 i=$((i+1)) ;;  # these take a value
+        -ctrl_a|-target_only|-long_seqids)    ;;             # these are flags
+        -dbtype=*|-line_length=*)             ;;
         -help|-h)     sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *)            die "option not supported by this wrapper: ${args[$i]}" ;;
     esac
@@ -84,6 +90,18 @@ while [ $i -lt ${#args[@]} ]; do
 done
 
 [ -n "$db" ] || die "-db <name> is required"
+# Check the request before -out truncates anything.
+if [ "$info" -eq 0 ]; then
+    if [ -n "$entry_batch" ]; then
+        [ -f "$entry_batch" ] || die "entry batch file not found: $entry_batch"
+    else
+        [ -n "$entry" ] || die "one of -info, -entry or -entry_batch is required"
+        case "$outfmt" in
+            ""|"%f"|*%l*) ;;
+            *) die "-outfmt '$outfmt' is not supported by this wrapper (supported: %f, and any format containing %l)" ;;
+        esac
+    fi
+fi
 
 # ── Resolve <name> to a real file ────────────────────────────────────────────
 # RepeatModeler hands us a BLAST-database *prefix* (it strips .nsq/.nin/...),
@@ -95,7 +113,9 @@ for cand in "$db" "$db.2bit" "$db.fa" "$db.fasta" "$db.fna"; do
 done
 [ -n "$dbfile" ] || die "database not found: $db (tried $db, $db.2bit, $db.fa, $db.fasta, $db.fna)"
 
-if [ "$(head -c 1 "$dbfile")" = ">" ]; then
+# FASTA if the first non-blank character is '>'; anything else is taken for
+# 2bit (a 2bit file starts with its binary signature).
+if [ "$(LC_ALL=C awk 'NF { print substr($1, 1, 1); exit }' "$dbfile" 2>/dev/null)" = ">" ]; then
     dbtype_detected="fasta"
 else
     dbtype_detected="2bit"
@@ -111,9 +131,11 @@ list_ids_lengths_raw() {
     if [ "$dbtype_detected" = "2bit" ]; then
         "$TWOBITINFO" "$dbfile" stdout
     else
-        awk '/^>/ { if (n != "") print n "\t" len; n = substr($1,2); len = 0; next }
-                  { gsub(/[ \t\r]/, ""); len += length($0) }
-             END  { if (n != "") print n "\t" len }' "$dbfile"
+        # (XLATE_AWK is defined below; only its defname() is used here)
+        awk "$XLATE_AWK"'
+            /^>/ { if (n != "") print n "\t" len; n = defname(); len = 0; next }
+                 { gsub(/[ \t\r]/, ""); len += length($0) }
+            END  { if (n != "") print n "\t" len }' "$dbfile"
     fi
 }
 
@@ -158,6 +180,8 @@ if [ -z "$xlate" ] && [ "$dbfile" != "$db" ] && [ "$dbfile" != "$db.2bit" ] &&
 fi
 
 # awk prologue: fwd[stored name] -> "gi|<N>", rev["gi|<N>"] -> stored name.
+# defname() is the sequence name on a '>' line: its first word, so "> name"
+# (space after the '>') names "name" as in rmblastn (3.0.12 dropped it).
 XLATE_AWK='
 function load_xlate(   line, t) {
     if (xlate == "") return
@@ -171,6 +195,7 @@ function load_xlate(   line, t) {
     close(xlate)
 }
 function xname(n) { return (n in fwd) ? fwd[n] : n }
+function defname(   h) { h = substr($0, 2); sub(/^[ \t]+/, "", h); sub(/[ \t\r].*$/, "", h); return h }
 function rname(n) { return (n in rev) ? rev[n] : n }
 '
 
@@ -195,7 +220,7 @@ raw_name() {
 db_fasta() {
     awk -v xlate="$xlate" "$XLATE_AWK"'
         BEGIN { load_xlate() }
-        /^>/  { n = substr($1, 2)
+        /^>/  { n = defname()
                 if (n in fwd) print ">" fwd[n] " "; else print
                 next }
               { print toupper($0) }'
@@ -231,6 +256,7 @@ if [ "$info" -eq 1 ]; then
         }
         { seqs++; bases += $2; if ($2 > longest) longest = $2 }
         END {
+            seqs += 0; bases += 0; longest += 0     # an empty database prints 0s
             printf "Database: %s\n", db
             printf "\t%s sequences; %s total bases\n\n", commify(seqs), commify(bases)
             printf "Date: %s (SYNTHETIC: %s file mtime, not a BLASTDB creation date)", filedate, kind
@@ -251,32 +277,46 @@ if [ -n "$entry_batch" ]; then
     # the records by position and ignores our deflines.
     #
     # Emitted as twoBitToFa's -seqList spec: name[:zeroBasedStart-end].
-    # Unknown names are dropped with a warning, the way real blastdbcmd skips
-    # them.  Without this twoBitToFa aborts the whole batch on the first miss,
-    # silently truncating the sample.
+    # Unknown names are skipped with a message, and the command then exits 1
+    # after writing the rest, as real blastdbcmd does.  (Without the skip
+    # twoBitToFa aborts the whole batch on the first miss.)  An end past the
+    # sequence is clamped, as NCBI clamps it.  A start past the end, or an
+    # interval that runs backwards, is skipped the same way: NCBI silently
+    # returns the whole sequence for a start past the end.
     speclist=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_seqlist_XXXXXX")
     names=$(mktemp "${TMPDIR:-/tmp}/blastdbcmd_names_XXXXXX")
     trap 'rm -f "$speclist" "$names"' EXIT
-    list_ids_lengths | cut -f1 > "$names"
+    list_ids_lengths > "$names"
     awk -v namesfile="$names" -v xlate="$xlate" "$XLATE_AWK"'
-         BEGIN { load_xlate(); while ((getline nm < namesfile) > 0) have[nm] = 1 }
+         BEGIN { load_xlate()
+                 while ((getline ln < namesfile) > 0) { split(ln, f, "\t"); have[f[1]] = f[2] + 0 } }
          {
             if (NF == 0) next
             id = $1
             if (!(id in have) && !(id in fwd)) {
-                print "[blastdbcmd] Skipped " id > "/dev/stderr"; next
+                print "Error: [blastdbcmd] Skipped " id > "/dev/stderr"; bad = 1; next
             }
+            len = (id in have) ? have[id] : have[xname(id)]
             # The extraction below scans the file, so it needs the stored name.
             name = rname(id)
             rest = $2
             if (NF >= 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) rest = $2 "-" $3
             if (rest ~ /^[0-9]+-[0-9]+$/) {
                 split(rest, r, "-")
-                printf "%s:%d-%d\n", name, r[1] - 1, r[2]
+                st = r[1] + 0; en = r[2] + 0
+                if (st < 1 || en < st || st > len) {
+                    printf "Error: [blastdbcmd] Skipped %s: interval %s is outside the sequence (length %d)\n", \
+                           id, rest, len > "/dev/stderr"
+                    bad = 1; next
+                }
+                if (en > len) en = len
+                printf "%s:%d-%d\n", name, st - 1, en
             } else {
                 print name
             }
-         }' "$entry_batch" > "$speclist"
+         }
+         END { exit bad }' "$entry_batch" > "$speclist"
+    skipped_rc=$?
 
     if [ "$dbtype_detected" = "2bit" ]; then
         "$TWOBITTOFA" -seqList="$speclist" "$dbfile" stdout | db_fasta
@@ -317,7 +357,7 @@ if [ -n "$entry_batch" ]; then
             my ($cur, $pos, $ni, @active, %seen) = ("", 0, 0);
             while (my $line = <$fh>) {
                 if (substr($line, 0, 1) eq ">") {
-                    my ($id) = $line =~ /^>(\S*)/;
+                    my ($id) = $line =~ /^>\s*(\S*)/;
                     if (exists $by_id{$id}) { ($cur, $pos, $ni, @active) = ($id, 0, 0, ()) }
                     else                    { $cur = "" }
                     next;
@@ -360,10 +400,22 @@ if [ -n "$entry_batch" ]; then
             }
         ' "$speclist" "$dbfile"
     fi
-    exit $?     # propagate a real extraction failure instead of masking it
+    rc=$?
+    # an extraction failure wins; otherwise 1 if anything was skipped
+    [ $rc -ne 0 ] && exit $rc
+    exit $skipped_rc
 fi
 
-[ -n "$entry" ] || die "one of -info, -entry or -entry_batch is required"
+# A single entry that is not there is an error, as in NCBI (3.0.12 printed
+# nothing and exited 0).
+if [ "$entry" != "all" ] &&
+   ! list_ids_lengths | awk -F'\t' -v want="$entry" '$1 == want { hit = 1 } END { exit !hit }'; then
+    # (no early exit in that awk: under pipefail the writer's SIGPIPE would
+    # turn a hit into "not found")
+    echo "Error: [blastdbcmd] Entry not found: $entry" >&2
+    echo "Error: [blastdbcmd] Entry or entries not found in BLAST database" >&2
+    exit 1
+fi
 
 case "$outfmt" in
     ""|"%f")
@@ -386,7 +438,7 @@ case "$outfmt" in
             else
                 awk -v want="$entry" -v xlate="$xlate" "$XLATE_AWK"'
                     BEGIN { load_xlate() }
-                    /^>/  { p = (xname(substr($1, 2)) == want) }
+                    /^>/  { p = (xname(defname()) == want) }
                     p' "$dbfile" | db_fasta
             fi
         fi

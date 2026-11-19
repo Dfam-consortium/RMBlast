@@ -1,18 +1,31 @@
 //! Nucleotide substitution matrix in BLASTNA encoding.
 //!
-//! Reads RMBlast-format custom nucleotide matrices:
-//!   - Optional FREQS line: "# FREQS A 0.255 C 0.245 G 0.245 T 0.255"
-//!   - Header row of column symbols (IUPAC)
-//!   - Rows: row-symbol followed by integer scores
+//! Reads RMBlast-format custom nucleotide matrices, as NCBI's
+//! `BlastScoreBlkNucleotideMatrixRead` (blast_stat.c) does:
+//!   - A FREQS line (required, as in NCBI): a `#` comment containing
+//!     "FREQS" followed by A, C, G and T frequencies, e.g.
+//!     "# FREQS A 0.255 C 0.245 G 0.245 T 0.255"
+//!   - A header row of column symbols
+//!   - One row per column, in header order: an optional row label, then one
+//!     integer score per column
 //!
-//! After loading, the 16×16 BLASTNA matrix is filled by remapping each IUPAC
-//! symbol to its BLASTNA index.  Lambda is computed (or read from file) for
-//! use by the complexity adjustment algorithm.
+//! Rows are assigned by position, as in NCBI.  Header symbols map through
+//! NCBI's `IUPACNA_TO_BLASTNA`: symbols outside the IUPAC codes (X, Z, U, -)
+//! land in the gap slot, which is then overwritten, so their scores are
+//! discarded exactly as NCBI discards them.
+//!
+//! Where NCBI accepts a malformed file, this parser refuses it with the line
+//! number: a value that is not an integer (NCBI's sscanf reads `9.5` as 9), a
+//! row label that is not the header symbol for that row (NCBI ignores labels),
+//! a repeated header symbol, FREQS for anything but exactly A, C, G and T
+//! once each, or frequencies that do not sum to 1 (NCBI only asserts that in
+//! debug builds).  Like NCBI it refuses a missing FREQS line, short or long
+//! rows and a non-square matrix.
 
 use std::io::{self, BufRead};
 use thiserror::Error;
 
-use crate::encoding::{BLASTNA_SIZE, IUPAC_TO_BLASTNA};
+use crate::encoding::BLASTNA_SIZE;
 
 #[derive(Debug, Error)]
 pub enum MatrixError {
@@ -20,8 +33,6 @@ pub enum MatrixError {
     Io(#[from] io::Error),
     #[error("matrix parse error: {0}")]
     Parse(String),
-    #[error("missing required matrix symbol '{0}'")]
-    MissingSymbol(char),
 }
 
 /// Gapped Karlin-Altschul parameters declared in a `# KARLIN` comment line of
@@ -63,83 +74,97 @@ pub struct ScoreMatrix {
 impl ScoreMatrix {
     /// Parse a matrix from any `BufRead` source.
     pub fn from_reader<R: BufRead>(name: &str, reader: R) -> Result<Self, MatrixError> {
+        let err = |line: usize, msg: String| MatrixError::Parse(format!("line {line}: {msg}"));
         let mut freqs = [0f64; BLASTNA_SIZE];
+        let mut freqs_line: Option<usize> = None;
         let mut karlin: Option<KarlinComment> = None;
-        let mut col_order: Vec<u8> = Vec::new(); // BLASTNA indices of columns
-        let mut raw_rows: Vec<(u8, Vec<i32>)> = Vec::new(); // (blastna_row, scores)
+        let mut header: Option<Vec<u8>> = None; // column symbols, upper-cased
+        let mut rows: Vec<Vec<i32>> = Vec::new();
 
-        for line in reader.lines() {
+        for (i, line) in reader.lines().enumerate() {
+            let lineno = i + 1;
             let line = line?;
             let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
 
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                // Look for FREQS / KARLIN annotations
-                if let Some(rest) = trimmed.strip_prefix("# FREQS") {
-                    parse_freqs(rest, &mut freqs)?;
-                } else if let Some(rest) = trimmed.strip_prefix("#FREQS") {
-                    parse_freqs(rest, &mut freqs)?;
-                } else if let Some(rest) = trimmed.strip_prefix("# KARLIN") {
-                    karlin = Some(parse_karlin(rest)?);
-                } else if let Some(rest) = trimmed.strip_prefix("#KARLIN") {
+            if trimmed.starts_with('#') {
+                // NCBI: strstr(line, "FREQS") on any comment line
+                if let Some(at) = trimmed.find("FREQS") {
+                    if let Some(first) = freqs_line {
+                        return Err(err(lineno, format!("a second FREQS line (the first is line {first})")));
+                    }
+                    parse_freqs(&trimmed[at + 5..], &mut freqs).map_err(|m| err(lineno, m))?;
+                    freqs_line = Some(lineno);
+                } else if let Some(rest) = trimmed.strip_prefix("# KARLIN")
+                    .or_else(|| trimmed.strip_prefix("#KARLIN"))
+                {
                     karlin = Some(parse_karlin(rest)?);
                 }
                 continue;
             }
 
             let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-            if tokens.is_empty() {
-                continue;
-            }
-
-            // First non-comment non-empty line without a leading symbol that
-            // parses as integer is the column header.
-            if col_order.is_empty() && tokens[0].len() == 1 {
-                // Heuristic: if the first token is a single letter and the
-                // second token is also a single letter (or the line has many
-                // single letters), it's the header row.
-                let all_letters = tokens.iter().all(|t| t.len() == 1 && t.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || *t == "-"));
-                if all_letters {
-                    for tok in &tokens {
-                        let ch = tok.chars().next().unwrap() as u8;
-                        col_order.push(matrix_symbol_to_blastna(ch));
+            let Some(cols) = &header else {
+                // The first non-comment line is the column header.
+                let mut syms: Vec<u8> = Vec::with_capacity(tokens.len());
+                for tok in &tokens {
+                    let b = tok.as_bytes();
+                    if b.len() != 1 || !(b[0].is_ascii_alphabetic() || b[0] == b'-') {
+                        return Err(err(lineno, format!(
+                            "expected the column header (single-letter symbols), found '{tok}'")));
                     }
-                    continue;
+                    let sym = b[0].to_ascii_uppercase();
+                    if syms.contains(&sym) {
+                        return Err(err(lineno, format!("column symbol '{}' appears twice", sym as char)));
+                    }
+                    syms.push(sym);
                 }
-            }
+                header = Some(syms);
+                continue;
+            };
 
-            if !col_order.is_empty() {
-                // Two supported formats:
-                //   1. With row label:    "A  9  1 -6 ..."  — first token is an IUPAC letter
-                //   2. Without row label: "9  1 -6 ..."     — all tokens are integers, row
-                //                          position in the file determines the IUPAC symbol
-                //                          (same order as the column header).
-                //
-                // Format 2 is used by NCBI's FREQS matrices (comparison.matrix, 14p35g.matrix,
-                // etc.).  Detect by checking whether the first token parses as an integer.
-                let ch = tokens[0].chars().next().unwrap() as u8;
-                let has_label = (ch.is_ascii_alphabetic() || ch == b'-') && tokens[0].len() == 1;
-                let (row_idx, score_tokens): (u8, &[&str]) = if has_label {
-                    let idx = matrix_symbol_to_blastna(ch);
-                    (idx, &tokens[1..])
-                } else if raw_rows.len() < col_order.len() {
-                    // No row label: assign row in col_order sequence order.
-                    (col_order[raw_rows.len()], &tokens[..])
-                } else {
-                    continue; // more rows than columns — ignore trailing garbage
-                };
-                let scores: Result<Vec<i32>, _> = score_tokens.iter().map(|t| t.parse::<i32>()).collect();
-                match scores {
-                    Ok(s) => raw_rows.push((row_idx, s)),
-                    Err(_) => continue, // skip unparsable rows (e.g. trailing whitespace lines)
-                }
+            let row = rows.len();
+            if row == cols.len() {
+                return Err(err(lineno, format!(
+                    "more rows than the {} columns in the header", cols.len())));
             }
+            // An optional row label, which must be the header symbol for this row.
+            let values = match tokens[0].parse::<i32>() {
+                Ok(_) => &tokens[..],
+                Err(_) => {
+                    let want = cols[row] as char;
+                    if !tokens[0].eq_ignore_ascii_case(&want.to_string()) {
+                        return Err(err(lineno, format!(
+                            "row {} is labelled '{}', but column {} of the header is '{want}'",
+                            row + 1, tokens[0], row + 1)));
+                    }
+                    &tokens[1..]
+                }
+            };
+            let mut scores = Vec::with_capacity(values.len());
+            for tok in values {
+                scores.push(tok.parse::<i32>()
+                    .map_err(|_| err(lineno, format!("score '{tok}' is not an integer")))?);
+            }
+            if scores.len() != cols.len() {
+                return Err(err(lineno, format!(
+                    "{} scores for {} columns", scores.len(), cols.len())));
+            }
+            rows.push(scores);
         }
 
-        if col_order.is_empty() {
+        let Some(cols) = header else {
             return Err(MatrixError::Parse("no column header found".into()));
+        };
+        if rows.len() != cols.len() {
+            return Err(MatrixError::Parse(format!(
+                "{} rows for {} columns: the matrix must be square", rows.len(), cols.len())));
         }
-        if raw_rows.is_empty() {
-            return Err(MatrixError::Parse("no data rows found".into()));
+        if freqs_line.is_none() {
+            return Err(MatrixError::Parse(
+                "no FREQS line (\"# FREQS A <f> C <f> G <f> T <f>\"); NCBI requires one".into()));
         }
 
         // NCBI BlastScoreBlkNucleotideMatrixRead (blast_stat.c) initializes every
@@ -149,12 +174,11 @@ impl ScoreMatrix {
         // gapped-DP arithmetic at ambiguous positions and can diverge from NCBI.
         const BLAST_SCORE_MIN: i32 = -32768; // INT2_MIN
         let mut scores = [[BLAST_SCORE_MIN; BLASTNA_SIZE]; BLASTNA_SIZE];
-        // Fill in parsed values
-        for (row_idx, row_scores) in &raw_rows {
-            for (ci, &col_idx) in col_order.iter().enumerate() {
-                if ci < row_scores.len() {
-                    scores[*row_idx as usize][col_idx as usize] = row_scores[ci];
-                }
+        // Rows by position, in file order (a later write to a slot wins, as in NCBI)
+        for (ri, row_scores) in rows.iter().enumerate() {
+            let r = matrix_symbol_to_blastna(cols[ri]) as usize;
+            for (ci, &v) in row_scores.iter().enumerate() {
+                scores[r][matrix_symbol_to_blastna(cols[ci]) as usize] = v;
             }
         }
 
@@ -163,6 +187,18 @@ impl ScoreMatrix {
         for i in 0..BLASTNA_SIZE {
             scores[BLASTNA_SIZE - 1][i] = i32::MIN / 2;
             scores[i][BLASTNA_SIZE - 1] = i32::MIN / 2;
+        }
+
+        // Local alignment needs a negative expected score per aligned pair.
+        // With a non-negative one there is no Karlin-Altschul lambda, and NCBI
+        // 2.17.1 silently reports no hits (RepeatModeler's at.matrix.4.2).
+        let expected: f64 = (0..4).flat_map(|i| (0..4).map(move |j| (i, j)))
+            .map(|(i, j)| freqs[i] * freqs[j] * scores[i][j] as f64)
+            .sum();
+        if expected >= 0.0 {
+            return Err(MatrixError::Parse(format!(
+                "the expected score of an aligned pair is {expected:.3} (from the A/C/G/T scores \
+                 and FREQS); it must be negative for local alignment")));
         }
 
         let lambda = estimate_lambda(&scores, &freqs);
@@ -189,22 +225,23 @@ impl ScoreMatrix {
     }
 }
 
-/// Map a matrix column/row symbol to its BLASTNA index, matching NCBI's
-/// `IUPACNA_TO_BLASTNA` table (blast_encoding.c) as used by the custom matrix
-/// reader (`BlastScoreBlkNucleotideMatrixRead`).  This DIFFERS from sequence
-/// encoding for two symbols:
-///   - '-'  -> 15 (gap slot)
-///   - 'X'  -> 15 (gap slot)   [sequence encoding sends 'X' -> 14 (N)]
-/// Sending 'X' to 15 here is essential: matrices like 20p43g/18p43g carry BOTH
-/// an 'N' column (-1) and an 'X' column (-30).  If 'X' shared N's index 14 the
-/// X row/column would clobber N (bug #33).  At 15 the X entries land in the gap
-/// row/column, which `from_reader` overwrites with the sentinel -- discarded,
-/// exactly as NCBI does.
+/// Map a matrix header symbol (already upper-cased) to its BLASTNA index:
+/// NCBI's `IUPACNA_TO_BLASTNA` (blast_encoding.c), which the custom matrix
+/// reader uses.  The IUPAC codes get their own slots; every other symbol --
+/// X, Z, U, '-' -- goes to 15, the gap slot, which `from_reader` then
+/// overwrites with the sentinel, so its scores are discarded as in NCBI.
+///
+/// This differs from sequence encoding, where X is N.  Matrices like
+/// 20p43g/18p43g carry both an N column (-1) and an X column (-30), and
+/// ctools.matrix a Z column (+3): sharing N's slot would clobber N (bug #33,
+/// and for Z the same bug until 3.0.13).
 #[inline]
-fn matrix_symbol_to_blastna(ch: u8) -> u8 {
-    match ch {
-        b'-' | b'X' | b'x' => 15,
-        _ => IUPAC_TO_BLASTNA[ch as usize],
+fn matrix_symbol_to_blastna(sym: u8) -> u8 {
+    match sym {
+        b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3,
+        b'R' => 4, b'Y' => 5, b'M' => 6, b'K' => 7, b'W' => 8, b'S' => 9,
+        b'B' => 10, b'D' => 11, b'H' => 12, b'V' => 13, b'N' => 14,
+        _ => 15,
     }
 }
 
@@ -229,20 +266,32 @@ fn parse_karlin(rest: &str) -> Result<KarlinComment, MatrixError> {
     Ok(kc)
 }
 
-fn parse_freqs(rest: &str, freqs: &mut [f64; BLASTNA_SIZE]) -> Result<(), MatrixError> {
-    use crate::encoding::IUPAC_TO_BLASTNA;
+/// The FREQS pairs after the word "FREQS": exactly A, C, G and T, once each
+/// (any order, any case), with frequencies that sum to 1 within NCBI's
+/// debug-build tolerance (0.999..1.001).  NCBI requires 4 pairs.
+fn parse_freqs(rest: &str, freqs: &mut [f64; BLASTNA_SIZE]) -> Result<(), String> {
     let tokens: Vec<&str> = rest.split_whitespace().collect();
-    let mut i = 0;
-    while i + 1 < tokens.len() {
-        let sym_bytes = tokens[i].as_bytes();
-        if sym_bytes.len() == 1 {
-            let idx = IUPAC_TO_BLASTNA[sym_bytes[0] as usize] as usize;
-            let f: f64 = tokens[i + 1].parse().map_err(|_| {
-                MatrixError::Parse(format!("bad frequency value '{}'", tokens[i + 1]))
-            })?;
-            freqs[idx] = f;
+    if tokens.len() != 8 {
+        return Err(format!(
+            "FREQS needs 4 base/frequency pairs (A, C, G and T), found {} tokens", tokens.len()));
+    }
+    let mut seen = [false; 4];
+    for pair in tokens.chunks(2) {
+        let idx = match pair[0].to_ascii_uppercase().as_str() {
+            "A" => 0, "C" => 1, "G" => 2, "T" => 3,
+            other => return Err(format!("FREQS base '{other}' is not A, C, G or T")),
+        };
+        if seen[idx] {
+            return Err(format!("FREQS gives base '{}' twice", pair[0]));
         }
-        i += 2;
+        seen[idx] = true;
+        let f: f64 = pair[1].parse().ok().filter(|f: &f64| f.is_finite() && *f >= 0.0)
+            .ok_or_else(|| format!("FREQS value '{}' for {} is not a frequency", pair[1], pair[0]))?;
+        freqs[idx] = f;
+    }
+    let sum: f64 = freqs[..4].iter().sum();
+    if !(0.999..=1.001).contains(&sum) {
+        return Err(format!("FREQS frequencies sum to {sum}, not 1"));
     }
     Ok(())
 }
@@ -376,6 +425,90 @@ X -30 -30 -30 -30 -30 -30
         assert!(ScoreMatrix::from_reader("test", Cursor::new(SAMPLE_MATRIX)).unwrap().karlin.is_none());
         let bad = format!("# KARLIN lambdo 0.1\n{}", SAMPLE_MATRIX);
         assert!(ScoreMatrix::from_reader("test", Cursor::new(bad)).is_err());
+    }
+
+    fn parse(text: &str) -> Result<ScoreMatrix, MatrixError> {
+        ScoreMatrix::from_reader("test", Cursor::new(text))
+    }
+
+    /// `SAMPLE_MATRIX` with `from` replaced by `to` (once).
+    fn sample_with(from: &str, to: &str) -> String {
+        assert!(SAMPLE_MATRIX.contains(from), "{from:?}");
+        SAMPLE_MATRIX.replacen(from, to, 1)
+    }
+
+    /// Each malformed matrix is refused with a message naming the problem.
+    /// 3.0.12 accepted all but one of these and mis-scored silently.
+    #[test]
+    fn malformed_matrices_are_rejected() {
+        let cases: Vec<(&str, String, &str)> = vec![
+            // NCBI's sscanf reads 9.5 as 9; 3.0.12 dropped the whole row
+            ("non-integer score", sample_with("A  9  -6", "A  9.5  -6"), "line 4: score '9.5' is not an integer"),
+            ("short row", sample_with("C -6   9 -13  -5  -1", "C -6   9 -13  -5"), "line 5: 4 scores for 5 columns"),
+            ("long row", sample_with("C -6   9 -13  -5  -1", "C -6   9 -13  -5  -1 7"), "6 scores for 5 columns"),
+            ("missing row", sample_with("N -1  -1  -1  -1  -1\n", ""), "4 rows for 5 columns"),
+            ("extra row", format!("{SAMPLE_MATRIX}N -1 -1 -1 -1 -1\n"), "more rows than the 5 columns"),
+            // NCBI ignores labels and assigns rows by position
+            ("label out of order", sample_with("G -5", "T -5"), "row 3 is labelled 'T', but column 3 of the header is 'G'"),
+            ("repeated header symbol", sample_with("   A   C   G   T   N", "   A   C   G   T   A"), "'A' appears twice"),
+            ("no FREQS", sample_with("# FREQS A 0.255 C 0.245 G 0.245 T 0.255\n", ""), "no FREQS line"),
+            ("FREQS missing T", sample_with(" T 0.255", ""), "4 base/frequency pairs"),
+            ("FREQS base twice", sample_with("G 0.245", "A 0.245"), "base 'A' twice"),
+            ("FREQS not a number", sample_with("C 0.245", "C x"), "'x' for C is not a frequency"),
+            ("FREQS sum", sample_with("A 0.255", "A 0.355"), "sum to"),
+            ("two FREQS lines", format!("# FREQS A 0.25 C 0.25 G 0.25 T 0.25\n{SAMPLE_MATRIX}"), "a second FREQS line"),
+            ("data before header", "# FREQS A 0.25 C 0.25 G 0.25 T 0.25\n1 2 3\n".to_string(), "expected the column header"),
+            ("positive expected score", sample_with("A  9  -6  -5 -13", "A  9  60  50 -13"), "must be negative"),
+        ];
+        for (label, text, needle) in cases {
+            match parse(&text) {
+                Err(e) => assert!(e.to_string().contains(needle), "{label}: {e}"),
+                Ok(_) => panic!("{label}: accepted"),
+            }
+        }
+    }
+
+    /// NCBI finds FREQS with strstr on any comment line, so `#  FREQS ...`
+    /// counts (3.0.12 missed it, leaving lambda 0 and -complexity_adjust off).
+    #[test]
+    fn freqs_found_anywhere_on_a_comment_line() {
+        let m = parse(&sample_with("# FREQS", "#  my matrix FREQS")).unwrap();
+        assert!((m.freqs[0] - 0.255).abs() < 1e-12);
+        assert!(m.lambda > 0.0);
+        assert_eq!(m.lambda, parse(SAMPLE_MATRIX).unwrap().lambda);
+    }
+
+    /// Unlabelled rows (assigned by position) and lower-case symbols load the
+    /// same matrix as the labelled upper-case form.
+    #[test]
+    fn unlabelled_rows_and_lower_case_symbols() {
+        let unlabelled: String = SAMPLE_MATRIX.lines()
+            .map(|l| match l.chars().next() { Some('A'|'C'|'G'|'T'|'N') => &l[1..], _ => l })
+            .collect::<Vec<_>>().join("\n");
+        let lower = sample_with("   A   C   G   T   N", "   a   c   g   t   n").replacen("\nG -5", "\ng -5", 1);
+        let want = parse(SAMPLE_MATRIX).unwrap().scores;
+        assert_eq!(parse(&unlabelled).unwrap().scores, want);
+        assert_eq!(parse(&lower).unwrap().scores, want);
+    }
+
+    /// Non-IUPAC header symbols (Z here, as in ctools.matrix) go to the gap
+    /// slot and are discarded, as in NCBI; 3.0.12 mapped Z to N, so the Z
+    /// column's +3 replaced N's -1.
+    #[test]
+    fn z_column_does_not_clobber_n() {
+        let text = "# FREQS A 0.25 C 0.25 G 0.25 T 0.25
+   A   C   G   T   N   Z
+A  9  -6  -5 -13  -1   3
+C -6   9 -13  -5  -1   3
+G -5 -13   9  -6  -1   3
+T -13  -5  -6   9  -1   3
+N -1  -1  -1  -1  -1   3
+Z  3   3   3   3   3   3
+";
+        let m = parse(text).unwrap();
+        assert_eq!(m.score(0, 14), -1);
+        assert_eq!(m.score(14, 0), -1);
+        assert_eq!(m.score(14, 14), -1);
     }
 
     #[test]

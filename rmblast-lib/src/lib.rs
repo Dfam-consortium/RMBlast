@@ -5,7 +5,6 @@ pub mod matrix;
 pub mod options;
 pub mod seq;
 pub mod filter;
-pub mod lookup;
 pub mod search;
 pub mod hits;
 pub mod stats;

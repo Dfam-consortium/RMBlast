@@ -11,23 +11,17 @@
 
 /// BLASTNA alphabet size (including gap/N/ambiguous codes).
 pub const BLASTNA_SIZE: usize = 16;
-/// Unambiguous base count (A, C, G, T).
-pub const BLAST2NA_SIZE: usize = 4;
 /// Sentinel value for sequence ends (same as GAP in BLASTNA).
 pub const NUCL_SENTINEL: u8 = 15;
-
-/// BLASTNA indices for unambiguous bases.
-pub const BLASTNA_A: u8 = 0;
-pub const BLASTNA_C: u8 = 1;
-pub const BLASTNA_G: u8 = 2;
-pub const BLASTNA_T: u8 = 3;
 
 /// Convert IUPAC ASCII character to BLASTNA index.
 /// Unknown characters map to N (14).
 pub const IUPAC_TO_BLASTNA: [u8; 128] = {
     let mut t = [14u8; 128]; // default = N
-    // Gap
-    t[b'-' as usize] = 15;
+    // A '-' in a *sequence* is N, as in NCBI (it prints and scores as N).  It
+    // must not be 15, the sentinel/gap code: 3.0.12 printed `GGC--GGG` where
+    // NCBI prints `GGCNNGGG` and scored such alignments lower.  In a matrix
+    // header '-' is the gap slot; matrix.rs maps that itself.
     // Unambiguous
     t[b'A' as usize] = 0;  t[b'a' as usize] = 0;
     t[b'C' as usize] = 1;  t[b'c' as usize] = 1;
@@ -136,14 +130,6 @@ pub fn encode_iupac(seq: &[u8]) -> Vec<u8> {
     }
     out.push(NUCL_SENTINEL);
     out
-}
-
-/// Decode a BLASTNA slice back to IUPAC ASCII (no sentinels).
-pub fn decode_blastna(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .filter(|&&b| b != NUCL_SENTINEL)
-        .map(|&b| BLASTNA_TO_IUPAC[(b & 15) as usize])
-        .collect()
 }
 
 /// Reverse-complement a BLASTNA encoded sequence (excluding sentinels).

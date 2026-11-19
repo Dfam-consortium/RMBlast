@@ -4,22 +4,19 @@
 # Legacy callers invoke rmblastn with NCBI BLAST-style arguments:
 #   - single-dash flags  (-flag)
 #   - underscores in flag names  (-mask_level, -xdrop_ungap, ...)
-#   - -dust no  (boolean expressed as no/yes)
 #   - -num_alignments  (not implemented in the Rust port)
 #
-# This wrapper translates all of the above before exec-ing the real binary:
-#   1. Single-dash flags are promoted to double-dash  (-foo → --foo).
-#   2. Underscores in flag names are replaced with hyphens  (foo_bar → foo-bar).
-#   3. -dust no/yes is converted to --dust false/true.
-#   4. -num_alignments (and its value) is silently dropped.
-#
-# (1) and (2) are now also done by the binary itself, so they are belt-and-
-# braces; (3) and (4) and the -db handling below are still the wrapper's job.
-#   5. The -db value is passed as the FASTA path (any trailing ".2bit" is
+# The binary itself accepts NCBI's spellings (-flag, underscores) and -dust
+# yes/no.  This wrapper still:
+#   1. drops -num_alignments and its value (NCBI's report limit; the binary
+#      has no such option),
+#   2. passes the -db value as the FASTA path (any trailing ".2bit" is
 #      stripped).  The Rust binary reads FASTA directly; the 2bit format
 #      degrades IUB ambiguity codes to N, and all result-equivalence
 #      validation was performed against FASTA databases (matches the
-#      verify_wrappers behaviour).
+#      verify_wrappers behaviour),
+#   3. prints -version in NCBI's shape (see below).
+# Every other argument, values included, passes through unchanged.
 
 # ── Locate the Rust binaries relative to this wrapper ─────────────────────────
 # The same script has to work from two layouts:
@@ -69,7 +66,7 @@ rmblast_find_bin() {
 REAL_RMBLASTN="$(rmblast_find_bin rmblastn)" || exit 1
 
 # ── NCBI-shaped "-version" output ─────────────────────────────────────────────
-# The Rust binary prints clap's plain "rmblastn 3.0.3".  NCBI prints:
+# The Rust binary prints clap's plain "rmblastn <version>".  NCBI prints:
 #   rmblastn: 2.17.1+
 #    Package: blast 2.17.0, build Apr 28 2026 12:15:13
 # The colon and the trailing '+' are not decoration -- every RepeatMasker /
@@ -90,7 +87,7 @@ REAL_RMBLASTN="$(rmblast_find_bin rmblastn)" || exit 1
 # reporting its own honest "rmblastn <ver>".  The version number itself is
 # always taken from the binary -- it is never hardcoded in the wrapper.
 rmblast_print_version() {
-    local raw ver
+    local raw ver build
     raw="$("$REAL_RMBLASTN" --version 2>&1)"
     ver="$(printf '%s\n' "$raw" \
            | sed -n '1s/^[[:space:]]*rmblastn[: ][[:space:]]*\([0-9][^[:space:]]*\).*/\1/p')"
@@ -99,8 +96,10 @@ rmblast_print_version() {
         return
     fi
     ver="${ver%+}"               # never double up the '+'
+    # The binary's "(<commit>[-dirty])", if any, goes on the free-text line.
+    build="$(printf '%s\n' "$raw" | sed -n '1s/^[^(]*(\([^)]*\)).*/\1/p')"
     printf 'rmblastn: %s+\n' "$ver"
-    printf ' Package: rmblast %s, Rust port\n' "$ver"
+    printf ' Package: rmblast %s, Rust port%s\n' "$ver" "${build:+, build $build}"
 }
 
 # Informational invocations short-circuit before any argument translation.
@@ -118,54 +117,38 @@ args=("$@")
 new_args=()
 i=0
 
+# The binary's boolean flags.  Every other option takes exactly one value,
+# the next token, passed through verbatim even when it starts with '-': so
+# "-matrix_beta -4.9" and "-mask_level -1" reach the binary intact (3.0.12
+# turned "-4.9" into the option "--4.9").  Option names are normalised to
+# --name-with-hyphens, which the binary would also do; -dust yes/no needs no
+# translation, the binary takes it.  tests/wrappers.sh checks this list
+# against `rmblastn --help`.
+RMBLASTN_FLAGS=" complexity-adjust ncbi-compat "
+
 while [ $i -lt ${#args[@]} ]; do
     arg="${args[$i]}"
+    if [[ "$arg" =~ ^--?([A-Za-z][A-Za-z0-9_-]*)(=.*)?$ ]]; then
+        flag_name="${BASH_REMATCH[1]//_/-}"
+        inline_value="${BASH_REMATCH[2]}"   # "=value" for -flag=value, else empty
 
-    if [[ "$arg" =~ ^(-{1,2})([^=]+)(=.*)?$ ]]; then
-        flag_name="${BASH_REMATCH[2]}"
-        inline_value="${BASH_REMATCH[3]}"   # non-empty only for --flag=value style
-
-        # normalize underscores → hyphens
-        flag_name="${flag_name//_/-}"
-
-        # drop -num-alignments (and its value)
+        # -num_alignments is NCBI's report limit; the binary has no such
+        # option.  Drop it and its value.
         if [[ "$flag_name" == "num-alignments" ]]; then
-            if [[ -n "$inline_value" ]]; then
-                i=$((i+1))
-            else
-                next_i=$((i+1))
-                if [ $next_i -lt ${#args[@]} ] && [[ ! "${args[$next_i]}" =~ ^- ]]; then
-                    i=$((i+1))
-                fi
-                i=$((i+1))
-            fi
+            if [[ -n "$inline_value" ]]; then i=$((i+1)); else i=$((i+2)); fi
             continue
         fi
 
-        new_flag="--${flag_name}"
-
         if [[ -n "$inline_value" ]]; then
-            # --flag=value style: keep as-is (value already attached)
-            new_args+=("${new_flag}${inline_value}")
+            new_args+=("--${flag_name}${inline_value}")
+            i=$((i+1))
+        elif [[ "$RMBLASTN_FLAGS" == *" $flag_name "* ]]; then
+            new_args+=("--${flag_name}")
             i=$((i+1))
         else
-            # separate-value style: peek at next token
-            next_i=$((i+1))
-            if [ $next_i -lt ${#args[@]} ] && [[ ! "${args[$next_i]}" =~ ^- ]]; then
-                value="${args[$next_i]}"
-                # translate -dust no/yes to --dust false/true
-                if [[ "$flag_name" == "dust" ]]; then
-                    case "$value" in
-                        no|false|0)  value="false" ;;
-                        yes|true|1)  value="true"  ;;
-                    esac
-                fi
-                new_args+=("$new_flag" "$value")
-                i=$((i+2))
-            else
-                new_args+=("$new_flag")
-                i=$((i+1))
-            fi
+            new_args+=("--${flag_name}")
+            [ $((i+1)) -lt ${#args[@]} ] && new_args+=("${args[$((i+1))]}")
+            i=$((i+2))
         fi
     else
         new_args+=("$arg")

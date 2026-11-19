@@ -217,6 +217,7 @@ impl Triplets {
 
     /// Mirror of NCBI `find_perfect`.
     /// `perfect` is ordered with index-0 = largest `start`, last = smallest `start`.
+    #[allow(clippy::explicit_counter_loop)] // `count` mirrors symdust.cpp's counter
     pub fn find_perfect(&self, perfect: &mut Vec<Perfect>, thresholds: &[u32]) {
         let mut counts = [0u32; 64];
         counts.copy_from_slice(&self.c_v);
@@ -232,7 +233,7 @@ impl Triplets {
 
         // deque[stop-l .. list.len()-1] are the pre-suffix triplets (oldest = back)
         // deque[k] = absolute position (stop - k)
-        let start_idx = (self.stop - self.l) as usize; // = count as usize
+        let start_idx = self.stop - self.l; // = count as usize
 
         for idx in start_idx..self.list.len() {
             let ti = self.list[idx];
@@ -295,7 +296,7 @@ fn save_masked(
         let b0 = back_start;
         let b1 = back_stop;
 
-        let should_merge = res.last().map_or(false, |l| l.1 + linker >= b0);
+        let should_merge = res.last().is_some_and(|l| l.1 + linker >= b0);
         if should_merge {
             let last = res.last_mut().unwrap();
             if b1 > last.1 { last.1 = b1; }
@@ -397,8 +398,6 @@ pub fn dust_intervals(
         // `rng` advances on each N, so re-visited N's get fresh CRandom values exactly as NCBI.
         let mut conv_from = j_start;
 
-        let mut done = false;
-
         'inner: loop {
             if j >= j_end { break; }
 
@@ -422,7 +421,6 @@ pub fn dust_intervals(
                     while conv_from <= j + 2 { conv[conv_from] = cvt_base(bases[conv_from], rng); conv_from += 1; }
                     let t2 = (conv[j] << 4) | (conv[j + 1] << 2) | conv[j + 2];
                     if w.shift_window(t2, &mut perfect) {
-                        done = true;
                         // Do NOT advance j here (mirrors NCBI: no ++it when done=true).
                         break;
                     }
@@ -440,7 +438,6 @@ pub fn dust_intervals(
         }
 
         // Restart outer loop from the advanced window position (NCBI restart logic).
-        let _ = done; // used implicitly via w.start advancing
         if w.start > j_start {
             j_start = w.start;
         } else {
@@ -448,10 +445,10 @@ pub fn dust_intervals(
         }
     }
 
-    // Sort and merge (save_masked already merges incrementally, but res may be
-    // slightly out of order across outer-loop restarts).
-    res.sort_unstable();
-    merge_intervals(res, linker)
+    // save_masked merges as it goes and NCBI does no final pass; 3.0.12 sorted
+    // and merged again here, which changed nothing on chr20, chr22, human-1mb
+    // or the TE libraries.
+    res
 }
 
 /// Mask a BLASTNA-encoded sequence in place.
@@ -632,28 +629,21 @@ pub fn dust_mask_ncbi_compat(
     intervals
 }
 
-fn merge_intervals(mut ivs: Vec<(usize, usize)>, linker: usize) -> Vec<(usize, usize)> {
-    if ivs.is_empty() { return ivs; }
-    ivs.sort_unstable();
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    let mut cur = ivs[0];
-    for (s, e) in ivs.into_iter().skip(1) {
-        if s <= cur.1 + linker {
-            cur.1 = cur.1.max(e);
-        } else {
-            merged.push(cur);
-            cur = (s, e);
-        }
-    }
-    merged.push(cur);
-    merged
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `tests/data/chr22.fa` at the workspace root (tracked in git).
+    fn repo_chr22() -> String {
+        format!("{}/../tests/data/chr22.fa", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// A fixture file under `rmblast-lib/tests/data/`.
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/data/{}", env!("CARGO_MANIFEST_DIR"), name)
+    }
 
     fn encode_fasta_region(fa_path: &str, start: usize, end: usize) -> Vec<u8> {
         use std::io::BufRead;
@@ -683,8 +673,7 @@ mod tests {
     /// NCBI dustmasker output (0-based, inclusive): 10510356-10510364, 10510518-10510527
     #[test]
     fn test_chr22_dust_region_10510228() {
-        let chr22 = "/home/rhubley/projects/Claude/rmblast-port/attic/rmblast-rs/chr22.fa";
-        if !std::path::Path::new(chr22).exists() { return; }
+        let chr22 = &repo_chr22();
         let region_start = 10510100usize;
         let region_end = 10510600usize;
         let mut seq = encode_fasta_region(chr22, region_start, region_end);
@@ -709,14 +698,13 @@ mod tests {
     /// are the same as when computed on a smaller window.
     #[test]
     fn test_chr22_dust_full_prefix_10510228() {
-        let chr22 = "/home/rhubley/projects/Claude/rmblast-port/attic/rmblast-rs/chr22.fa";
-        if !std::path::Path::new(chr22).exists() { return; }
+        let chr22 = &repo_chr22();
         let region_end = 10511000usize;
         let mut seq = encode_fasta_region(chr22, 0, region_end);
         let masked = dust_mask(&mut seq, DUST_WINDOW, DUST_LEVEL, DUST_LINKER, 14);
         println!("Masked intervals in chr22:10510300-10510540 (full prefix test):");
         for &(s, e) in &masked {
-            if s >= 10510300 && s <= 10510540 {
+            if (10510300..=10510540).contains(&s) {
                 println!("  chr22:{}-{}", s, e);
             }
         }
@@ -725,7 +713,7 @@ mod tests {
             let found = masked.iter().any(|&(s, e)| s == exp_s && e == exp_e);
             assert!(found, "Expected masked chr22:{}-{} not found. Near-region intervals: {:?}",
                 exp_s, exp_e,
-                masked.iter().filter(|&&(s, _)| s >= 10510300 && s <= 10510540)
+                masked.iter().filter(|&&(s, _)| (10510300..=10510540).contains(&s))
                     .collect::<Vec<_>>());
         }
     }
@@ -772,11 +760,11 @@ mod tests {
     ///   region2 (chr22:40060802-40061701): [580,592], [800,891]
     #[test]
     fn test_chr22_dust_vs_ncbi() {
-        // Read the two region files extracted from chr22.
-        let r1_seq = std::fs::read_to_string("/tmp/region1_dust.fa")
-            .expect("region1 file missing — run samtools faidx chr22_full.fa chr22:39030802-39031701");
-        let r2_seq = std::fs::read_to_string("/tmp/region2_dust.fa")
-            .expect("region2 file missing — run samtools faidx chr22_full.fa chr22:40060802-40061701");
+        // The two regions, extracted from tests/data/chr22.fa (1-based inclusive).
+        let read = |name: &str| std::fs::read_to_string(fixture(name))
+            .unwrap_or_else(|e| panic!("fixture {name}: {e}"));
+        let r1_seq = read("chr22_39030802-39031701.fa");
+        let r2_seq = read("chr22_40060802-40061701.fa");
 
         let r1_bases: Vec<u8> = r1_seq.lines()
             .filter(|l| !l.starts_with('>'))
